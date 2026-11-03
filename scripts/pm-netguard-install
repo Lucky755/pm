@@ -1,0 +1,89 @@
+#!/bin/bash
+# Install the NetGuard broker from the project source as root:root 0755.
+#
+# This is the only root-write action handed to the coding assistant. It takes
+# no path arguments on purpose: the source and destination are fixed, and the
+# source must belong to the invoking user and look like the broker. That keeps
+# an install from becoming "copy any file anywhere as root".
+#
+# Usage: sudo -n pm-netguard-install [--check] [--force]
+#   --check  report what would change, change nothing
+#   --force  install even while an attack run is active (pm.py)
+set -u
+
+SRC=/home/lucky/pentest-master/executor/netguard_root.py
+DEST=/usr/local/sbin/pm-netguard
+BACKUP_DIR=/var/backups/pm-netguard
+PY=/usr/bin/python3
+
+die() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die 'must run as root (sudo -n pm-netguard-install)'
+[ -e "$SRC" ] || die "source missing: $SRC"
+[ -L "$SRC" ] && die 'source must not be a symlink'
+[ -f "$SRC" ] || die 'source is not a regular file'
+
+uid="${SUDO_UID:-0}"
+owner=$(stat -c %u "$SRC")
+[ "$owner" = "$uid" ] || die "source owner ($owner) is not the invoking user ($uid)"
+
+grep -q '^def main(' "$SRC" || die 'source does not look like the broker (no main())'
+grep -q 'def ensure_root(' "$SRC" || die 'source does not look like the broker (no ensure_root())'
+grep -q 'session_worker' "$SRC" || die 'source does not look like the broker (no session worker)'
+
+"$PY" -m py_compile "$SRC" || die 'source does not compile'
+
+mode=install
+force=0
+for arg in "$@"; do
+    case "$arg" in
+        --check) mode=check ;;
+        --force) force=1 ;;
+        *) die "unknown argument: $arg" ;;
+    esac
+done
+
+running=$(pgrep -f '/pentest-master/pm\.py' | head -1 || true)
+if [ -n "${running:-}" ] && [ "$force" -eq 0 ]; then
+    die "an attack run is active (pm.py pid $running); finish it first or pass --force"
+fi
+
+if cmp -s "$SRC" "$DEST"; then
+    printf 'already up to date: %s (%s bytes)\n' "$DEST" "$(stat -c %s "$DEST")"
+    exit 0
+fi
+
+if [ "$mode" = check ]; then
+    printf 'source     : %s (%s bytes, mtime %s)\n' "$SRC" "$(stat -c %s "$SRC")" \
+           "$(stat -c %y "$SRC")"
+    if [ -f "$DEST" ]; then
+        printf 'installed  : %s (%s bytes, mtime %s)\n' "$DEST" "$(stat -c %s "$DEST")" \
+               "$(stat -c %y "$DEST")"
+        printf 'differs    : yes\n'
+    else
+        printf 'installed  : missing\n'
+    fi
+    printf 'action     : would install\n'
+    exit 0
+fi
+
+mkdir -p "$BACKUP_DIR" || die 'cannot create backup directory'
+chmod 700 "$BACKUP_DIR"
+
+backup=""
+if [ -f "$DEST" ]; then
+    backup="$BACKUP_DIR/pm-netguard.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$DEST" "$backup" || die 'backup failed'
+fi
+
+install -o root -g root -m 755 "$SRC" "$DEST" || die 'install failed'
+cmp -s "$SRC" "$DEST" || die 'installed file does not match the source'
+
+printf 'installed  : %s (%s bytes, root:root 0755)\n' "$DEST" "$(stat -c %s "$DEST")"
+[ -n "$backup" ] && printf 'previous   : %s\n' "$backup"
+
+if "$DEST" capabilities >/dev/null 2>&1; then
+    printf 'broker     : answers capabilities\n'
+else
+    printf 'WARNING    : broker did not answer capabilities\n'
+fi

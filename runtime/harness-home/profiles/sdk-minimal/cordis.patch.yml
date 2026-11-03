@@ -1,0 +1,59 @@
+
+# Pentest Master - SDK profile
+
+# Disable DeepSeek-specific request metadata.
+- id: session-log-deepseek
+  config:
+    enabled: false
+
+- id: plugin-package-inventory-deepseek
+  config:
+    enabled: false
+
+# Prevent access to the host shell.
+- id: persistent-bash
+  disabled: true
+
+- id: persistent-pwsh
+  disabled: true
+
+# OpenAI-compatible adapter for Experiential Labs.
+- insert:
+    - id: llm-pi-ai
+      name: "@deepseek-ai/dsh-llm-pi-ai"
+      config:
+        providers:
+          experiential:
+            displayName: Experiential Labs
+            # Keep the SDK's own credential name: DeepSeekHarness(api_key=...)
+            # exports DEEPSEEK_API_KEY, so renaming this var silently turns a
+            # valid call into MISSING_CREDENTIAL.
+            apiKeyEnv: DEEPSEEK_API_KEY
+            api: openai-completions
+            baseURL: https://api.experientiallabs.ai/v1
+            compat:
+              supportsDeveloperRole: false
+              maxTokensField: max_tokens
+            models:
+              - id: glm-5.3-uncensored
+                name: GLM-5.3 Uncensored
+                contextWindow: 1048576
+                maxTokens: 131000
+                input:
+                  - text
+
+# Our controlled MCP server.
+- insert:
+    - id: mcp-pentest-master
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: pentest_master
+        transport: stdio
+        command: /home/lucky/pentest-master/.venv/bin/python
+        args:
+          - /home/lucky/pentest-master/mcp/server.py
+        cwd: /home/lucky/pentest-master
+        # A scoped nmap scan or PoC run needs minutes, not seconds. The broker
+        # still enforces its own hard limits (exec <= 180s, poc <= 180s).
+        toolCallTimeoutMs: 300000
+        failOnStartupError: true

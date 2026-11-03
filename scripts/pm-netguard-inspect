@@ -1,0 +1,105 @@
+#!/bin/bash
+# Read-only inspection of the NetGuard broker and one task's state.
+#
+# Granting this instead of unrestricted sudo keeps the root grant to a fixed
+# set of queries: no arbitrary path can be read, nothing can be written, and no
+# command can be executed on behalf of the caller.
+#
+# Usage: sudo -n pm-netguard-inspect ACTION [--task-id N]
+#   status    configured scope and egress for a task
+#   sessions  open interactive sessions for a task
+#   work      listing and size of the task's persistent /work
+#   nft       the task's filter and NAT rules
+#   paths     installed broker versus project source
+#   workers   session worker processes
+#   stale     namespaces, workers, work directories, engine processes
+set -u
+
+ACTION=""
+TASK=""
+BROKER=/usr/local/sbin/pm-netguard
+SRC=/home/lucky/pentest-master/executor/netguard_root.py
+WORK=/var/lib/pentest-master/work
+
+usage() {
+    echo "usage: pm-netguard-inspect {status|sessions|work|nft|paths|workers|stale} [--task-id N]" >&2
+    exit 2
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        status|sessions|work|nft|paths|workers|stale) ACTION="$1" ;;
+        --task-id)
+            shift
+            [ $# -gt 0 ] || { echo 'ERROR: --task-id needs a value' >&2; exit 2; }
+            TASK="$1"
+            ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage ;;
+    esac
+    shift
+done
+
+[ "$(id -u)" -eq 0 ] || { echo 'ERROR: run with sudo -n pm-netguard-inspect' >&2; exit 1; }
+[ -n "$ACTION" ] || usage
+
+if [ -n "$TASK" ]; then
+    case "$TASK" in
+        *[!0-9]*) echo 'ERROR: task id must be numeric' >&2; exit 2 ;;
+    esac
+    if [ "$TASK" -lt 1 ] || [ "$TASK" -gt 200 ]; then
+        echo 'ERROR: task id out of range' >&2
+        exit 2
+    fi
+fi
+
+need_task() {
+    [ -n "$TASK" ] || { echo "ERROR: --task-id is required for $ACTION" >&2; exit 2; }
+}
+
+case "$ACTION" in
+    status)
+        need_task
+        "$BROKER" status --task-id "$TASK"
+        ;;
+    sessions)
+        need_task
+        "$BROKER" session --action list --task-id "$TASK"
+        ;;
+    work)
+        need_task
+        ls -la "$WORK/$TASK" 2>&1
+        echo '---'
+        du -sh "$WORK/$TASK" 2>&1
+        ;;
+    nft)
+        need_task
+        echo '--- filter ---'
+        /usr/sbin/nft list table inet "pm_t$TASK" 2>&1
+        echo '--- nat ---'
+        /usr/sbin/nft list table ip "pm_nat$TASK" 2>&1
+        ;;
+    paths)
+        echo '--- installed ---'
+        stat -c '%n  %s bytes  %U:%G  mode %a  %y' "$BROKER" 2>&1
+        echo '--- source ---'
+        stat -c '%n  %s bytes  %U:%G  mode %a  %y' "$SRC" 2>&1
+        if cmp -s "$SRC" "$BROKER"; then
+            echo 'installed == source'
+        else
+            echo 'installed != source'
+        fi
+        ;;
+    workers)
+        pgrep -af 'session-worker' || echo 'no session workers'
+        ;;
+    stale)
+        echo '--- namespaces ---'
+        /usr/sbin/ip netns list 2>&1 | head -20
+        echo '--- session workers ---'
+        pgrep -af 'session-worker' || echo none
+        echo '--- work directories ---'
+        ls -1 "$WORK" 2>&1 | head -20
+        echo '--- engine ---'
+        pgrep -af '/pentest-master/pm\.py' || echo 'no pm.py running'
+        ;;
+esac
