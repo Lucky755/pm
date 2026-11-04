@@ -38,6 +38,8 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from orchestrator import diagnostics
+
 from orchestrator import agent_actions
 from orchestrator import flag_verify
 from orchestrator import fact_state
@@ -71,13 +73,14 @@ def render(obj):
 
 
 def say(text=''):
-    print(text, flush=True)
+    print(diagnostics.clean(text, limit=None), flush=True)
 
 
 def stage_facts(task_id):
     """Read the derived ledgers; old free text enters only as open questions."""
     db = agent_actions.connect()
     try:
+        before = diagnostics.state_snapshot(db, task_id) if diagnostics.active() else {}
         fact_state.import_legacy_reports(db, task_id)
         fact_state.import_legacy_access_hint(db, task_id)
         fact_state.import_capability_assets(
@@ -86,6 +89,8 @@ def stage_facts(task_id):
         assets = fact_state.list_assets(db, task_id, limit=200)
         access = fact_state.access_state(db, task_id)
         db.commit()
+        if diagnostics.active():
+            diagnostics.state_diff(before, diagnostics.state_snapshot(db, task_id), task_id)
         return claims, assets, access
     finally:
         db.close()
@@ -460,6 +465,7 @@ def network_unreachable_since(task_id, start):
     return bool(outcomes) and all(outcomes)
 
 
+@diagnostics.stage
 def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
         api_key=None, max_tokens=None, expect_flags=None):
     iterations = int(iterations)
@@ -828,6 +834,7 @@ def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
 
 def finish(task_id, stages, stop_reason, previous, expect=DEFAULT_EXPECTED_FLAGS):
     """Write the run summary. Never raises: reporting must survive bad state."""
+    diagnostics.stop(stop_reason, task_id=task_id)
     confirmed = confirmed_values(task_id)
     candidates = transferred_candidates(task_id)
     problems = []
@@ -919,6 +926,8 @@ def finish(task_id, stages, stop_reason, previous, expect=DEFAULT_EXPECTED_FLAGS
         'hypotheses': hypotheses,
         'last_summary': (previous or {}).get('summary', '')[:2000],
     }
+    diagnostics.emit('assessment.result', task_id=task_id, status=result['status'],
+                     succeeded=succeeded, objective_confirmed=(primary['status'] == 'confirmed') if primary else None)
     directory = agent_actions.REPORT_DIR / f'task_{task_id}'
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -942,6 +951,7 @@ def finish(task_id, stages, stop_reason, previous, expect=DEFAULT_EXPECTED_FLAGS
     return result
 
 
+@diagnostics.entrypoint
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Pentest Master role loop')
     sub = parser.add_subparsers(dest='command', required=True)

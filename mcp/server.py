@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT))
 
 from executor.tool_catalog import detect_tools
 from executor.tool_executor_v3 import PROFILES
-from orchestrator import fact_state
+from orchestrator import fact_state, diagnostics
 
 
 mcp = FastMCP("pentest-master")
@@ -219,6 +219,7 @@ def run_internal(
 
 
 @mcp.tool()
+@diagnostics.tool
 def list_workspace() -> str:
     """List files in the isolated executor workspace."""
 
@@ -235,6 +236,7 @@ def list_workspace() -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def workspace_test() -> str:
     """Write a harmless test file inside the sandbox."""
 
@@ -251,6 +253,7 @@ def workspace_test() -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def execute_approved_demo(approval_id: str) -> str:
     """
     Consume a one-use approved demonstration contract.
@@ -279,6 +282,7 @@ def execute_approved_demo(approval_id: str) -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def list_available_tools(
     category: str = "all",
     installed_only: bool = True,
@@ -305,6 +309,7 @@ def list_available_tools(
 
 
 @mcp.tool()
+@diagnostics.tool
 def run_local_tool(
     task_id: int,
     tool_name: str,
@@ -353,6 +358,7 @@ def run_local_tool(
 
 
 @mcp.tool()
+@diagnostics.tool
 def list_tool_profiles_v3() -> str:
     """List local Executor v3 profiles and modes."""
 
@@ -369,6 +375,7 @@ def list_tool_profiles_v3() -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def run_local_tool_v3(
     task_id: int,
     tool_name: str,
@@ -467,6 +474,7 @@ def run_local_tool_v3(
 
 
 @mcp.tool()
+@diagnostics.tool
 def list_network_profiles() -> str:
     """
     List the controlled network probe profiles.
@@ -515,6 +523,7 @@ def list_network_profiles() -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def run_network_probe(
     task_id: int,
     profile: str,
@@ -814,6 +823,7 @@ def log_capability(tool, task_id, payload, elapsed, command=()):
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+        diagnostics.capability_result(record["id"], payload)
         return record["id"]
 
     except OSError:
@@ -898,6 +908,7 @@ def run_capability(command, timeout, tool="capability", task_id=None):
         result = subprocess.run(
             command,
             cwd=str(ROOT),
+            env={**os.environ, **diagnostics.child_env()},
             capture_output=True,
             text=True,
             errors="replace",
@@ -935,6 +946,7 @@ def run_capability(command, timeout, tool="capability", task_id=None):
         log_capability(tool, task_id, payload, time.monotonic() - started, command)
         return tool_response(payload)
 
+    diagnostics.execution_exit(result.returncode)
     text = (result.stdout or "").strip()
 
     try:
@@ -975,6 +987,7 @@ def run_capability(command, timeout, tool="capability", task_id=None):
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_evidence_index(task_id: int, offset: int = -1, limit: int = 40) -> str:
     """List saved result IDs; offset=-1 selects the latest page without a charged step."""
     if not valid_task(task_id) or type(offset) is not int or offset < -1 or type(limit) is not int:
@@ -986,6 +999,7 @@ def pm_evidence_index(task_id: int, offset: int = -1, limit: int = 40) -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_capability_read(task_id: int, result_id: str, offset: int = 0) -> str:
     """Read up to 12 KiB of a saved capability result by ID, with byte offset."""
     if not valid_task(task_id) or not re.fullmatch(r"[a-f0-9]{24}", str(result_id)):
@@ -1021,6 +1035,7 @@ def pm_capability_read(task_id: int, result_id: str, offset: int = 0) -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_write_poc(task_id: int, filename: str, content: str) -> str:
     """Save a PoC or helper script for this task, then run it with pm_poc_run.
 
@@ -1089,6 +1104,7 @@ def pm_write_poc(task_id: int, filename: str, content: str) -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_poc_run(
     task_id: int,
     target: str,
@@ -1188,6 +1204,7 @@ def pm_poc_run(
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_net_exec(
     task_id: int,
     target: str,
@@ -1269,6 +1286,7 @@ def pm_net_exec(
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_research(task_id: int, target: str, host: str, path: str = "/") -> str:
     """Fetch CVE and exploit data from the fixed research allowlist.
 
@@ -1322,6 +1340,7 @@ def pm_research(task_id: int, target: str, host: str, path: str = "/") -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_callback(
     task_id: int,
     action: str,
@@ -1417,6 +1436,7 @@ def pm_callback(
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_session(
     task_id: int,
     action: str,
@@ -1517,6 +1537,7 @@ def pm_session(
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_worknote(task_id: int, append: str = "") -> str:
     """Read or append 0-7 evidence-backed facts in this task's /work/NOTES.md.
 
@@ -1569,6 +1590,7 @@ def pm_worknote(task_id: int, append: str = "") -> str:
 
 
 @mcp.tool()
+@diagnostics.tool
 def pm_observations(task_id: int) -> str:
     """Return saved network observations and capability outputs for a task."""
     if not valid_task(task_id):

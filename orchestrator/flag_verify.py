@@ -27,6 +27,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from orchestrator import diagnostics
+
 DB_PATH = ROOT / 'storage/tasks.db'
 CAPABILITY_LOG = ROOT / 'storage/capability_log'
 POC_ROOT = ROOT / 'storage/pocs'
@@ -330,6 +334,7 @@ def scan(task_id, patterns=None, db=None):
     owns_db = db is None
     db = db if db is not None else connect()
     ensure_schema(db)
+    before = diagnostics.state_snapshot(db, task_id) if diagnostics.active() else {}
     patterns = patterns if patterns is not None else flag_patterns(db, task_id)
     pattern_sources = dict(db.execute('SELECT pattern,source FROM pm_flag_patterns WHERE task_id=?', (task_id,)))
     try:
@@ -500,6 +505,8 @@ def scan(task_id, patterns=None, db=None):
                 (task_id,),
             )
         db.commit()
+        if diagnostics.active():
+            diagnostics.state_diff(before, diagnostics.state_snapshot(db, task_id), task_id)
     finally:
         if owns_db:
             db.close()

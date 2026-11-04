@@ -4,7 +4,7 @@ import json
 import re
 
 from operator_errors import OperatorError
-from orchestrator import flag_verify
+from orchestrator import flag_verify, diagnostics
 
 MAX_OBJECTIVES = 30
 MODES = ('goal-first', 'goal-exclusive', 'all-flags')
@@ -86,6 +86,7 @@ def objective_status(db, task_id):
             'objectives': rows}
 
 
+@diagnostics.committed_changes
 def save_objectives(db, task_id, primary_title, primary_weight=100, exclusive=False,
                     specs=(), *, mode='goal-first', expected_flags=None):
     """Upsert stable objective keys without erasing confirmed progress."""
@@ -195,6 +196,7 @@ def _record_for(task_id, result_id):
     return None
 
 
+@diagnostics.committed_changes
 def process_report(db, task_id, report, registry):
     """Accept objective claims only with captured network evidence."""
     state = objective_status(db, task_id)

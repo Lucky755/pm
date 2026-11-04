@@ -19,11 +19,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from orchestrator import diagnostics
 PYTHON = ROOT / '.venv/bin/python'
 MAX_CHOICES = 3
 MAX_CANDIDATES = 16
 PLANNER_VERSION = 2
 SUPPORTED_PROFILES = ('service_versions', 'http_headers', 'http_get')
+
 
 
 def now():
@@ -194,6 +197,7 @@ def choose_with_model(bundle, candidates):
     key = getpass.getpass('Experiential API key (decision only): ').strip()
     if not key:
         raise ValueError('API key required for agent decisions')
+    diagnostics.register_secret(key)
     with evidence.read_only_analysis_patch() as policy_patch, DeepSeekHarness(
         profile='sdk-minimal', patches=(policy_patch,),
         dsh_home=str(evidence.DSH_HOME), cwd=str(evidence.WORKSPACE),
@@ -207,7 +211,9 @@ def choose_with_model(bundle, candidates):
             if previous_error:
                 prompt += ('\nPrevious response was invalid (' + previous_error[:300] +
                            '). Return ONLY the required JSON, with valid IDs.')
-            response = session.run(prompt)
+            if attempt:
+                diagnostics.emit('model.retry', reason='decision_recovery')
+            response = diagnostics.model_call(session, prompt)
             tool_event = any(isinstance(event, dict) and event.get('type') == 'tool/call'
                              for event in (getattr(response, 'events', None) or []))
             reason = getattr(response, 'finish_reason', 'unknown')
@@ -328,6 +334,7 @@ def print_decision_details(details, cached=False):
               + ': ' + _display(item.get('error'), 300), flush=True)
 
 
+@diagnostics.stage
 def plan(db, task_id):
     from orchestrator import evidence_pipeline as evidence
     initialize(db)
@@ -339,6 +346,7 @@ def plan(db, task_id):
                            FROM decision_agent_runs
                            WHERE task_id=? AND evidence_sha256=?''', (task_id, digest)).fetchone()
     if cached and cached[1] == context_hash and cached[2]:
+        diagnostics.emit('cache.hit', name='decision', task_id=task_id, evidence_sha256=digest)
         details = json.loads(cached[2])
         print_decision_details(details, cached=True)
         return {'status': 'cached', 'evidence_sha256': digest,
@@ -370,6 +378,9 @@ def plan(db, task_id):
             context_sha256=excluded.context_sha256,diagnostics_json=excluded.diagnostics_json''',
             (task_id, digest, json.dumps(selections), now(), context_hash,
              json.dumps(details, ensure_ascii=False)))
+    for item in created:
+        diagnostics.emit('state.change', task_id=task_id, table='network_phase_plans',
+                         identifiers={'id': item['plan_id']}, reason=item['reason'])
     print_decision_details(details)
     return {'status': 'completed', 'evidence_sha256': digest,
             'available_candidates': candidates, 'selected': selections,
@@ -436,6 +447,7 @@ def diagnose(db, task_id):
     print('Диагностика завершена. Модель, сканирование и сетевой исполнитель не запускались.')
 
 
+@diagnostics.entrypoint
 def main():
     parser = argparse.ArgumentParser(description='Bounded, evidence-grounded agent choices')
     parser.add_argument('command', choices=('suggest', 'plan', 'status', 'diagnose'))

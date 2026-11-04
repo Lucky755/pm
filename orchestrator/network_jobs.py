@@ -19,6 +19,7 @@ Important:
 import argparse
 import ipaddress
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -28,11 +29,14 @@ from pathlib import Path
 
 
 ROOT = Path("/home/lucky/pentest-master")
+
 DATABASE = ROOT / "storage/tasks.db"
 PYTHON = ROOT / ".venv/bin/python"
 EXECUTOR = ROOT / "executor/network_executor_isolated.py"
 
 sys.path.insert(0, str(ROOT))
+
+from orchestrator import diagnostics
 
 from executor.task_scope import check_action
 
@@ -572,8 +576,11 @@ def completed_run(db, plan_id):
     """, (plan_id,)).fetchone()
 
 
+@diagnostics.stage
 def execute_job(db, plan_id):
     plan = load_plan(db, plan_id)
+    diagnostics.emit('job.plan', task_id=plan['task_id'], plan_id=plan_id,
+                     parameters=diagnostics.parameters(plan), reason=plan.get('model_summary') or plan.get('goal'))
     command = validate_plan(db, plan)
 
     if documentation_address(plan["target"]):
@@ -632,6 +639,8 @@ def execute_job(db, plan_id):
 
         run_id = cursor.lastrowid
         db.commit()
+        diagnostics.emit('state.change', task_id=plan['task_id'], table='network_job_runs',
+                         identifiers={'id': run_id, 'plan_id': plan_id}, status='running')
 
     except Exception:
         db.rollback()
@@ -645,6 +654,7 @@ def execute_job(db, plan_id):
         completed = subprocess.run(
             command,
             cwd=str(ROOT),
+            env={**os.environ, **diagnostics.child_env()},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -654,6 +664,8 @@ def execute_job(db, plan_id):
             check=False,
         )
 
+        diagnostics.execution_exit(completed.returncode)
+        diagnostics.emit('job.execution', task_id=plan['task_id'], plan_id=plan_id, exit_code=completed.returncode)
         try:
             result = json.loads(
                 completed.stdout.strip()
@@ -766,6 +778,8 @@ def execute_job(db, plan_id):
                 now(),
             ))
 
+    diagnostics.emit('state.change', task_id=plan['task_id'], table='network_job_runs',
+                     identifiers={'id': run_id, 'plan_id': plan_id}, status=status)
     return {
         "run_id": run_id,
         "plan_id": plan_id,
@@ -885,6 +899,7 @@ def self_test():
     })
 
 
+@diagnostics.entrypoint
 def main():
     parser = argparse.ArgumentParser()
 

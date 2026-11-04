@@ -26,6 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from orchestrator import diagnostics
+
 from orchestrator import evidence_pipeline as evidence
 from orchestrator import network_workflow as workflow
 from orchestrator import network_enrichment as enrichment
@@ -98,6 +100,7 @@ def compact_status(db, task_id):
     }
 
 
+@diagnostics.stage
 def run(db, task_id, execute, sync_burp, skip_agents, max_jobs, decide=False):
     target = validate_task(db, task_id)
     if execute and any(ipaddress.ip_address(target) in net for net in DOCUMENTATION):
@@ -223,6 +226,7 @@ def auto_history(db, task_id, limit=5):
                       'stop_reason', 'started_at', 'finished_at'), row)) for row in rows]
 
 
+@diagnostics.stage
 def auto(db, task_id, execute, sync_burp, skip_agents, max_jobs,
          decide=False, max_rounds=4, bootstrap=False, web_enabled=False):
     """Manual, bounded evidence -> plans -> execution -> analysis loop.
@@ -256,6 +260,8 @@ def auto(db, task_id, execute, sync_burp, skip_agents, max_jobs,
             (task_id,live,model_decisions,status,started_at)
             VALUES (?,?,?,'running',?)""", (task_id, int(execute), int(decide), _now())).lastrowid
 
+    diagnostics.emit('state.change', task_id=task_id, table='master_auto_runs',
+                     identifiers={'id': run_id}, status='running')
     all_jobs = []
     round_reports = []
     stop_reason = 'round_limit'
@@ -276,6 +282,9 @@ def auto(db, task_id, execute, sync_burp, skip_agents, max_jobs,
                     (run_id,round_number,evidence_before,status,created_at)
                     VALUES (?,?,?,'running',?)""", (run_id, number, digest_before, _now()))
 
+            round_action = diagnostics.Action('round', 'scheduler', task_id=task_id, iteration=number,
+                                              identifiers={'auto_run_id': run_id, 'round': number})
+            round_action.__enter__()
             round_jobs = []
             decision_result = None
             try:
@@ -420,6 +429,8 @@ def auto(db, task_id, execute, sync_burp, skip_agents, max_jobs,
                     db.execute("""UPDATE master_auto_rounds SET status=?
                         WHERE run_id=? AND round_number=?""", (state, run_id, number))
                 raise
+            finally:
+                round_action.__exit__(*sys.exc_info())
 
         with db:
             db.execute("""UPDATE master_auto_runs
@@ -435,6 +446,8 @@ def auto(db, task_id, execute, sync_burp, skip_agents, max_jobs,
                  _now(), run_id))
         raise
 
+    diagnostics.emit('state.change', task_id=task_id, table='master_auto_runs',
+                     identifiers={'id': run_id}, status='completed', reason=stop_reason)
     result = compact_status(db, task_id)
     if discovery:
         result['bootstrap_progress'] = discovery.progress(db, task_id)
@@ -467,6 +480,7 @@ def exclusive_run_lock():
             fcntl.flock(lockfile.fileno(), fcntl.LOCK_UN)
 
 
+@diagnostics.entrypoint
 def main():
     parser = argparse.ArgumentParser(description="Pentest Master unified coordinator")
     parser.add_argument("command", choices=("status", "run", "auto", "auto-history"))

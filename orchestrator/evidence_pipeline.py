@@ -23,6 +23,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from orchestrator import diagnostics
 DB_PATH = ROOT / 'storage/tasks.db'
 BURP_IMPORT = ROOT / 'integrations/burp-bridge/burp_import.py'
 DSH_HOME = ROOT / 'runtime/harness-home'
@@ -36,6 +38,7 @@ ROLES = {
     'access': 'Analyze access-related evidence read-only; do not attempt to gain access or issue commands.',
     'verify': 'Audit earlier reports against the evidence; flag unsupported claims and missing evidence.',
 }
+
 
 
 def now():
@@ -339,7 +342,10 @@ def _run_stage_with_one_retry(harness, task_id, stage, prompt):
         session = harness.start_session(
             f'evidence-{task_id}-{stage}-{uuid.uuid4().hex[:12]}'
         )
-        result = session.run(prompt)
+        if attempt:
+            diagnostics.emit('model.retry', reason='evidence_recovery', task_id=task_id, role=stage)
+        with diagnostics.scope(task_id=task_id, role=stage):
+            result = diagnostics.model_call(session, prompt)
         if _has_tool_calls(result):
             if attempt == 0:
                 print(f'[MODEL] {stage.upper()}: tool event in read-only analysis; '
@@ -364,9 +370,12 @@ def _run_stage_with_one_retry(harness, task_id, stage, prompt):
         raise RuntimeError(f'{stage} model failed: {brief}; saved evidence retained; resume later')
 
 
+@diagnostics.stage
 def run_agents(db, task_id, digest, bundle):
     previous = saved_reports(db, task_id, digest)
     remaining = [stage for stage in STAGES if stage not in previous]
+    for stage in previous:
+        diagnostics.emit('cache.hit', name='evidence_report', task_id=task_id, role=stage, evidence_sha256=digest)
     if not remaining:
         print('[RESUME] All 4 reports exist for this evidence version; no API call.')
         return previous
@@ -380,6 +389,7 @@ def run_agents(db, task_id, digest, bundle):
     api_key = getpass.getpass('Experiential API key: ').strip()
     if not api_key:
         raise ValueError('API key required')
+    diagnostics.register_secret(api_key)
     with read_only_analysis_patch() as policy_patch, DeepSeekHarness(
         profile='sdk-minimal',
         patches=(policy_patch,),
@@ -409,7 +419,8 @@ def run_agents(db, task_id, digest, bundle):
                 repair = harness.start_session(
                     f'evidence-repair-{task_id}-{stage}-{uuid.uuid4().hex[:12]}'
                 )
-                repaired = repair.run(repair_prompt(
+                diagnostics.emit('model.retry', reason='report_format', task_id=task_id, role=stage)
+                repaired = diagnostics.model_call(repair, repair_prompt(
                     stage, bundle, previous, result.final_response or '', str(exc)
                 ))
                 if _has_tool_calls(repaired):
@@ -425,6 +436,8 @@ def run_agents(db, task_id, digest, bundle):
                     (task_id, evidence_sha256, stage, report_json, created_at)
                     VALUES (?, ?, ?, ?, ?)
                 ''', (task_id, digest, stage, json.dumps(report, ensure_ascii=False), now()))
+            diagnostics.emit('state.change', table='evidence_agent_reports', task_id=task_id,
+                             identifiers={'task_id': task_id, 'evidence_sha256': digest, 'stage': stage})
             previous[stage] = report
             render({'stage': stage, 'status': 'completed', 'report': report})
     return previous
@@ -444,6 +457,7 @@ def summary(db, task_id):
     }
 
 
+@diagnostics.entrypoint
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=('status', 'sync', 'agents', 'resume', 'run'))

@@ -40,6 +40,8 @@ PORTS_MAX = 32
 MAX_HOSTNAMES = 12
 TRANSITION_MAX_BYTES = 256 * 1024
 from intent_limits import INTENT_MAX, HINTS_MAX
+from orchestrator import diagnostics
+
 from operator_errors import OperatorError
 
 
@@ -76,7 +78,7 @@ def tint(value, tone='brand', *, stream=None):
 
 def safe_display(value):
     """Strip ANSI and C0/C1 controls from untrusted remote/model output."""
-    clean = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', str(value))
+    clean = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', diagnostics.clean(value, limit=None))
     return re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', clean)
 
 
@@ -397,7 +399,7 @@ def read_planner_stream(process, api_key=None):
     """
     master, slave = pty.openpty()
     read_fd = None
-    popen_options = {}
+    popen_options = {'env': {**os.environ, **diagnostics.child_env()}}
     if api_key is not None:
         secret = api_key.encode('utf-8')
         if not secret or len(secret) > 4096:
@@ -407,7 +409,7 @@ def read_planner_stream(process, api_key=None):
             os.write(write_fd, secret)
         finally:
             os.close(write_fd)
-        environment = os.environ.copy()
+        environment = {**os.environ, **diagnostics.child_env()}
         environment['PM_SESSION_KEY_FD'] = str(read_fd)
         popen_options = {'pass_fds': (read_fd,), 'env': environment}
         expected_planner = ROOT / 'orchestrator/planner.py'
@@ -713,6 +715,7 @@ def session_api_key(args, *, required=False):
     key = getpass.getpass('Experiential API key (один раз за запуск): ').strip()
     if not key or len(key.encode('utf-8')) > 4096:
         raise OperatorError('API-ключ обязателен и не должен превышать 4096 байт')
+    diagnostics.register_secret(key)
     args._session_key = key
     return key
 
@@ -740,7 +743,9 @@ class ConciseProgress:
             self._one(current)
     def _one(self, text):
         text = text.strip()
-        if text.startswith('[JOB]'):
+        if text.startswith(('[EVENT]', '[DIAG-ERROR]')):
+            line('  ' + diagnostics.clean(text), stream=self.stream)
+        elif text.startswith('[JOB]'):
             tone = 'success' if ': completed' in text else 'warning' if ': failed' in text else 'brand'
             line('  ' + tint('[+]', tone, stream=self.stream) + ' ' + safe_display(text), stream=self.stream)
         elif text.startswith('[AGENT]'):
@@ -1023,6 +1028,7 @@ def run_full_tcp_scan(db, task_id, target):
     entry = db.execute('SELECT status,open_ports_json,error FROM pm_tcp_full_scans WHERE task_id=? AND target=?',
                        (task_id, target)).fetchone()
     if entry and entry[0] == 'completed':
+        diagnostics.emit('cache.hit', name='tcp_full_scan', task_id=task_id, parameters={'target': target})
         scan = db.execute('SELECT created_at FROM pm_tcp_full_scans WHERE task_id=? AND target=?',
                           (task_id, target)).fetchone()
         try:
@@ -1169,6 +1175,7 @@ def launch_configured_task(db, task_id, target, args):
     call_scheduler(db, task_id, target, args, prior_jobs=used)
 
 
+@diagnostics.stage
 def op_new(args, *, defer_execution=False):
     target = validate_target(args.target)
     key = session_api_key(args, required=True)
@@ -1195,6 +1202,7 @@ def op_new(args, *, defer_execution=False):
     return task_id
 
 
+@diagnostics.stage
 def op_resume(args):
     session_api_key(args)
     with connect() as db:
@@ -1391,6 +1399,7 @@ def complete_pending_transition(db, old_id, new_id, *, broker_call=None,
     return moved
 
 
+@diagnostics.stage
 def op_change_ip(args):
     """Linked successor task: keep evidence honest across a machine reboot.
 
@@ -2111,6 +2120,7 @@ def op_hosts(args):
         line('  Готово. Вне namespace системный /etc/hosts не менялся.')
 
 
+@diagnostics.stage
 def op_attack(args):
     """Run the role cycle in this process; the key never touches argv or env."""
     if str(ROOT) not in sys.path:
@@ -2694,6 +2704,7 @@ def interactive():
             return
 
 
+@diagnostics.entrypoint
 def main():
     # The bundled Harness runtime needs IPv4-first connections without
     # AddressFamily auto-selection; without it every model call dies as

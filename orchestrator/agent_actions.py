@@ -41,6 +41,8 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from orchestrator import diagnostics
+
 DB_PATH = ROOT / 'storage/tasks.db'
 DSH_HOME = ROOT / 'runtime/harness-home'
 WORKSPACE = ROOT / 'runtime/workspace'
@@ -286,9 +288,13 @@ def action_policy_patch(step_limit=None, poc_budget=7):
         with tempfile.TemporaryDirectory(prefix='pm-action-policy-') as directory:
             path = Path(directory) / 'actions.patch.yml'
             # JSON is valid YAML and keeps absolute paths exact.
-            path.write_text(json.dumps([{'insert': [{
+            overlays = [{'insert': [{
                 'id': 'pm-agent-actions', 'name': str(POLICY_PLUGIN.resolve()),
-            }]}]), encoding='utf-8')
+            }]}]
+            if diagnostics.active():
+                overlays.append({'id': 'mcp-pentest-master',
+                                 'config': {'env': diagnostics.child_env()}})
+            path.write_text(json.dumps(overlays), encoding='utf-8')
             yield str(path)
     finally:
         if previous_poc is None:
@@ -1106,19 +1112,8 @@ def describe_call(name, arguments):
         args = {}
     if not isinstance(args, dict):
         args = {}
-    hint = ''
-    for key in ('command', 'argv', 'poc_file', 'query', 'cve', 'url', 'value',
-                'argv_json', 'action', 'data'):
-        raw = args.get(key)
-        if raw in (None, '', [], {}):
-            continue
-        if isinstance(raw, (list, tuple)):
-            raw = ' '.join(str(item) for item in raw)
-        elif isinstance(raw, dict):
-            raw = json.dumps(raw, ensure_ascii=False)
-        hint = str(raw)
-        break
-    return short_text(f'{label} {hint}'.strip(), 150)
+    hint = json.dumps(diagnostics.parameters(args), ensure_ascii=False)
+    return short_text(f'{label} {hint}', 150)
 
 
 def describe_result(message):
@@ -1137,20 +1132,12 @@ def describe_result(message):
         payload = None
     if isinstance(payload, dict):
         status = str(payload.get('status') or '')
-        if payload.get('error'):
-            detail = short_text(payload['error'], 80)
-        elif payload.get('executable') is False:
-            detail = 'исполняемый файл недоступен'
-        elif payload.get('output_truncated') or payload.get('stdout_truncated'):
-            detail = (status or 'ok') + ', вывод обрезан'
-        elif status:
-            detail = status
-        warnings = [str(payload[key]) for key in ('budget_warning', 'session_warning')
-                    if payload.get(key)]
-        if warnings:
-            detail = (detail or status or 'результат') + ' · ' + short_text('; '.join(warnings), 105)
+        detail = status or 'unknown'
+        for key in ('exit_code', 'result_id'):
+            if key in payload:
+                detail += f' {key}={diagnostics.clean(payload[key])}'
     if not detail:
-        detail = short_text(text, 80) if text else 'без вывода'
+        detail = 'ответ без структурированного статуса' if text else 'без вывода'
     if message.get('isError'):
         detail = 'ОШИБКА: ' + detail
     size_text = f'{size / 1024:.1f} КБ' if size >= 1024 else f'{size} Б'
@@ -1181,7 +1168,8 @@ def progress_watcher(role, step_limit, stream=None, stats_path=None):
         return {}
 
     def emit(text):
-        print(f'      {text}', file=stream, flush=True)
+        if not diagnostics.active():
+            print(f'      {diagnostics.clean(text)}', file=stream, flush=True)
 
     def watcher(notification):
         if getattr(notification, 'method', '') != 'session.event':
@@ -1838,6 +1826,7 @@ def _private_report_temp(directory, name, contents):
 
 
 def save_report(db, context, role, iteration, report, steps_used, raw_response=None):
+    before = diagnostics.state_snapshot(db, context['task_id']) if diagnostics.active() else {}
     REPORT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory = REPORT_DIR / f"task_{context['task_id']}"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1907,6 +1896,10 @@ def save_report(db, context, role, iteration, report, steps_used, raw_response=N
         for temporary in (staged_report, staged_raw, *backups.values()):
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+    if diagnostics.active():
+        diagnostics.state_diff(before, diagnostics.state_snapshot(db, context['task_id']), context['task_id'])
+        diagnostics.emit('state.change', table='pm_agent_action_reports', identifiers={
+            'task_id': context['task_id'], 'role': role, 'iteration': iteration})
     return str(path)
 
 
@@ -1972,6 +1965,7 @@ def validate_triage_objective(state, objective):
         raise ValueError('Не завершён триаж доступа: цель повышения уровня отклонена')
 
 
+@diagnostics.stage
 def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
              step_limit=15, api_key=None, max_tokens=DEFAULT_MAX_TOKENS):
     if role not in ROLES:
@@ -1992,6 +1986,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
     if not key:
         key = getpass.getpass('Experiential API key: ').strip()
     key = checked_api_key(key)
+    diagnostics.register_secret(key)
 
     from deepseek_harness import DeepSeekHarness
     try:
@@ -2047,7 +2042,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                     f'action-{task_id}-{role}-{uuid.uuid4().hex[:10]}'
                 )
                 watcher = progress_watcher(role, step_limit, stats_path=stats_path)
-                turn = session.run(first_prompt, on_notification=watcher)
+                turn = diagnostics.model_call(session, first_prompt, diagnostic_reason='stage_start', on_notification=watcher)
                 note = None
                 parsed = None
                 if getattr(turn, 'finish_reason', None) == 'max-tokens':
@@ -2072,15 +2067,15 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                                   f'{COMPACT_MODE_NOTE}', flush=True)
                             session = harness.start_session(
                                 f'action-{task_id}-{role}-{uuid.uuid4().hex[:10]}-compact')
-                            turn = session.run(compact_prompt(
+                            turn = diagnostics.model_call(session, compact_prompt(
                                 db, context, role, objective, iteration,
                                 poc_budget, step_limit,
                                 f'пик контекста {watcher.metrics["peak_context_tokens"]} '
                                 f'токенов, порог {CONTEXT_PRESSURE_TOKENS}'),
-                                on_notification=watcher)
+                                diagnostic_reason='context_pressure_continuation', on_notification=watcher)
                             note = 'max-tokens-compact'
                         else:
-                            turn = session.run(recovery_prompt, on_notification=watcher)
+                            turn = diagnostics.model_call(session, recovery_prompt, diagnostic_reason='max_tokens_continuation', on_notification=watcher)
                 if getattr(turn, 'finish_reason', None) == 'completed':
                     try:
                         parsed = parse_report(turn.final_response)
@@ -2103,17 +2098,17 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                                       flush=True)
                                 retry_session = harness.start_session(
                                     f'action-{task_id}-{role}-{uuid.uuid4().hex[:10]}-compact-json')
-                                turn = retry_session.run(
+                                turn = diagnostics.model_call(retry_session,
                                     compact_prompt(
                                         db, context, role, objective, iteration,
                                         poc_budget, step_limit,
                                         f'пик контекста {peak} токенов, порог '
                                         f'{CONTEXT_PRESSURE_TOKENS}') + '\n\n'
                                     + REPORT_ONLY_RECOVERY,
-                                    on_notification=watcher)
+                                    diagnostic_reason='json_repair', on_notification=watcher)
                             else:
-                                turn = session.run(REPORT_ONLY_RECOVERY,
-                                                   on_notification=watcher)
+                                turn = diagnostics.model_call(session, REPORT_ONLY_RECOVERY,
+                                                   diagnostic_reason='json_repair', on_notification=watcher)
                             note = 'json'
                 stats = read_stage_stats(stats_path)
                 stats.update(watcher.metrics)
@@ -2144,6 +2139,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                                 poc_budget, step_limit,
                                 f'пик контекста {tool_calls["peak_context_tokens"]} '
                                 f'токенов, порог {CONTEXT_PRESSURE_TOKENS}') + ACT_NOW
+                        diagnostics.emit('model.retry', reason='no_tool_calls', max_tokens=escalated)
                         result, recovery, report, tool_calls = attempt(escalated, retry_prompt)
                         for metric in ('thinking_chars', 'assistant_messages',
                                        'input_tokens', 'cache_read_tokens', 'output_tokens'):
@@ -2454,6 +2450,7 @@ def self_test():
     return {'status': 'completed', 'test': 'agent_actions', **checks}
 
 
+@diagnostics.entrypoint
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Pentest Master action agents')
     sub = parser.add_subparsers(dest='command', required=True)

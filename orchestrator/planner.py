@@ -15,6 +15,9 @@ ROOT = Path("/home/lucky/pentest-master")
 DATABASE = ROOT / "storage" / "tasks.db"
 API_URL = "https://api.experientiallabs.ai/v1/chat/completions"
 MODEL = "glm-5.3-uncensored"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from orchestrator import diagnostics
 # A trailing sentence period is not part of the address: "10.1.1.1." must
 # still be seen, otherwise a stale address survives in the plan text.
 IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)")
@@ -129,6 +132,7 @@ def request_plan(api_key, target, description, attempts=2, context=None):
     plan for a larger room could be cut off mid-string and the resulting
     "Expecting ',' delimiter" killed the whole task creation.
     """
+    diagnostics.register_secret(api_key)
     last_error = None
     for attempt in range(1, attempts + 1):
         request_text = description
@@ -177,8 +181,11 @@ def request_plan(api_key, target, description, attempts=2, context=None):
             method="POST"
         )
 
-        with urllib.request.urlopen(request, timeout=120) as response:
-            result = json.load(response)
+        if attempt > 1:
+            diagnostics.emit('model.retry', reason='planner_format')
+        with diagnostics.Action('model', 'planner_request'):
+            with urllib.request.urlopen(request, timeout=120) as response:
+                result = json.load(response)
 
         choice = result["choices"][0]
         content = choice["message"]["content"]
@@ -433,6 +440,7 @@ def save_plan(target, description, plan):
         return cursor.lastrowid
 
 
+@diagnostics.entrypoint
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True)
@@ -466,6 +474,8 @@ def main():
         raise SystemExit(2) from exc
 
     task_id = save_plan(target, args.task, plan)
+    diagnostics.emit('state.change', task_id=task_id, table='tasks',
+                     identifiers={'id': task_id}, status='pending_review')
 
     print("[3] Plan saved to SQLite.")
     print("Task ID:", task_id)

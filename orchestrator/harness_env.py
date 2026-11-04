@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import shlex
+from orchestrator import diagnostics
 
 # --no-network-family-autoselection: one attempt at a time, like curl, so a
 #   slow-but-working TCP handshake is never aborted after a few hundred ms.
@@ -53,7 +54,10 @@ def ensure_process_env(environ: dict | None = None) -> str:
 
 def harness_env(extra: dict | None = None) -> dict:
     """Child environment for DeepSeekHarness(env=...) call sites."""
-    env = {'NODE_OPTIONS': ensure_process_env()}
+    env = {'NODE_OPTIONS': ensure_process_env(), **diagnostics.child_env()}
     if extra:
         env.update(extra)
+        for key, value in extra.items():
+            if 'KEY' in key or 'TOKEN' in key:
+                diagnostics.register_secret(value)
     return env
