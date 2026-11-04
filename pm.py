@@ -2166,10 +2166,15 @@ def op_attack(args):
             approve_step=getattr(args,'approve_step',None),
             abandon_running_step=getattr(args,'abandon_running_step',None))
         line('  Остановка: ' + safe_display(result['stop_reason']))
+        if result['stop_reason']=='role_report_incomplete_requires_review':
+            line('  Отчёт неполон; результаты сохранены. Исход действий требует проверки оператором. '
+                 'Автоматический повтор роли заблокирован.')
         line(f"  Исследовательская цель подтверждена: {result['succeeded']}")
         for step in result['steps']:
             decision=step['decision']
             line(f"  Шаг #{step['id']} {step['status']} · {decision.get('role') or decision.get('action','invalid')} · отчёт {step['report_iteration']}")
+            if step.get('report_path'):
+                line('    Сохранённый отчёт: ' + safe_display(step['report_path']))
             if decision:
                 line('    Вопрос: ' + safe_display(decision['question']))
                 line('    Основание: ' + safe_display(decision['reason']))

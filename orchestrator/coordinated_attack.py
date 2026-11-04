@@ -50,6 +50,11 @@ def ensure_schema(db):
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(task_id,step_no), UNIQUE(task_id,report_iteration));
     ''')
+    columns = {r[1] for r in db.execute('PRAGMA table_info(pm_coordinator_steps)')}
+    for column in ('knowledge_before_sha256','knowledge_after_sha256','assignment_json'):
+        if column not in columns:
+            db.execute(f'ALTER TABLE pm_coordinator_steps ADD COLUMN {column} TEXT')
+    db.commit()
 
 
 @contextmanager
@@ -79,6 +84,48 @@ def authorization(db, context, mapped):
     return None
 
 
+def semantic_set(values):
+    """Ignore insertion order and duplicate evidence for the same content."""
+    return sorted({encoded(value) for value in values})
+
+
+def access_knowledge(essential):
+    return {key:essential['access_state'][key] for key in ('level','signal','triage_done','pending')}
+
+
+def knowledge_state(db, task_id, context, mapped, essential, goals, results, confirmed):
+    """A content fingerprint, not a truth evaluator or execution counter.
+
+    Captures below remain untrusted observations. Only the existing validators
+    can change hypothesis/access/objective status. Read-back tools and local
+    replays are excluded; changing their wrapper/ID is not new target evidence.
+    Use all saved facts, not a timestamp-ordered context window.
+    """
+    captures = sorted({
+        digest({'text':r['text'].replace('\r\n','\n'),'status':r['status'],'exit_code':r.get('exit_code')})
+        for r in results if r.get('provenance')=='network'
+        and r['tool'] in ('net_exec','poc_run','session','network_probe',
+                          'http_get','http_headers','http_path','http_document','http_capture')
+        and r['text'].strip()})
+    proofs = [list(row) for row in db.execute(
+        "SELECT claim,kind,status,quote,objective_key FROM pm_hypotheses WHERE task_id=? "
+        "AND status IN ('confirmed','refuted') AND probe_result_id<>'' AND quote<>''",(task_id,))]
+    assets = [list(row) for row in db.execute(
+        'SELECT kind,key,status,evidence_quote,origin_target,objective_key FROM pm_assets WHERE task_id=?',(task_id,))]
+    triage = {key:{k:value[k] for k in ('summary','quote')}
+              for key,value in essential['triage']['categories'].items()}
+    services = [{**{k:entry[k] for k in ('target','protocol','port','state')},
+                 'identifications':semantic_set({k:v for k,v in item.items() if k!='source'}
+                                                for item in entry['identifications'])}
+                for entry in mapped['entries']]
+    return {'version':2,'intent':context['intent'],'target':context['target'],
+            'goals':[{k:g.get(k) for k in ('key','title','role','weight','status')} for g in goals['objectives']],
+            'goal_policy':{k:goals.get(k) for k in ('mode','exclusive','expected_flags')},
+            'access':access_knowledge(essential),'triage':triage,'services':semantic_set(services),
+            'proofs':semantic_set(proofs),'assets':semantic_set(assets),
+            'captures_untrusted':captures,'confirmed_flags':confirmed}
+
+
 def snapshot(db, task_id, expect):
     context = actions.task_context(db, task_id)
     row = db.execute('SELECT COALESCE(MAX(iteration),0)+1 FROM pm_agent_action_reports WHERE task_id=?',
@@ -88,7 +135,7 @@ def snapshot(db, task_id, expect):
     goals = objectives.objective_status(db, task_id)
     facts = actions.fact_state.list_hypotheses(db, task_id, limit=200)
     assets = actions.fact_state.list_assets(db, task_id, limit=80)
-    results = actions.stage_results(task_id)
+    results = actions.stage_results(task_id,include_metadata=True)
     reports = [dict(zip(('role','iteration'), r)) for r in db.execute(
         'SELECT role,iteration FROM pm_agent_action_reports WHERE task_id=? '
         'ORDER BY iteration DESC,role LIMIT 12', (task_id,))]
@@ -114,29 +161,23 @@ def snapshot(db, task_id, expect):
     recent = results[-20:]
     for item in recent:
         if isinstance(item['result_id'], str) and item['result_id']:
-            refs['result:' + item['result_id']] = {k: item[k] for k in ('result_id','tool','status')}
+            refs['result:' + item['result_id']] = {
+                **{k:item[k] for k in ('result_id','tool','status','provenance','exit_code')},
+                'excerpt_untrusted':actions.clip_result(item['text'],max_chars=1200),
+                'text_sha256':digest(item['text'])}
     for item in mapped['hints']:
         refs['hint:' + digest(item)] = item
     stop = attack_loop.objective_stop_reason(goals, len(confirmed), expect)
     success = stop in ('flag_confirmed','goal_confirmed','objectives_done')
-    # A new report number, prose summary, or touched timestamp is not new evidence.
-    def stable(value):
-        if isinstance(value, dict):
-            return {k: stable(v) for k,v in value.items() if k not in (
-                'updated_at','created_at','fresh','scan_mode','scan_mode_reason','last_seen_at','when')}
-        if isinstance(value, list):
-            return [stable(v) for v in value]
-        return value
-    meaningful = {'intent': context['intent'], 'target': context['target'], 'goals': stable(goals),
-                  'access': essential, 'services': stable(mapped['entries']),
-                  'proofs': [stable(f) for f in facts if f['status'] in ('confirmed','refuted') and f['probe_result_id']],
-                  'assets': stable(assets), 'result_ids': [r['result_id'] for r in results], 'confirmed': confirmed}
+    knowledge = knowledge_state(db,task_id,context,mapped,essential,goals,results,confirmed)
     return {'task': context, 'objectives': goals, 'service_map': mapped, 'essential_state': essential,
             'open_hypotheses': [f for f in facts if f['status']=='untested'],
             'refutations': [f for f in facts if f['status']=='refuted' and f['probe_result_id'] and f['quote']],
             'recent_results': [{**{k:r[k] for k in ('result_id','tool','status')},
                                 'excerpt_untrusted': actions.clip_result(r['text'], max_chars=600)} for r in recent],
-            'references': refs, 'state_sha256': digest(meaningful), 'confirmed_flags': confirmed,
+            'references': refs, 'knowledge_sha256':digest(knowledge),
+            'history_sha256':digest({'result_ids':[r['result_id'] for r in results],'reports':reports}),
+            'state_sha256':digest(knowledge), 'confirmed_flags': confirmed,
             'success_verified': success, 'verified_stop_reason': stop,
             'authorization_block': authorization(db, context, mapped)}
 
@@ -162,7 +203,7 @@ def parse_decision(value, state, roles):
         access = state['essential_state']['access_state']
         if access['pending'] and decision['role'] != 'access':
             raise ValueError('access_triage_required')
-        actions.validate_triage_objective(access, decision['question'])
+        actions.validate_triage_objective(access,decision['question']+'\n'+decision['expected_result'])
     elif decision['role'] is not None:
         raise ValueError('non_role_action_has_role')
     if decision['action'] == 'stop':
@@ -183,8 +224,12 @@ def decision_prompt(state, roles, previous, error=None):
             "Use existing reference keys. A service hint or a model claim is not a verified fact. "
             "Do not claim success unless success_verified is true. Access requires explicit per-step operator approval. "
             "When access.pending is true, choose ACCESS with a question starting 'ТРИАЖ:'; do not escalate. "
-            "Do not repeat a question without new evidence. Never provide hidden reasoning; reason is one short "
-            "operational justification. Return ONLY JSON with exactly these fields: "
+            "Do not repeat a question without new evidence. "
+            "A new result ID or reading old output is not new knowledge. To verify independently, choose a "
+            "distinct probe question and observable result, referencing the earlier evidence it checks; "
+            "changing the role alone does not permit repeating the same question. "
+            "Never provide hidden reasoning; reason is one short operational justification. "
+            "Return ONLY JSON with exactly these fields: "
             '{"action":"run_role|wait_operator|stop","role":"recon|vuln|access|verify or null",'
             '"question":"one concrete check","reason":"brief justification",'
             '"references":["intent"],"expected_result":"observable evidence expected",'
@@ -233,9 +278,9 @@ def insert_step(db, run_id, task_id, decision, state, budgets, status='planned',
         key = actions.title_key(decision.get('question',''))
         cursor = db.execute('''INSERT INTO pm_coordinator_steps
             (run_id,task_id,step_no,status,decision_json,state_sha256,question_key,report_iteration,
-             budgets_json,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+             budgets_json,error,created_at,updated_at,knowledge_before_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (run_id,task_id,step_no,status,encoded(decision),state['state_sha256'],key,iteration,
-             encoded(budgets),error,now(),now()))
+             encoded(budgets),error,now(),now(),state['knowledge_sha256']))
     return cursor.lastrowid
 
 
@@ -246,14 +291,18 @@ def repeated(db, task_id, decision, state):
         old = json.loads(row['decision_json'])
         if (old.get('action')=='run_role'
                 and row['question_key']==actions.title_key(decision['question'])
-                and row['status'] in ('running','completed','failed')
-                and (row['state_sha256']==state['state_sha256'] or row['outcome_uncertain'])):
+                and (row['status'] in ('running','completed') or row['outcome_uncertain'])
+                # Compare with what the check already learned, not its input.
+                # Legacy completed steps have no post-state; conservatively do
+                # not replay their question using an incomparable old hash.
+                and (row['knowledge_after_sha256'] in (None,state['knowledge_sha256'])
+                     or row['outcome_uncertain'])):
             return True
     return False
 
 
 def significant(before, after, report):
-    if before['essential_state']['access_state'] != after['essential_state']['access_state']:
+    if access_knowledge(before['essential_state']) != access_knowledge(after['essential_state']):
         return 'access_state_changed'
     if set(after['confirmed_flags']) - set(before['confirmed_flags']):
         return 'confirmed_flag_found'
@@ -263,6 +312,48 @@ def significant(before, after, report):
             or f.get('confidence')=='high' and f.get('impact')) for f in report.get('findings',[])):
         return 'significant_finding'
     return None
+
+
+def resolve_assignment(db, decision, state):
+    """Resolve selected records in this task's current catalog, bounded per reference."""
+    data = []
+    for reference in decision['references']:
+        if reference not in state['references']:
+            raise ValueError('unknown_reference')
+        value = state['references'][reference]
+        if reference == 'intent':
+            value = {'kind':'operator_intent','text':state['task']['intent']}
+        elif reference.startswith('objective:'):
+            value = next((g for g in state['objectives']['objectives'] if g['key']==value['key']),None)
+            if value is None:
+                raise ValueError('unknown_reference')
+        elif reference.startswith('observation:'):
+            task_id,target = state['task']['task_id'],state['task']['target']
+            row = db.execute('''SELECT o.data_json FROM network_observations o
+                JOIN network_job_runs r ON r.id=o.run_id
+                JOIN network_phase_plans p ON p.id=r.plan_id
+                WHERE o.id=? AND r.id=? AND p.id=? AND o.task_id=? AND p.task_id=?
+                  AND o.target=? AND p.target=? AND r.status='completed' ''',
+                (value['key']['id'],value['run_id'],value['plan_id'],task_id,task_id,target,target)).fetchone()
+            if not row:
+                raise ValueError('unknown_reference')
+            value = {**value,'observation_untrusted':json.loads(row[0])}
+        elif reference.startswith('report:'):
+            row = db.execute('SELECT report_json FROM pm_agent_action_reports '
+                             'WHERE task_id=? AND role=? AND iteration=? AND target=?',
+                             (state['task']['task_id'],value['role'],value['iteration'],state['task']['target'])).fetchone()
+            if not row:
+                raise ValueError('unknown_reference')
+            value = {**value,'report_untrusted':json.loads(row[0])}
+        raw = encoded(value)
+        if len(raw) <= 1800:
+            data.append({'reference':reference,'value':value,'truncated':False})
+        else:
+            excerpt = actions.clip_result(raw,max_chars=1800)
+            data.append({'reference':reference,'excerpt_untrusted':excerpt,'truncated':True,
+                         'original_characters':len(raw),'sha256':digest(value)})
+    return {'question':decision['question'],'expected_result':decision['expected_result'],
+            'references':decision['references'],'data':data,'reference_character_limit':1800}
 
 
 def changed_records(before, after):
@@ -416,6 +507,17 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 if repeated(db,task_id,decision,state):
                     update_step(db,step_id,'failed',error='repeated_question_without_new_evidence')
                     return finish('repeated_question_without_new_evidence','failed')
+                # A model request is not a transaction over task state. Resolve
+                # again immediately before dispatch, including resumed steps.
+                state = snapshot(db,task_id,expect_flags)
+                try:
+                    parse_decision(decision,state,roles)
+                    if state['authorization_block'] or state['state_sha256'] != pending['state_sha256']:
+                        raise ValueError('assignment_state_changed')
+                    assignment = resolve_assignment(db,decision,state)
+                except ValueError:
+                    update_step(db,step_id,'failed',error='assignment_state_changed')
+                    return finish('assignment_state_changed_replan','failed')
                 saved_budget=json.loads(pending['budgets_json'])
                 effective={k:min(saved_budget[k],budgets[k]) for k in budgets}
                 iteration=pending['report_iteration']
@@ -423,12 +525,13 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 if db.execute('SELECT 1 FROM pm_agent_action_reports WHERE task_id=? AND iteration=?',(task_id,iteration)).fetchone():
                     iteration=max(db.execute('SELECT COALESCE(MAX(iteration),0) FROM pm_agent_action_reports WHERE task_id=?',(task_id,)).fetchone()[0],
                                   max((r['report_iteration'] or 0 for r in steps(db,task_id)),default=0))+1
-                update_step(db,step_id,'running',report_iteration=iteration)
+                update_step(db,step_id,'running',report_iteration=iteration,assignment_json=encoded(assignment))
                 before = state
                 db.commit()
                 try:
                     role_runner(task_id,decision['role'],decision['question'],iteration,
-                                effective['poc_budget'],effective['step_limit'],api_key=key(),max_tokens=effective['max_tokens'])
+                                effective['poc_budget'],effective['step_limit'],api_key=key(),max_tokens=effective['max_tokens'],
+                                assignment=assignment)
                     raw=db.execute('SELECT report_json,role FROM pm_agent_action_reports WHERE task_id=? AND role=? AND iteration=?',
                                    (task_id,decision['role'],iteration)).fetchone()
                     if not raw:
@@ -436,10 +539,22 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                     report=json.loads(raw[0])
                     if report.get('stage_aborted'):
                         raise RuntimeError('Role saved only an aborted report')
+                    if report.get('report_incomplete'):
+                        state=snapshot(db,task_id,expect_flags)
+                        update_step(db,step_id,'failed',report_path=report.get('report_path'),
+                                    error='report_incomplete',outcome_uncertain=1,
+                                    knowledge_after_sha256=state['knowledge_sha256'])
+                        with db:
+                            db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
+                        diagnostics.emit('coordinator.pause',step_id=step_id,coordinator_run_id=run_id,
+                                         reason='report_incomplete',report_path=report.get('report_path'),outcome_uncertain=True,
+                                         reason_summary='Отчёт неполон; результаты сохранены. Исход действий требует проверки оператором.')
+                        return finish('role_report_incomplete_requires_review','waiting_operator')
                     registry=flag_verify.scan(task_id,db=db)
                     objectives.process_report(db,task_id,report,registry)
                     state=snapshot(db,task_id,expect_flags)
-                    update_step(db,step_id,'completed',report_path=report.get('report_path'))
+                    update_step(db,step_id,'completed',report_path=report.get('report_path'),
+                                knowledge_after_sha256=state['knowledge_sha256'])
                 except KeyboardInterrupt:
                     # Keep running: tools may already have changed the target.
                     update_step(db,step_id,'running',outcome_uncertain=1,error='interrupted_unknown_outcome')
@@ -454,8 +569,9 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                     return finish('role_failed_outcome_requires_review','waiting_operator')
                 diagnostics.emit('coordinator.state_changed',step_id=step_id,
                                  coordinator_run_id=run_id,identifiers=changed_records(before,state),
-                                 changed=before['state_sha256']!=state['state_sha256'],
-                                 before_sha256=before['state_sha256'],after_sha256=state['state_sha256'])
+                                 changed=before['knowledge_sha256']!=state['knowledge_sha256'],
+                                 before_sha256=before['knowledge_sha256'],after_sha256=state['knowledge_sha256'],
+                                 history_changed=before['history_sha256']!=state['history_sha256'])
                 pause=significant(before,state,report)
                 if pause:
                     with db:

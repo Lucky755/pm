@@ -70,13 +70,19 @@ class ConsoleV2Tests(unittest.TestCase):
         db.close()
 
     def test_only_confirmed_user_root_evidence_enables_cleanup(self):
+        from orchestrator import flag_verify
         db = sqlite3.connect(':memory:')
-        db.execute('''CREATE TABLE pm_verified_flags (
-            task_id INTEGER, flag_kind TEXT, verified INTEGER, evidence_id TEXT)''')
-        db.execute("INSERT INTO pm_verified_flags VALUES (10,'user',1,'evidence-1')")
-        db.execute("INSERT INTO pm_verified_flags VALUES (10,'root',0,'evidence-2')")
+        self.addCleanup(db.close)
+        flag_verify.ensure_schema(db)
+        db.executemany('INSERT INTO pm_verified_flags '
+                       '(task_id,value,status,evidence_count,reported_by,sources_json,created_at,updated_at) '
+                       'VALUES (?,?,?,?,?,?,?,?)',
+                       [(10,'FLAG{user_fixture}','confirmed',2,'verify','{}','2026-10-31','2026-10-31'),
+                        (10,'FLAG{root_fixture}','candidate',1,'access','{}','2026-10-31','2026-10-31')])
         self.assertFalse(pm.flags_confirmed_by_evidence(db, 10))
-        db.execute("UPDATE pm_verified_flags SET verified=1 WHERE flag_kind='root'")
+        db.execute("UPDATE pm_verified_flags SET status='confirmed' WHERE value='FLAG{root_fixture}'")
+        self.assertFalse(pm.flags_confirmed_by_evidence(db, 10))
+        db.execute("UPDATE pm_verified_flags SET evidence_count=2 WHERE value='FLAG{root_fixture}'")
         self.assertTrue(pm.flags_confirmed_by_evidence(db, 10))
         with patch('builtins.input', return_value='no'), redirect_stdout(io.StringIO()):
             with patch.object(pm, 'op_close') as close:

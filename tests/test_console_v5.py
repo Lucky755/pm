@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import sqlite3
+import tempfile
 import types
 import unittest
 from contextlib import nullcontext, redirect_stdout
@@ -16,8 +17,8 @@ spec2 = importlib.util.spec_from_file_location('pm_v5_broker', ROOT / 'executor/
 broker = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(broker)
 
 
-def db_test():
-    db = sqlite3.connect(':memory:')
+def db_test(path=':memory:'):
+    db = sqlite3.connect(path)
     db.executescript('''
     CREATE TABLE tasks(id INTEGER PRIMARY KEY,target TEXT);
     CREATE TABLE task_scope_settings(task_id INTEGER PRIMARY KEY,initial_target TEXT);
@@ -88,7 +89,24 @@ class Tests(unittest.TestCase):
         db.close()
 
     def test_successor_retains_old_task_and_closes_rules(self):
-        db=db_test()
+        temporary=tempfile.TemporaryDirectory(prefix='pm-lineage-fixture-')
+        self.addCleanup(temporary.cleanup)
+        database=Path(temporary.name)/'tasks.db'
+        db_test(database).close()
+        # Apply the real migrations, rather than duplicating an old lineage schema.
+        with patch.object(pm,'DB',database):db=pm.connect()
+        self.addCleanup(db.close)
+        transitions=Path(temporary.name)/'transitions'
+        save_transition=pm.save_transition_snapshot
+        complete_transition=pm.complete_pending_transition
+        def create_successor(args,*,defer_execution):
+            with db:
+                db.execute('INSERT INTO tasks VALUES(?,?)',(12,args.target))
+                db.execute('INSERT INTO task_scope_settings VALUES(?,?)',(12,args.target))
+                db.execute('INSERT INTO pm_operator_approvals VALUES(?,?,?,?,?,NULL)',
+                           (12,args.target,args.target+'/32','tun0','2026-10-31'))
+                db.execute('INSERT INTO pm_task_intents VALUES(?,?,?)',(12,args.task,'2026-10-31'))
+            return 12
         with db:
             db.execute('INSERT INTO pm_operator_approvals VALUES(?,?,?,?,?,NULL)',
                        (11,'10.10.10.65','10.10.10.65/32','tun0','2026-10-31'))
@@ -103,13 +121,18 @@ class Tests(unittest.TestCase):
         with patch.dict('sys.modules',{'orchestrator':orch,'orchestrator.master_scheduler':mod}),\
              patch.object(pm,'connect',return_value=db),patch.object(pm,'broker_is_trusted'),\
              patch.object(pm,'sudo_authenticate'),patch.object(pm,'sudo_checked',side_effect=responses) as sudo,\
-             patch.object(pm,'op_new',return_value=12) as newborn,\
+             patch.object(pm,'op_new',side_effect=create_successor) as newborn,\
+             patch.object(pm,'save_transition_snapshot',side_effect=lambda *a,**kw:save_transition(*a,**kw,transition_root=transitions)),\
+             patch.object(pm,'complete_pending_transition',side_effect=lambda *a:complete_transition(*a,transition_root=transitions)),\
+             patch('builtins.input',return_value='no'),\
              patch.object(pm,'launch_configured_task') as launch,\
              patch.object(pm,'get_egress',return_value='tun0'),redirect_stdout(io.StringIO()):
             pm.op_change_ip(args)
         self.assertEqual(db.execute('SELECT target FROM tasks WHERE id=11').fetchone()[0],'10.10.10.65')
         self.assertEqual(db.execute('SELECT successor_task_id FROM pm_task_lineage').fetchone()[0],12)
         self.assertIsNotNone(db.execute('SELECT closed_at FROM pm_operator_approvals WHERE task_id=11').fetchone()[0])
+        self.assertEqual(db.execute('SELECT transfer_state FROM pm_task_lineage').fetchone()[0],'done')
+        self.assertFalse((transitions/'12.json').exists())
         self.assertTrue(newborn.call_args.kwargs['defer_execution'])
         self.assertEqual(newborn.call_args.args[0].task,'Find flags, no brute force')
         self.assertEqual(sudo.call_args_list[-1].args[0][:3],['teardown','--task-id','11'])
