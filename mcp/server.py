@@ -28,7 +28,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 
-ROOT = Path("/home/lucky/pentest-master")
+ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / ".venv/bin/python"
 
 sys.path.insert(0, str(ROOT))

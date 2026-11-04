@@ -37,6 +37,7 @@ class ConsoleV2Tests(unittest.TestCase):
                 "assert key == 'secret_for_unit_test'\n"
                 "print('Task ID: 12', flush=True)\n"
                 "print(json.dumps({'tasks':[{'agent':'recon','instruction':'inspect'}]}), flush=True)\n"
+                + 'print(' + repr(pm.planner_protocol.encode_result(12, {'tasks': [{'agent': 'recon', 'instruction': 'inspect'}]})) + ', flush=True)\n'
             )
             out = io.StringIO()
             with patch.object(pm, 'ROOT', project), redirect_stdout(out):

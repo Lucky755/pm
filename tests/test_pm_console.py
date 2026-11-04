@@ -92,6 +92,7 @@ class Tests(unittest.TestCase):
 
     def test_planner_pty_parses_id_and_hides_raw_json(self):
         script = "import json; print('[1] Requesting plan', flush=True); print('Task ID: 17', flush=True); print('Status: pending_review', flush=True); print(json.dumps({'summary':'Lab test','tasks':[{'agent':'recon','instruction':'Inspect services'}]}), flush=True)"
+        script += '; print(' + repr(pm.planner_protocol.encode_result(17, {'summary': 'Lab test', 'tasks': [{'agent': 'recon', 'instruction': 'Inspect services'}]})) + ', flush=True)'
         out = io.StringIO()
         with redirect_stdout(out):
             task_id, plan = pm.read_planner_stream(['python', '-u', '-c', script])

@@ -11,12 +11,14 @@ import base64
 from html.parser import HTMLParser
 import ipaddress
 import json
+import os
 import re
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
+from orchestrator import diagnostics
 
 ROOT = Path(__file__).resolve().parents[1]
 BROKER = '/usr/local/sbin/pm-netguard'
@@ -480,6 +482,7 @@ class HTTPResult(str):
         return obj
 
 
+@diagnostics.operation
 def request(task_id, target, scheme, hostname, port, path, *, runner=subprocess.run, profile='http_path'):
     if profile not in ('http_path', 'http_document'):
         raise ValueError('Unsupported HTTP discovery profile')
@@ -487,14 +490,16 @@ def request(task_id, target, scheme, hostname, port, path, *, runner=subprocess.
                '--profile', profile, '--target', target,
                '--port', str(port), '--scheme', scheme, '--path', path,
                '--hostname', hostname if hostname != target else '']
-    result = runner(command, stdin=subprocess.DEVNULL, capture_output=True,
+    result = runner(command, env={**os.environ, **diagnostics.child_env()}, stdin=subprocess.DEVNULL, capture_output=True,
                     text=True, errors='replace', timeout=60, check=False)
+    diagnostics.execution_exit(result.returncode)
     try:
         payload = json.loads(result.stdout)
     except (ValueError, TypeError) as exc:
         raise ValueError('NetGuard HTTP probe did not return JSON') from exc
     if not isinstance(payload, dict) or not isinstance(payload.get('stdout', ''), str):
         raise ValueError('NetGuard HTTP probe returned an invalid result schema')
+    diagnostics.record_result(payload, result.returncode)
     limited = (payload.get('status') == 'error' and payload.get('exit_code') == 63)
     if result.returncode or (payload.get('status') != 'completed' and not limited) or payload.get('profile') != profile:
         raise ValueError('NetGuard HTTP probe blocked or failed: ' + str(payload.get('error') or payload.get('stderr', ''))[:150])
@@ -511,8 +516,10 @@ def request_document(*args, **kwargs):
     return request(*args, profile='http_document', **kwargs)
 
 
+@diagnostics.operation
 def require_capture_support(*, runner=subprocess.run):
-    result = runner([BROKER,'capabilities'],capture_output=True,text=True,timeout=5,check=False)
+    result = runner([BROKER,'capabilities'],env={**os.environ, **diagnostics.child_env()},
+                    capture_output=True,text=True,timeout=5,check=False)
     try:
         payload = json.loads(result.stdout)
     except (ValueError,TypeError):
@@ -522,8 +529,10 @@ def require_capture_support(*, runner=subprocess.run):
             or not isinstance(payload.get('capture_limits'),list)
             or not all(limit in payload['capture_limits'] for limit in (2*1024*1024,8*1024*1024))):
         raise ValueError('NetGuard broker needs the HTTP capture update; install executor/netguard_root.py before resume')
+    diagnostics.record_result({'status': 'completed'}, result.returncode)
 
 
+@diagnostics.operation
 def request_capture(task_id, target, scheme, hostname, port, path, *, runner=subprocess.run, limit_bytes=2*1024*1024):
     from orchestrator import http_artifacts as artifacts
     if limit_bytes not in (artifacts.DEFAULT_BODY,artifacts.MAX_BODY):
@@ -531,11 +540,13 @@ def request_capture(task_id, target, scheme, hostname, port, path, *, runner=sub
     command = ['sudo','-n',BROKER,'run','--task-id',str(task_id),'--profile','http_capture',
                '--target',target,'--scheme',scheme,'--hostname',hostname,'--port',str(port),'--path',path,
                '--capture-limit',str(limit_bytes)]
-    result = runner(command,stdin=subprocess.DEVNULL,capture_output=True,text=True,errors='replace',timeout=60,check=False)
+    result = runner(command,env={**os.environ, **diagnostics.child_env()},stdin=subprocess.DEVNULL,capture_output=True,text=True,errors='replace',timeout=60,check=False)
+    diagnostics.execution_exit(result.returncode)
     try:
         payload = json.loads(result.stdout)
     except (ValueError,TypeError) as exc:
         raise ValueError('HTTP capture broker returned no valid JSON') from exc
+    diagnostics.record_result(payload, result.returncode)
     expected = {'capture_protocol':1,'task_id':task_id,'target':target,'profile':'http_capture',
                 'port':port,'scheme':scheme,'hostname':hostname,'path':path}
     if result.returncode or not isinstance(payload,dict) or any(payload.get(k) != v for k,v in expected.items()):
@@ -808,6 +819,7 @@ def reparse_saved(db, task_id, path=None):
     return results
 
 
+@diagnostics.stage
 def execute_round(db, task_id, max_requests=2, *, requester=request, document_requester=request_document,
                   capture=False, capture_requester=request_capture):
     """Execute up to N new GETs, after already-authenticated Console approval."""

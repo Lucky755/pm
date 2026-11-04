@@ -44,6 +44,8 @@ def clean(value, limit=500):
     text = re.sub(r'(?i)((?:api[_-]?key|password|passwd|secret|token)\s*[=:]\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
     text = re.sub(r'(https?://)[^/@\s]+:[^/@\s]+@', r'\1[REDACTED]@', text)
+    text = re.sub(r'(?i)(--(?:api[-_]?key|password|passwd|secret|token|cookie)(?:=|\s+))[^\s]+',
+                  r'\1[REDACTED]', text)
     return text[:limit] if limit is not None else text
 
 
@@ -58,7 +60,8 @@ def parameters(arguments):
         return {}
     result = {}
     for key in ('task_id', 'target', 'port', 'ports', 'profile', 'action', 'timeout',
-                'offset', 'limit', 'scheme', 'role', 'iteration', 'plan_id', 'host', 'filename', 'poc_file'):
+                'offset', 'limit', 'limit_bytes', 'scheme', 'role', 'iteration', 'plan_id',
+                'host', 'hostname', 'path', 'filename', 'poc_file'):
         value = arguments.get(key)
         if isinstance(value, (int, float, bool)) or value is None:
             if key in arguments:
@@ -120,7 +123,7 @@ def journal(ctx=None):
 def display(event, stream=None):
     fields = ' '.join(f'{key}={clean(event[key])}' for key in
                       ('run_id', 'task_id', 'role', 'iteration', 'status', 'duration_seconds',
-                       'exit_code', 'result_id', 'reason', 'error_type', 'parameters', 'table', 'identifiers',
+                       'exit_code', 'executor_exit_code', 'result_id', 'reason', 'reason_category', 'reason_summary', 'error_type', 'parameters', 'table', 'identifiers',
                        'previous_state', 'current_state', 'input_tokens', 'cache_read_tokens',
                        'output_tokens', 'unfinished', 'journal')
                       if event.get(key) is not None)
@@ -234,6 +237,43 @@ def exception_status(exc):
     return 'error'
 
 
+def failure_details(payload=None, exc=None):
+    """Classify failure without copying stdout, stderr, commands or environments."""
+    payload = payload if isinstance(payload, dict) else {}
+    status = payload.get('status')
+    text = str(payload.get('error') or payload.get('reason') or payload.get('stderr') or '') if exc is None else str(exc)
+    lowered = text.casefold()
+    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)) or status == 'timeout' or payload.get('kind') == 'timeout':
+        category, summary = 'timeout', 'Executor exceeded the configured time limit.'
+    elif payload.get('kind') in ('scope', 'scope_denied') or any(token in lowered for token in ('outside authorized scope', 'outside the task scope', 'outside task scope', 'outside scope', 'scope mismatch', 'outside the authorized', 'scope denied', 'за пределами scope')):
+        category, summary = 'scope_denied', 'Target is outside the authorized task scope.'
+    elif isinstance(exc, FileNotFoundError) or any(token in lowered for token in ('executor unavailable', 'executor not found', 'broker unavailable', 'netguard недоступен', 'no such file', 'исполнитель недоступен')):
+        category, summary = 'executor_unavailable', 'Executor is unavailable; check its installation and path.'
+    elif isinstance(exc, PermissionError) or '[errno 13]' in lowered:
+        category, summary = 'permission_denied', 'Permission to invoke the executor was denied.'
+    elif exc is not None and isinstance(exc.__cause__, json.JSONDecodeError):
+        category, summary = 'protocol_error', 'Executor returned an invalid JSON response.'
+    elif isinstance(exc, KeyboardInterrupt) or isinstance(exc, SystemExit) and exc.code == 130:
+        category, summary = 'interrupted', 'Operation interrupted by the operator.'
+    elif exc is not None:
+        category = 'exception'
+        # Timeout/CalledProcessError can embed command arguments. Structured
+        # dumps can embed outputs. Preserve the original exception for callers.
+        if isinstance(exc, subprocess.SubprocessError) or re.search(r"['\"]?(?:stdout|stderr|argv|env|response_b64)['\"]?\s*[:=]", text, re.I):
+            summary = type(exc).__name__ + ': operation failed; diagnostic dump withheld.'
+        else:
+            summary = type(exc).__name__ + ': ' + clean(text, limit=200)
+    elif status == 'blocked':
+        category, summary = 'policy_refusal', 'Executor refused the request before execution.'
+    elif status == 'nonzero_exit' or payload.get('exit_code') not in (None, 0):
+        category, summary = 'nonzero_exit', 'Command returned a nonzero exit code; the check is not confirmed.'
+    elif status in ('error', 'failed'):
+        category, summary = 'executor_error', 'Executor reported failure; inspect the linked evidence or original operation error.'
+    else:
+        return {}
+    return {'reason_category': category, 'reason_summary': clean(summary, limit=240)}
+
+
 class Action:
     def __init__(self, kind, name, *, console=True, **fields):
         self.kind, self.name, self.console, self.fields = kind, name, console, fields
@@ -253,8 +293,13 @@ class Action:
 
     def __exit__(self, typ, exc, tb):
         if exc is not None:
-            self.status = exception_status(exc)
-            self.fields['error_type'] = type(exc).__name__
+            status = exception_status(exc)
+            if status == 'interrupted' or self.status not in ('blocked', 'error', 'failed', 'timeout', 'nonzero_exit'):
+                self.status = status
+            if status != 'completed':
+                self.fields['error_type'] = type(exc).__name__
+                if status == 'interrupted' or not self.fields.get('reason_category'):
+                    self.fields.update(failure_details(exc=exc))
         emit(self.kind + '.end', name=self.name, parent_action_id=self.parent,
              status=self.status, duration_seconds=round(time.monotonic() - self.started, 3),
              console=self.console, **self.fields)
@@ -332,7 +377,7 @@ def stage(function):
             return function(*args, **kwargs)
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        if function.__name__ == 'execute_job' and isinstance(bound.arguments.get('db'), sqlite3.Connection):
+        if function.__name__ in ('execute_job', 'run_plan') and isinstance(bound.arguments.get('db'), sqlite3.Connection):
             try:
                 row = bound.arguments['db'].execute('SELECT task_id FROM network_phase_plans WHERE id=?',
                                                      (bound.arguments['plan_id'],)).fetchone()
@@ -351,6 +396,8 @@ def stage(function):
                 if isinstance(result, dict):
                     if result.get('stop_reason'):
                         stop(result['stop_reason'])
+                    if result.get('status'):
+                        record_result(result)
                     action.status = outcome({'status': result.get('status', 'completed'),
                                              'exit_code': action.fields.get('exit_code')})
                 return result
@@ -387,9 +434,7 @@ def tool(function):
             except ValueError:
                 payload = {}
             if isinstance(payload, dict):
-                action.fields.update({k: payload[k] for k in ('exit_code', 'result_id') if k in payload})
-                # run_capability may have already attached the original helper exit code.
-                action.status = outcome({**payload, **{k: v for k, v in action.fields.items() if k == 'exit_code'}})
+                record_result(payload)
             return value
     return wrapped
 
@@ -475,7 +520,7 @@ class Observer:
                 action.started = started
                 action.status = outcome(payload) if isinstance(payload, dict) and payload.get('status') else 'dispatch_error'
                 if isinstance(payload, dict):
-                    action.fields.update({k: payload[k] for k in ('exit_code', 'result_id') if k in payload})
+                    record_result(payload)
 
 
 @contextmanager
@@ -629,4 +674,72 @@ def committed_changes(function):
         if not db.in_transaction:
             state_diff(before, state_snapshot(db, task_id), task_id)
         return result
+    return wrapped
+
+
+def record_result(payload, returncode=None):
+    """Attach metadata to the current action, preserving the actual return value."""
+    action = _action.get()
+    if not action or not isinstance(payload, dict):
+        return
+    for key in ('exit_code', 'result_id'):
+        if key in payload:
+            action.fields[key] = payload[key]
+    if returncode is not None:
+        action.fields['executor_exit_code'] = returncode
+        action.fields.setdefault('exit_code', returncode)
+    effective = {**payload, 'exit_code': action.fields.get('exit_code')}
+    action.status = outcome(effective)
+    if returncode not in (None, 0) and action.status in ('completed', 'ok', 'success', 'planned', 'already_completed'):
+        action.status = 'nonzero_exit'
+    action.fields.update(failure_details({**effective, 'status': action.status}))
+
+
+def command_parameters(command):
+    values = {}
+    for index, item in enumerate(command[:-1]):
+        if item in ('--task-id', '--target', '--profile', '--port', '--ports', '--scheme'):
+            key = item[2:].replace('-', '_')
+            values[key] = command[index + 1]
+    if str(values.get('task_id', '')).isdigit():
+        values['task_id'] = int(values['task_id'])
+    return parameters(values)
+
+
+def _record_return(value):
+    if isinstance(value, dict):
+        record_result(value)
+    elif isinstance(value, tuple) and len(value) == 2:
+        if isinstance(value[0], dict):
+            record_result(value[0], value[1])
+        elif isinstance(value[1], dict):
+            record_result(value[1], value[0])
+
+
+def call(name, function, *args, task_id=None, parameters=None, **kwargs):
+    if not active():
+        return function(*args, **kwargs)
+    with Action('tool', name, task_id=task_id, parameters=parameters or {}):
+        value = function(*args, **kwargs)
+        _record_return(value)
+        return value
+
+
+def operation(function):
+    """One action around one executor request, including parsing/validation."""
+    signature = inspect.signature(function)
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        if not active():
+            return function(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = parameters(bound.arguments)
+        if isinstance(bound.arguments.get('command'), (list, tuple)):
+            values.update(command_parameters(bound.arguments['command']))
+        with Action('tool', function.__name__, task_id=values.get('task_id', context().get('task_id')),
+                    parameters=values):
+            value = function(*args, **kwargs)
+            _record_return(value)
+            return value
     return wrapped

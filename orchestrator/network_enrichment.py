@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -24,6 +25,7 @@ from pathlib import Path
 ROOT = Path("/home/lucky/pentest-master")
 sys.path.insert(0, str(ROOT))
 
+from orchestrator import diagnostics
 from executor.task_scope import check_action
 from orchestrator.network_jobs import initialize
 from orchestrator.network_workflow import build_evidence_bundle
@@ -291,10 +293,12 @@ def command_for(
     return command
 
 
+@diagnostics.operation
 def executor_call(command, timeout):
     process = subprocess.run(
         command,
         cwd=str(ROOT),
+        env={**os.environ, **diagnostics.child_env()},
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -303,6 +307,7 @@ def executor_call(command, timeout):
         check=False,
     )
 
+    diagnostics.execution_exit(process.returncode)
     try:
         result = json.loads(
             process.stdout
@@ -319,6 +324,7 @@ def executor_call(command, timeout):
             "Executor returned non-object JSON"
         )
 
+    diagnostics.record_result(result, process.returncode)
     return process.returncode, result
 
 
@@ -519,6 +525,7 @@ def parse_facts(profile, text, parameters):
     return facts
 
 
+@diagnostics.stage
 def run_plan(db, plan_id):
     row = db.execute("""
         SELECT
@@ -780,6 +787,7 @@ def show_status(db, task_id):
     ]
 
 
+@diagnostics.entrypoint
 def main():
     parser = argparse.ArgumentParser()
 

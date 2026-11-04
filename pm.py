@@ -40,7 +40,7 @@ PORTS_MAX = 32
 MAX_HOSTNAMES = 12
 TRANSITION_MAX_BYTES = 256 * 1024
 from intent_limits import INTENT_MAX, HINTS_MAX
-from orchestrator import diagnostics
+from orchestrator import diagnostics, planner_protocol
 
 from operator_errors import OperatorError
 
@@ -270,8 +270,8 @@ def ask_approval(db, task_id, target, egress, *, show=True, auto=False):
 
 def sudo_checked(args, *, root=False, timeout=30, allow_error=False):
     argv = ['sudo', '-n', BROKER, *args]
-    proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-                          text=True, timeout=timeout)
+    proc = subprocess.run(argv, env={**os.environ, **diagnostics.child_env()},
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
     try:
         obj = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
@@ -446,6 +446,11 @@ def read_planner_stream(process, api_key=None):
             while '\n' in pending:
                 part, pending = pending.split('\n', 1)
                 part = part.rstrip('\r')
+                if part.startswith(planner_protocol.RESULT_PREFIX):
+                    continue
+                if part.lstrip().startswith(('[EVENT]', '[DIAG-ERROR]')):
+                    line('  ' + safe_display(part))
+                    continue
                 if part.startswith('PM_PLAN_VALIDATION_ERROR:'):
                     continue
                 if part.lstrip().startswith('{'):
@@ -470,15 +475,10 @@ def read_planner_stream(process, api_key=None):
     ids = re.findall(r'(?m)^Task ID:\s*(\d+)\s*$', raw.replace('\r', ''))
     if len(ids) != 1:
         raise OperatorError('Planner не сообщил однозначный Task ID')
-    plan = None
-    start = raw.find('{')
-    if start >= 0:
-        try:
-            plan = json.JSONDecoder().raw_decode(raw[start:])[0]
-        except json.JSONDecodeError:
-            pass
-    if not isinstance(plan, dict) or not isinstance(plan.get('tasks'), list):
-        raise OperatorError('Невозможно проверить план GLM; автоматический запуск запрещён')
+    try:
+        plan = planner_protocol.decode_result(raw.replace('\r', ''), int(ids[0]))
+    except ValueError as exc:
+        raise OperatorError('Невозможно проверить план GLM; автоматический запуск запрещён') from exc
     return int(ids[0]), plan
 
 
@@ -1008,6 +1008,7 @@ def full_scan_open_ports(stdout):
     return sorted(result)
 
 
+@diagnostics.stage
 def run_full_tcp_scan(db, task_id, target):
     """One bounded full scan per explicit console run, with durable retry audit.
 
@@ -1056,8 +1057,9 @@ def run_full_tcp_scan(db, task_id, target):
                              (task_id, target, 'running', datetime.now(timezone.utc).isoformat())).lastrowid
     line('  ' + tint('[SCAN]', 'brand') + f' TCP connect 1–65535 · {target} · --min-rate 1000')
     try:
-        payload, rc = sudo_checked(['run', '--task-id', str(task_id),
+        payload, rc = diagnostics.call('tcp_full', sudo_checked, ['run', '--task-id', str(task_id),
                                     '--profile', 'tcp_full', '--target', target],
+                                   task_id=task_id, parameters={'target': target, 'profile': 'tcp_full'},
                                    timeout=270, allow_error=True)
         if rc or payload.get('status') != 'completed' or payload.get('output_truncated'):
             raise OperatorError('Nmap: ' + str(payload.get('stderr') or payload.get('error') or
@@ -1096,6 +1098,7 @@ def run_full_tcp_scan(db, task_id, target):
         raise
 
 
+@diagnostics.stage
 def preflight_target(db, task_id, target, ports, timeout=2.0):
     """Probe cached ports through the task broker and its existing NetGuard path."""
     try:
@@ -1116,7 +1119,9 @@ def preflight_target(db, task_id, target, ports, timeout=2.0):
     for item in argv:
         command.append('--argv=' + item)
     try:
-        payload, rc = sudo_checked(command, timeout=20, allow_error=True)
+        payload, rc = diagnostics.call('preflight', sudo_checked, command, task_id=task_id,
+                                       parameters={'target': target, 'profile': 'exec', 'ports': ','.join(map(str, selected))},
+                                       timeout=20, allow_error=True)
         if rc or payload.get('status') != 'completed' or payload.get('exit_code') != 0:
             raise OperatorError('Проверка доступности через NetGuard не завершилась: ' +
                                 str(payload.get('error') or payload.get('stderr') or 'ошибка')[:200])

@@ -17,7 +17,7 @@ API_URL = "https://api.experientiallabs.ai/v1/chat/completions"
 MODEL = "glm-5.3-uncensored"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from orchestrator import diagnostics
+from orchestrator import diagnostics, planner_protocol
 # A trailing sentence period is not part of the address: "10.1.1.1." must
 # still be seen, otherwise a stale address survives in the plan text.
 IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)")
@@ -480,6 +480,7 @@ def main():
     print("[3] Plan saved to SQLite.")
     print("Task ID:", task_id)
     print("Status: pending_review")
+    print(planner_protocol.encode_result(task_id, plan), flush=True)
     print(json.dumps(plan, ensure_ascii=False, indent=2))
 
 

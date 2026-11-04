@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -159,9 +160,13 @@ class DiagnosticTests(unittest.TestCase):
         fixture.write_text("""import importlib.util, os
 from pathlib import Path
 import sys, json
-spec = importlib.util.spec_from_file_location('pm_server_fixture', 'mcp/server.py')
+checkout = Path(os.environ['PYTHONPATH']).resolve()
+sys.path.insert(0, str(checkout))
+spec = importlib.util.spec_from_file_location('pm_server_fixture', checkout / 'mcp/server.py')
 s = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(s)
+from executor import tool_catalog
+assert Path(tool_catalog.__file__).resolve().is_relative_to(checkout), 'Executor imported from a different checkout'
 s.CAPABILITY_LOG = Path(os.environ['TEST_CAP_LOG'])
 # A minimal MCP peer: dispatch the project's actual wrapped tool on JSON-RPC.
 # No model runtime, executor, target network, or production task storage.
@@ -179,6 +184,7 @@ for line in sys.stdin:
     print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
 """)
         def call(env):
+            self.assertEqual(env.get('PYTHONPATH'), str(ROOT))
             messages = [
                 {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
                  'params': {'protocolVersion': '2024-11-05', 'capabilities': {},
@@ -195,7 +201,7 @@ for line in sys.stdin:
             self.assertIn('blocked', responses[1]['result']['content'][0]['text'])
         with d.run('MCP integration', 11), d.scope(role='recon', iteration=2):
             with d.Action('model', 'fake request') as request:
-                env = {**d.child_env(), 'TEST_CAP_LOG': str(self.root / 'caps')}
+                env = {**d.child_env(), 'PYTHONPATH': str(ROOT), 'TEST_CAP_LOG': str(self.root / 'caps')}
                 with d.relay():
                     call(env)
                 self.assertEqual(self.ends()[0]['parent_action_id'], request.id)
@@ -208,6 +214,26 @@ for line in sys.stdin:
                     self.assertEqual(overlays[1]['config']['env']['PM_RUN_ID'], d.context()['run_id'])
         self.assertEqual(self.console.getvalue().count('tool.start pm_capability_read'), 1)
         self.assertEqual(self.console.getvalue().count('tool.end pm_capability_read'), 1)
+
+    def test_mcp_fixture_runs_in_relocated_checkout_without_external_pythonpath(self):
+        checkout = self.root / 'relocated-checkout'
+        for directory in ('orchestrator', 'executor', 'mcp'):
+            for source in (ROOT / directory).rglob('*'):
+                if source.suffix not in ('.py', '.mjs') or '__pycache__' in source.parts:
+                    continue
+                destination = checkout / source.relative_to(ROOT)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+        for source in ROOT.glob('*.py'):
+            shutil.copyfile(source, checkout / source.name)
+        (checkout / 'tests').mkdir()
+        shutil.copyfile(Path(__file__), checkout / 'tests/test_run_diagnostics.py')
+        environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH' and key not in d.ENV_KEYS}
+        result = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests',
+                                 '-p', 'test_run_diagnostics.py', '-k', 'process_mcp'],
+                                cwd=checkout, env=environment, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Ran 1 test', result.stderr)
 
     def test_saved_report_state_changes_are_identified_after_commit(self):
         db = sqlite3.connect(':memory:')
