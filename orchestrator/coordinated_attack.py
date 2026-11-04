@@ -4,10 +4,12 @@ The durable checkpoint is committed before dispatch. A running checkpoint is
 never retried automatically, even when a role report happens to exist already.
 """
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
 
@@ -16,6 +18,7 @@ from orchestrator import evidence_pipeline as evidence
 from orchestrator.harness_env import harness_env
 
 LOCK_DIR = actions.ROOT / 'runtime/coordinator_locks'
+_held_tasks = ContextVar('pm_task_locks',default=frozenset())
 MAX_STEPS = 32
 MAX_RETRIES = 2
 FIELDS = {'action', 'role', 'question', 'reason', 'references', 'expected_result', 'stop_kind'}
@@ -59,6 +62,10 @@ def ensure_schema(db):
 
 @contextmanager
 def task_lock(task_id):
+    identity = (os.getpid(),int(task_id))
+    if identity in _held_tasks.get():
+        yield
+        return
     LOCK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (LOCK_DIR / f'{int(task_id)}.lock').open('a+') as handle:
         try:
@@ -66,8 +73,10 @@ def task_lock(task_id):
         except BlockingIOError as exc:
             raise ValueError('A coordinated attack for this task is already active') from exc
         try:
+            token = _held_tasks.set(_held_tasks.get() | {identity})
             yield
         finally:
+            _held_tasks.reset(token)
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
@@ -366,6 +375,11 @@ def changed_records(before, after):
             for name,values in (('added',added),('removed',removed),('changed',changed))}
 
 
+def step_view(row):
+    return {**{key:row[key] for key in ('id','step_no','status','report_iteration','report_path','error','outcome_uncertain')},
+            'decision':json.loads(row['decision_json'])}
+
+
 def result_view(db, run_id, task_id, state, expect, reason, status):
     with db:
         db.execute('UPDATE pm_coordinator_runs SET status=?,stop_reason=?,updated_at=? WHERE id=?',
@@ -375,8 +389,7 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
             'task_id':task_id,'coordinator_run_id':run_id,'stop_reason':reason,
             'expected_flags':expect,'confirmed_flags':state['confirmed_flags'],
             'objectives_matrix':attack_loop.objective_matrix(state['objectives']['objectives']),
-            'steps':[{**{k:r[k] for k in ('id','step_no','status','report_iteration','report_path','error','outcome_uncertain')},
-                      'decision':json.loads(r['decision_json'])} for r in rows]}
+            'steps':[step_view(row) for row in rows]}
 
 
 @diagnostics.stage

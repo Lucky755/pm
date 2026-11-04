@@ -309,12 +309,12 @@ class Action:
 
 
 @contextmanager
-def run(name, task_id=None):
-    if active():
+def run(name, task_id=None, *, fresh=False):
+    if active() and not fresh:
         yield None
         return
     run_id = uuid.uuid4().hex
-    with scope(run_id=run_id, directory=str(EVENT_DIR), task_id=task_id, action_id=None):
+    with scope(run_id=run_id, directory=str(EVENT_DIR), task_id=task_id, action_id=None,role=None,iteration=None):
         outcome = 'completed'
         try:
             with Action('run', name) as action:
@@ -340,12 +340,30 @@ def run(name, task_id=None):
                  unfinished=[e['action_id'] for e in pending], journal=str(journal()))
 
 
+@contextmanager
+def process_environment():
+    """Keep ordinary subprocesses on the current manual operation's run."""
+    previous = {key:os.environ.get(key) for key in ENV_KEYS}
+    os.environ.update(child_env())
+    try:
+        yield
+    finally:
+        for key,value in previous.items():
+            if value is None:
+                os.environ.pop(key,None)
+            else:
+                os.environ[key]=value
+
+
 def entrypoint(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
         name = Path(function.__code__.co_filename).stem
         task_id = None
         argv = sys.argv[1:]
+        if name=='pm' and not argv:
+            # The menu owns one run per selected operation, not per open UI.
+            return function(*args,**kwargs)
         if '--task-id' in argv:
             index = argv.index('--task-id') + 1
             if index < len(argv) and argv[index].isdigit():
@@ -354,19 +372,11 @@ def entrypoint(function):
             task_id = int(argv[1])
         with run(name, task_id) as action:
             # Propagate to ordinary subprocesses, including the planner PTY.
-            previous = {key: os.environ.get(key) for key in ENV_KEYS}
-            os.environ.update(child_env())
-            try:
+            with process_environment():
                 result = function(*args, **kwargs)
                 if action and isinstance(result, int) and result != 0:
                     action.status = 'error'
                 return result
-            finally:
-                for key, value in previous.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
     return wrapped
 
 

@@ -19,7 +19,7 @@ import fcntl
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import sys
 from pathlib import Path
 
@@ -511,7 +511,9 @@ def main():
     if args.command in ("status", "auto-history") and (args.execute or args.sync_burp or args.no_agents or args.decide):
         parser.error("status/auto-history do not accept run-only flags")
     try:
-        with exclusive_run_lock():
+        from orchestrator.coordinated_attack import task_lock
+        execution_lock=task_lock(args.task_id) if args.command in ('run','auto') else nullcontext()
+        with execution_lock, exclusive_run_lock():
             with evidence.connect() as db:
                 jobs.initialize(db)
                 validate_task(db, args.task_id)

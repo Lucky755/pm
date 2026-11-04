@@ -24,7 +24,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext, closing
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -553,15 +553,20 @@ def show_plan(task_id, plan):
     line('  План GLM — предложение, не разрешение на эксплуатацию.')
 
 
-def plan_reprobe(db, task_id, target, ports_raw):
-    if not ports_raw:
-        return None
+def reprobe_ports(ports_raw):
     values = ports_raw.split(',')
     if not 1 <= len(values) <= PORTS_MAX or any(not re.fullmatch(r'\d{1,5}', x) for x in values):
         raise OperatorError('Для --reprobe укажи 1..32 порта через запятую')
     ports = [int(v) for v in values]
     if len(set(ports)) != len(ports) or any(not 1 <= p <= 65535 for p in ports):
         raise OperatorError('Недопустимые/повторяющиеся порты')
+    return ports
+
+
+def plan_reprobe(db, task_id, target, ports_raw):
+    if not ports_raw:
+        return None
+    ports=reprobe_ports(ports_raw)
     from orchestrator import bootstrap_discovery
     port_string = ','.join(map(str, ports))
     argv = bootstrap_discovery.validate_plan(task_id, target, port_string)
@@ -709,7 +714,8 @@ def session_api_key(args, *, required=False):
     if (not required and getattr(args, 'command', None) != 'new' and
             getattr(args, 'no_agents', False) and getattr(args, 'no_decide', False)):
         return None
-    existing = getattr(args, '_session_key', None)
+    owner = getattr(args,'_key_session',args)
+    existing = getattr(args, '_session_key', None) or getattr(owner,'_session_key',None)
     if existing is not None:
         return existing
     key = getpass.getpass('Experiential API key (один раз за запуск): ').strip()
@@ -717,6 +723,7 @@ def session_api_key(args, *, required=False):
         raise OperatorError('API-ключ обязателен и не должен превышать 4096 байт')
     diagnostics.register_secret(key)
     args._session_key = key
+    owner._session_key = key
     return key
 
 
@@ -725,7 +732,13 @@ def session_getpass(key):
     """Legacy in-process agents ask getpass independently; reuse the session key."""
     original = getpass.getpass
     try:
-        getpass.getpass = lambda prompt='Password: ', stream=None: key
+        def reuse(prompt='Password: ',stream=None):
+            getpass.getpass=original
+            try:
+                return key() if callable(key) else key
+            finally:
+                getpass.getpass=reuse
+        getpass.getpass = reuse
         yield
     finally:
         getpass.getpass = original
@@ -774,6 +787,7 @@ def call_scheduler(db, task_id, target, args, *, prior_jobs=0):
     from orchestrator import evidence_pipeline as evidence
     from orchestrator import decision_agent as decision
     from orchestrator import network_jobs as jobs
+    coordinated = bool(getattr(args,'coordinated',False))
     # Suppress JSON-only end-of-run dumps while retaining verbose English progress.
     original = scheduler.emit, evidence.render, decision.emit
     scheduler.emit = lambda obj: None
@@ -784,18 +798,22 @@ def call_scheduler(db, task_id, target, args, *, prior_jobs=0):
         scheduler.validate_task(db, task_id)
         from contextlib import redirect_stdout
         progress = ConciseProgress(sys.stdout)
-        with scheduler.exclusive_run_lock(), session_getpass(session_api_key(args)), redirect_stdout(progress):
+        keys = nullcontext() if coordinated else session_getpass(lambda:session_api_key(args,required=True))
+        with scheduler.exclusive_run_lock(), keys, redirect_stdout(progress):
             result = scheduler.auto(db, task_id, True, args.sync_burp,
-                                    args.no_agents, args.max_jobs,
-                                    not args.no_decide, args.max_rounds, True,
+                                    True if coordinated else args.no_agents, args.max_jobs,
+                                    False if coordinated else not args.no_decide, args.max_rounds, True,
                                     web_enabled=True)
         progress.flush()
     finally:
         scheduler.emit, evidence.render, decision.emit = original
     if prior_jobs:
         result['total_jobs'] = result.get('total_jobs', 0) + prior_jobs
+    if coordinated:
+        return result
     render_results(db, result, json_output=args.json, verbose=getattr(args, 'verbose', False))
     offer_cleanup_if_verified(db, task_id, result)
+    return result
 
 
 def configure(db, task_id, args, *, create_scope=False, plan=None):
@@ -1155,7 +1173,166 @@ def preflight_target(db, task_id, target, ports, timeout=2.0):
     return result
 
 
+COORDINATOR_OPTIONS = ('coordinator_steps','decision_retries','roles','poc_budget','step_limit','max_tokens')
+
+
+def chosen_task_mode(db, args):
+    from orchestrator import task_runtime
+    requested=getattr(args,'coordinated',None)
+    if requested is not None:
+        return 'coordinated' if requested else 'legacy'
+    return (task_runtime.saved(db,args.task_id) or {}).get('mode','legacy')
+
+
+def validate_launch_options(args, mode, *, new=False):
+    """Reject mode mismatches before planner, metadata, approval or target traffic."""
+    if not 1 <= getattr(args,'max_jobs',8) <= 12 or not 1 <= getattr(args,'max_rounds',4) <= 8:
+        raise OperatorError('max-jobs 1..12, max-rounds 1..8')
+    objective_specs(args)
+    objective_mode(args)
+    objective_numbers(args)
+    with closing(sqlite3.connect(':memory:')) as checks:
+        save_flag_options(checks,1,args)
+    if getattr(args,'hostnames',None):
+        validate_hostnames(args.hostnames)
+    egress=getattr(args,'egress',None)
+    if egress and (egress=='auto' or not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}',egress)):
+        raise OperatorError('Нужен конкретный интерфейс, например tun0')
+    if getattr(args,'reprobe',None):
+        reprobe_ports(args.reprobe)
+    controls=(bool(getattr(args,'continue_coordinated',False)),getattr(args,'approve_step',None) is not None,
+              getattr(args,'abandon_running_step',None) is not None)
+    if sum(controls)>1 or new and any(controls):
+        raise OperatorError('Выбери одно действие продолжения только для существующей задачи')
+    explicit=any(getattr(args,key,None) is not None for key in COORDINATOR_OPTIONS)
+    if mode=='legacy':
+        if explicit or any(controls):
+            raise OperatorError('Параметры координатора требуют --coordinated или сохранённого coordinated-режима')
+        return
+    if getattr(args,'no_agents',False) or getattr(args,'no_decide',False) or getattr(args,'verbose',False):
+        raise OperatorError('--no-agents, --no-decide и --verbose относятся к прежнему режиму')
+    for name,default,lower,upper in (('coordinator_steps',8,1,32),('decision_retries',1,0,2),
+                                     ('poc_budget',7,1,7),('step_limit',15,1,99),('max_tokens',24000,1,64000)):
+        value=getattr(args,name,None)
+        if value is not None and not lower <= value <= upper:
+            raise OperatorError(f'{name}: {lower}..{upper}')
+    roles=getattr(args,'roles',None)
+    if roles is not None and (not roles.strip() or any(r.strip().lower() not in ('recon','vuln','access','verify') for r in roles.split(','))):
+        raise OperatorError('Недопустимые роли координатора')
+    for name in ('approve_step','abandon_running_step'):
+        value=getattr(args,name,None)
+        if value is not None and value<1:
+            raise OperatorError('ID шага должен быть положительным')
+
+
+def continuation_requested(args):
+    return (getattr(args,'continue_coordinated',False) or getattr(args,'approve_step',None) is not None
+            or getattr(args,'abandon_running_step',None) is not None)
+
+
+def render_coordinator_result(result, args):
+    if getattr(args,'json',False):
+        line(json.dumps(result,ensure_ascii=False,indent=2))
+        return result
+    line('  Остановка: ' + safe_display(result['stop_reason']))
+    if result['stop_reason']=='role_report_incomplete_requires_review':
+        line('  Отчёт неполон; результаты сохранены. Исход действий требует проверки оператором. '
+             'Автоматический повтор роли заблокирован.')
+    line(f"  Исследовательская цель подтверждена: {result['succeeded']}")
+    for step in result['steps']:
+        decision=step['decision']
+        line(f"  Шаг #{step['id']} {step['status']} · {decision.get('role') or decision.get('action','invalid')} · отчёт {step['report_iteration']}")
+        if step.get('report_path'):
+            line('    Сохранённый отчёт: ' + safe_display(step['report_path']))
+        if decision:
+            line('    Вопрос: ' + safe_display(decision['question']))
+            line('    Основание: ' + safe_display(decision['reason']))
+            line('    Ожидается: ' + safe_display(decision['expected_result']))
+    if result['status']=='waiting_operator':
+        line('  Пауза сохранена. --continue-coordinated продолжает после проверки результатов.')
+        line('  --approve-step ID подтверждает показанный шаг ACCESS; --abandon-running-step ID '
+             'после ручной проверки оставляет прерванный исход неизвестным и разрешает другую проверку.')
+    return result
+
+
+def run_task_coordinator(db, task_id, args):
+    from orchestrator import coordinated_attack, objectives, attack_loop
+    state=objectives.objective_status(db,task_id)
+    expect=int(getattr(args,'expect_flags',None) or
+               (state['expected_flags'] or len(state['objectives']) if state['primary'] else attack_loop.DEFAULT_EXPECTED_FLAGS))
+    def option(key,default):
+        value=getattr(args,key,None)
+        return default if value is None else value
+    if not getattr(args,'json',False):
+        heading(f'Координатор — задача #{task_id}')
+        line(f"  Решений до {option('coordinator_steps',8)}, исправлений ответа до {option('decision_retries',1)}; "
+             f"на специалиста: {option('step_limit',15)} инструментов, {option('poc_budget',7)} PoC, "
+             f"{option('max_tokens',24000)} токенов вывода.")
+    result=coordinated_attack.run(task_id,roles=tuple(r.strip().lower() for r in option('roles','recon,vuln,access,verify').split(',')),
+        max_steps=option('coordinator_steps',8),decision_retries=option('decision_retries',1),
+        poc_budget=option('poc_budget',7),step_limit=option('step_limit',15),max_tokens=option('max_tokens',24000),
+        expect_flags=expect,key_provider=lambda:session_api_key(args,required=True),
+        continue_run=getattr(args,'continue_coordinated',False),approve_step=getattr(args,'approve_step',None),
+        abandon_running_step=getattr(args,'abandon_running_step',None))
+    return render_coordinator_result(result,args)
+
+
 def launch_configured_task(db, task_id, target, args):
+    from orchestrator.coordinated_attack import task_lock
+    with task_lock(task_id):
+        if getattr(args,'coordinated',False):
+            return launch_coordinated_task(db,task_id,target,args)
+        return launch_legacy_task(db,task_id,target,args)
+
+
+def launch_coordinated_task(db, task_id, target, args):
+    from orchestrator import agent_actions, task_runtime
+    meta=task_runtime.saved(db,task_id)
+    if meta is None:
+        task_runtime.save_mode(db,task_id,'coordinated')
+        meta=task_runtime.saved(db,task_id)
+    mapped=agent_actions.service_map(db,task_id,1)
+    ports=sorted({entry['port'] for entry in mapped['entries'] if entry['protocol']=='tcp'})
+    cached=bool(ports and meta['recon_status'] in ('pending','completed'))
+    def pause(reason):
+        task_runtime.reconnaissance(db,task_id,'waiting_operator',reason)
+        diagnostics.stop(reason,task_id=task_id)
+        return render_coordinator_result({'task_id':task_id,'status':'waiting_operator','succeeded':False,
+                                          'stop_reason':reason,'steps':[],'coordinator_run_id':None},args)
+    if not getattr(args,'json',False):
+        heading('Начальная разведка → общая карта')
+        line(f'  Бюджет разведки: {args.max_jobs} сетевых операций, до {args.max_rounds} раундов.')
+    task_runtime.reconnaissance(db,task_id,'running')
+    try:
+        used=0 if ports else run_full_tcp_scan(db,task_id,target)
+        if not ports:
+            row=db.execute('SELECT open_ports_json FROM pm_tcp_full_scans WHERE task_id=? AND target=?',(task_id,target)).fetchone()
+            ports=json.loads(row[0]) if row else []
+        if not ports:
+            return pause('reconnaissance_no_tcp_services')
+        checked=preflight_target(db,task_id,target,ports)
+        if not checked['reachable'] and not getattr(args,'force_unreachable',False):
+            return pause('reconnaissance_target_unreachable')
+        if cached and not getattr(args,'reprobe',None) and not getattr(args,'sync_burp',False):
+            diagnostics.emit('cache.hit',name='initial_reconnaissance',task_id=task_id,
+                             reason='saved_scoped_service_map')
+        else:
+            if args.max_jobs<=used:
+                return pause('reconnaissance_job_budget')
+            budget=argparse.Namespace(**vars(args))
+            budget.max_jobs-=used
+            scout=call_scheduler(db,task_id,target,budget,prior_jobs=used)
+            if scout['stop_reason'] not in ('queue_empty','no_progress','no_new_evidence'):
+                return pause('reconnaissance_'+scout['stop_reason'])
+        task_runtime.reconnaissance(db,task_id,'completed')
+    except BaseException as exc:
+        task_runtime.reconnaissance(db,task_id,'waiting_operator',
+                                   'reconnaissance_interrupted' if isinstance(exc,KeyboardInterrupt) else 'reconnaissance_failed')
+        raise
+    return run_task_coordinator(db,task_id,args)
+
+
+def launch_legacy_task(db, task_id, target, args):
     heading('Автономная разведка')
     # One brokered full scan consumes one of the network-operation slots.
     # Do not automatically repeat it after a restart.
@@ -1182,8 +1359,9 @@ def launch_configured_task(db, task_id, target, args):
 
 @diagnostics.stage
 def op_new(args, *, defer_execution=False):
+    mode='coordinated' if getattr(args,'coordinated',False) else 'legacy'
+    validate_launch_options(args,mode,new=True)
     target = validate_target(args.target)
-    key = session_api_key(args, required=True)
     heading('Создание задачи')
     # Interactive mode already composed limits and hints; the CLI passes them
     # separately, so normalise here instead of duplicating the logic.
@@ -1192,11 +1370,16 @@ def op_new(args, *, defer_execution=False):
     objective_specs(args)
     objective_mode(args)
     objective_numbers(args)
+    key = session_api_key(args, required=True)
     task_id, plan = run_planner_with_validation_retry(
         target, task_text, key, getattr(args, 'planner_context', None))
-    with connect() as db:
+    from orchestrator import coordinated_attack, task_runtime
+    args.task_id=task_id
+    with coordinated_attack.task_lock(task_id), diagnostics.scope(task_id=task_id), connect() as db:
         if task_target(db, task_id) != target:
             raise OperatorError('IP цели в SQLite не соответствует запросу; запуск запрещён')
+        task_runtime.save_mode(db,task_id,mode)
+        args.coordinated=mode=='coordinated'
         configured = configure(db, task_id, args, create_scope=True, plan=plan)
         save_task_intent(db, task_id, task_text)
         save_flag_options(db, task_id, args)
@@ -1209,14 +1392,46 @@ def op_new(args, *, defer_execution=False):
 
 @diagnostics.stage
 def op_resume(args):
-    session_api_key(args)
-    with connect() as db:
+    from orchestrator import coordinated_attack, task_runtime
+    with coordinated_attack.task_lock(args.task_id), connect() as db:
+        requested=getattr(args,'coordinated',None)
+        mode=chosen_task_mode(db,args)
+        validate_launch_options(args,mode)
+        args.coordinated=mode=='coordinated'
+        task_target(db,args.task_id)
+        paused=task_runtime.pause(db,args.task_id)
+        if not args.coordinated and paused and (task_runtime.saved(db,args.task_id) or {}).get('mode')=='coordinated':
+            raise OperatorError('Сначала разбери сохранённую паузу coordinated-режима; переключение режима её не отменяет')
+        if args.coordinated:
+            if paused:
+                running=next((s for s in paused['steps'] if s['status']=='running'),None)
+                waiting=next((s for s in paused['steps'] if s['status']=='waiting_operator'),None)
+                if getattr(args,'approve_step',None) is not None and (
+                        not waiting or waiting['id']!=args.approve_step or waiting['decision']['action']!='run_role'):
+                    raise OperatorError('Нет соответствующего шага ACCESS для одобрения')
+                if getattr(args,'abandon_running_step',None) is not None and (
+                        not running or running['id']!=args.abandon_running_step):
+                    raise OperatorError('Нет соответствующего running-шага')
+                if (not continuation_requested(args) or paused['stop_reason']=='interrupted_full_tcp_scan'
+                        or running and getattr(args,'abandon_running_step',None)!=running['id']):
+                    explicit_flags=getattr(args,'_explicit_flags',set())-{'--coordinated','--json','--continue-coordinated'}
+                    if (explicit_flags or any(getattr(args,key,None) for key in ('reprobe','hostnames','egress','force_unreachable'))
+                            or any(getattr(args,key,None) is not None for key in COORDINATOR_OPTIONS)):
+                        raise OperatorError('Сначала явно продолжи сохранённую паузу')
+                    if requested is not None:
+                        task_runtime.save_mode(db,args.task_id,mode)
+                    if not getattr(args,'json',False):
+                        line('  Режим задачи: coordinated · сохранённая пауза')
+                    return render_coordinator_result(paused,args)
+            elif getattr(args,'approve_step',None) is not None or getattr(args,'abandon_running_step',None) is not None:
+                raise OperatorError('Нет сохранённого шага для этого операторского действия')
+        task_runtime.save_mode(db,args.task_id,mode)
         target = configure(db, args.task_id, args)
         save_flag_options(db, args.task_id, args)
         save_objective_options(db, args.task_id, args)
         if args.reprobe:
             plan_reprobe(db, args.task_id, target, args.reprobe)
-        launch_configured_task(db, args.task_id, target, args)
+        return launch_configured_task(db, args.task_id, target, args)
 
 
 def transition_path(new_id, transition_root=ROOT / 'storage/transitions', *, create=False):
@@ -2131,14 +2346,24 @@ def op_hosts(args):
 
 @diagnostics.stage
 def op_attack(args):
+    from orchestrator.coordinated_attack import task_lock
+    with task_lock(args.task_id):
+        return attack_task(args)
+
+
+def attack_task(args):
     """Run the role cycle in this process; the key never touches argv or env."""
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from orchestrator import attack_loop
+    explicit=getattr(args,'_explicit_flags',set())
+    if getattr(args,'coordinated',False) and '--iterations' in explicit:
+        raise OperatorError('--iterations относится к прежнему циклу; используй --coordinator-steps')
     if not getattr(args,'coordinated',False) and (
             getattr(args,'continue_coordinated',False) or getattr(args,'approve_step',None) is not None
             or getattr(args,'abandon_running_step',None) is not None
-            or getattr(args,'coordinator_steps',8) != 8 or getattr(args,'decision_retries',1) != 1):
+            or getattr(args,'coordinator_steps',None) not in (None,8) or getattr(args,'decision_retries',None) not in (None,1)
+            or explicit & {'--coordinator-steps','--decision-retries'}):
         raise OperatorError('Параметры координатора требуют --coordinated')
     with connect() as db:
         save_flag_options(db, args.task_id, args)
@@ -2155,35 +2380,10 @@ def op_attack(args):
     if not 1 <= expect <= attack_loop.MAX_EXPECTED_FLAGS:
         raise OperatorError(f'Ожидаемое число флагов должно быть от 1 до {attack_loop.MAX_EXPECTED_FLAGS}')
     if getattr(args, 'coordinated', False):
-        from orchestrator import coordinated_attack
-        heading(f'Координатор — задача #{args.task_id}')
-        result = coordinated_attack.run(
-            args.task_id, roles=roles, max_steps=getattr(args,'coordinator_steps',8),
-            decision_retries=getattr(args,'decision_retries',1), poc_budget=args.poc_budget,
-            step_limit=args.step_limit, max_tokens=limit, expect_flags=expect,
-            key_provider=lambda: session_api_key(args, required=True),
-            continue_run=getattr(args,'continue_coordinated',False),
-            approve_step=getattr(args,'approve_step',None),
-            abandon_running_step=getattr(args,'abandon_running_step',None))
-        line('  Остановка: ' + safe_display(result['stop_reason']))
-        if result['stop_reason']=='role_report_incomplete_requires_review':
-            line('  Отчёт неполон; результаты сохранены. Исход действий требует проверки оператором. '
-                 'Автоматический повтор роли заблокирован.')
-        line(f"  Исследовательская цель подтверждена: {result['succeeded']}")
-        for step in result['steps']:
-            decision=step['decision']
-            line(f"  Шаг #{step['id']} {step['status']} · {decision.get('role') or decision.get('action','invalid')} · отчёт {step['report_iteration']}")
-            if step.get('report_path'):
-                line('    Сохранённый отчёт: ' + safe_display(step['report_path']))
-            if decision:
-                line('    Вопрос: ' + safe_display(decision['question']))
-                line('    Основание: ' + safe_display(decision['reason']))
-                line('    Ожидается: ' + safe_display(decision['expected_result']))
-        if result['status']=='waiting_operator':
-            line('  Пауза сохранена. --continue-coordinated продолжает после проверки результатов.')
-            line('  --approve-step ID подтверждает показанный шаг ACCESS; --abandon-running-step ID '
-                 'после ручной проверки оставляет прерванный исход неизвестным и разрешает другую проверку.')
-        return result
+        from orchestrator import task_runtime
+        with connect() as db:
+            task_runtime.save_mode(db,args.task_id,'coordinated')
+            return run_task_coordinator(db,args.task_id,args)
     key = session_api_key(args, required=True)
     heading(f'Ролевой цикл - задача #{args.task_id}')
     line('  ' + tint('решает оркестратор: ' + ' -> '.join(roles), 'bright'))
@@ -2603,12 +2803,25 @@ def parser_main():
     hosts.add_argument('--hostnames', required=True, help='Имена через запятую, все → IP задачи')
     hosts.add_argument('--egress')
     for cmd in (new, resume):
+        modes=cmd.add_mutually_exclusive_group()
+        modes.add_argument('--coordinated',dest='coordinated',action='store_true',help='Разведка → координатор → одна выбранная роль')
+        modes.add_argument('--legacy',dest='coordinated',action='store_false',help='Явно выбрать прежний Evidence Hub / DECIDE')
+        cmd.set_defaults(coordinated=None)
+        cmd.add_argument('--coordinator-steps',type=int,default=None,help='Шагов координатора на запуск: 1..32, по умолчанию 8')
+        cmd.add_argument('--decision-retries',type=int,default=None,help='Исправлений решения: 0..2, по умолчанию 1')
+        cmd.add_argument('--roles',default=None,help='Разрешённые роли координатора через запятую')
+        cmd.add_argument('--poc-budget',type=int,default=None,help='PoC-бюджет специалиста: 1..7, по умолчанию 7')
+        cmd.add_argument('--step-limit',type=int,default=None,help='Инструментов на специалиста: 1..99, по умолчанию 15')
+        cmd.add_argument('--max-tokens',type=int,default=None,help='Вывод специалиста: 1..64000, по умолчанию 24000')
+        cmd.add_argument('--continue-coordinated',action='store_true',help='Явно продолжить сохранённую паузу')
+        cmd.add_argument('--approve-step',type=int,help='Одобрить конкретный шаг ACCESS')
+        cmd.add_argument('--abandon-running-step',type=int,help='После ручной проверки оставить исход running-шага неизвестным')
         cmd.add_argument('--force-unreachable', action='store_true',
                          help='Продолжить после неудачной проверки доступности цели')
         cmd.add_argument('--egress', help='Явно выбрать интерфейс (напр. tun0); по умолчанию берётся из маршрута')
         cmd.add_argument('--hostnames', help='Имена сайтов, разделённые запятыми; все → IP задачи')
-        cmd.add_argument('--max-jobs', type=int, default=8)
-        cmd.add_argument('--max-rounds', type=int, default=4)
+        cmd.add_argument('--max-jobs', type=int, default=8,help='Бюджет сетевых операций разведки: 1..12')
+        cmd.add_argument('--max-rounds', type=int, default=4,help='Раундов разведки: 1..8')
         cmd.add_argument('--no-agents', action='store_true')
         cmd.add_argument('--no-decide', action='store_true')
         cmd.add_argument('--sync-burp', action='store_true')
@@ -2616,7 +2829,9 @@ def parser_main():
         cmd.add_argument('--verbose', action='store_true', help='Полные отчёты агентов')
     status.add_argument('--json', action='store_true')
     status.add_argument('--verbose', action='store_true')
-    return parser, parser.parse_args()
+    args=parser.parse_args()
+    args._explicit_flags={token.split('=',1)[0] for token in sys.argv[1:] if token.startswith('--')}
+    return parser,args
 
 
 def compose_task_description(objective, constraints, hints=''):
@@ -2642,11 +2857,30 @@ def compose_task_description(objective, constraints, hints=''):
     return text
 
 
+def interactive_operation(callback, args):
+    with diagnostics.run('pm:'+getattr(callback,'__name__','operation'),getattr(args,'task_id',None),fresh=True), diagnostics.process_environment():
+        return callback(args)
+
+
+def interactive_mode():
+    mode=input('Режим: 1 — координатор, 2 — прежний Evidence Hub / DECIDE (Enter — 2): ').strip()
+    if mode not in ('','1','2'):
+        raise OperatorError('Выбери режим 1 или 2')
+    return mode=='1'
+
+
+def interactive_continuation(args):
+    action=input('Пауза: Enter — показать/запустить; c — продолжить; a:ID — одобрить ACCESS; r:ID — разобранный running: ').strip()
+    args.continue_coordinated=action=='c'
+    args.approve_step=int(action[2:]) if action.startswith('a:') else None
+    args.abandon_running_step=int(action[2:]) if action.startswith('r:') else None
+    if action and action!='c' and not action.startswith(('a:','r:')):
+        raise OperatorError('Неизвестное действие продолжения')
+
+
 def interactive():
     banner()
     session = argparse.Namespace(_session_key=None)
-    # One input per session; never persist secrets.
-    session_api_key(session)
     entries = (
         ('1', 'НОВАЯ ЦЕЛЬ', 'Создать задачу и запустить разведку'),
         ('2', 'ПРОДОЛЖИТЬ', 'Возобновить работу по задаче'),
@@ -2673,7 +2907,7 @@ def interactive():
             line('  Выбери 0–8.')
             continue
         args = argparse.Namespace(
-            _session_key=session._session_key, egress=None, max_jobs=8,
+            _session_key=session._session_key, _key_session=session, egress=None, max_jobs=8,
             max_rounds=4, no_agents=False, no_decide=False,
             sync_burp=False, json=False, verbose=False, reprobe=None,
             hostnames=None, hints=None, iterations=7,
@@ -2682,12 +2916,15 @@ def interactive():
             objective=None, objectives_file=None, goal_weight=None,
             goal_exclusive=False, goal_first=False, all_flags=False,
             expect_flags=None,
-            roles='recon,vuln,access,verify', poc_budget=7, step_limit=15,
+            roles=None, poc_budget=None, step_limit=None,coordinated=None,
+            coordinator_steps=None,decision_retries=None,continue_coordinated=False,
+            approve_step=None,abandon_running_step=None,
             all_tasks=False, yes=False, dry_run=False, archive_work=False,
         )
         try:
             if choice == '1':
                 args.target = validate_target(input('IP лабораторной машины: ').strip())
+                args.coordinated=interactive_mode()
                 task = input('Что требуется сделать: ').strip()
                 side = input('Дополнительные флаги-цели (вес:описание через ; Enter — нет): ').strip()
                 if side:
@@ -2708,30 +2945,42 @@ def interactive():
                 args.force_unreachable = (input('Продолжить, если цель недоступна? [y/N]: ')
                                           .strip().lower() in ('y', 'yes', 'д', 'да'))
                 args.hostnames = input('Домены сайта (через запятую, Enter если нет): ').strip()
-                op_new(args)
+                interactive_operation(op_new,args)
             elif choice == '2':
                 args.task_id = int(input('Номер задачи: ').strip())
-                args.force_unreachable = (input('Продолжить, если цель недоступна? [y/N]: ')
-                                          .strip().lower() in ('y', 'yes', 'д', 'да'))
-                op_resume(args)
+                from orchestrator import task_runtime
+                with connect() as db:
+                    mode=chosen_task_mode(db,args)
+                    paused=task_runtime.pause(db,args.task_id) if mode=='coordinated' else None
+                line('  Сохранённый режим: '+mode+' · пауза: '+(paused['stop_reason'] if paused else 'нет'))
+                selection=input('Режим: Enter — сохранённый, 1 — координатор, 2 — прежний: ').strip()
+                if selection not in ('','1','2'):
+                    raise OperatorError('Выбери режим 1 или 2')
+                args.coordinated=(selection=='1') if selection else None
+                if selection=='1' or not selection and mode=='coordinated':
+                    interactive_continuation(args)
+                if not paused or continuation_requested(args) or selection=='2':
+                    args.force_unreachable = (input('Продолжить, если цель недоступна? [y/N]: ')
+                                              .strip().lower() in ('y', 'yes', 'д', 'да'))
+                interactive_operation(op_resume,args)
             elif choice == '3':
                 args.task_id = int(input('Номер задачи: ').strip())
-                op_status(args)
+                interactive_operation(op_status,args)
             elif choice == '4':
                 args.task_id = int(input('Номер задачи: ').strip())
-                op_close(args)
+                interactive_operation(op_close,args)
             elif choice == '5':
                 args.task_id = int(input('Номер задачи: ').strip())
                 args.hostnames = input('Доменные имена (через запятую): ').strip()
-                op_hosts(args)
+                interactive_operation(op_hosts,args)
             elif choice == '6':
                 args.task_id = int(input('Номер задачи с прежним IP: ').strip())
                 args.target = validate_target(input('Новый IP машины: ').strip())
                 args.archive_work = (input('Архивировать старый /work до смены IP? [y/N]: ')
                                      .strip().lower() in ('y', 'yes', 'д', 'да'))
-                op_change_ip(args)
+                interactive_operation(op_change_ip,args)
             elif choice == '8':
-                op_cleanup(args)
+                interactive_operation(op_cleanup,args)
             else:
                 args.task_id = int(input('Номер задачи: ').strip())
                 patterns = input('Дополнительные шаблоны флагов (Enter — стандартные): ').strip()
@@ -2761,7 +3010,7 @@ def interactive():
                 args.poc_budget = int(raw) if raw else 7
                 raw = input('Сколько флагов ожидать (Enter — из целей задачи, иначе 2): ').strip()
                 args.expect_flags = int(raw) if raw else None
-                op_attack(args)
+                interactive_operation(op_attack,args)
         except (OperatorError, ValueError, RuntimeError, OSError, sqlite3.Error,
                 subprocess.SubprocessError, ImportError) as exc:
             line('  ' + tint('[ОШИБКА]', 'danger', stream=sys.stderr) + ' ' + safe_display(exc), stream=sys.stderr)
