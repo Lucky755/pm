@@ -1276,6 +1276,12 @@ def max_tokens_recovery(stats, step_limit):
     return MAX_TOKENS_RECOVERY, 'max-tokens-report'
 
 
+def operator_intent_block(context):
+    """Keep task_context's intent verbatim in both prompt representations."""
+    intent = context.get('intent') or 'Find and verify the flags on the target, then report impact.'
+    return f'Objective from the operator (authoritative scope and goal):\n{intent}'
+
+
 def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit=15):
     logs = capability_tail(context['task_id'])
     if isinstance(db, sqlite3.Connection):
@@ -1312,12 +1318,10 @@ def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit
                      transferred_notes=True, inherited_from=source['task_id'],
                      entries=[dict(item, round=None, source='предшественник')
                               for item in source['map']['entries']])
-    intent = context['intent'] or 'Find and verify the flags on the target, then report impact.'
     return f'''You are the {role.upper()} agent of an authorised penetration test.
 Charter: {CHARTERS[role]}
 
-Objective from the operator (authoritative scope and goal):
-{intent}
+{operator_intent_block(context)}
 
 Current objective of this round: {objective or 'advance the assessment as far as the evidence allows'}
 Round: {iteration}. PoC write/run budget for you: {poc_budget} attempts.
@@ -1412,6 +1416,8 @@ def compact_prompt(db, context, role, objective, iteration, poc_budget,
     return f'''You are the {role.upper()} agent of an authorised penetration test,
 resuming its stage after a context switch ({reason}).
 Charter: {CHARTERS[role]}
+
+{operator_intent_block(context)}
 
 Objective of this round: {objective or 'advance the assessment as far as the evidence allows'}
 Round: {iteration}. PoC write/run budget for you: {poc_budget} attempts;
