@@ -41,7 +41,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from orchestrator import diagnostics
+from orchestrator import diagnostics, service_inventory
 
 DB_PATH = ROOT / 'storage/tasks.db'
 DSH_HOME = ROOT / 'runtime/harness-home'
@@ -59,8 +59,8 @@ CHARTERS = {
     'recon': (
         'Extend the existing service map of the authorised target: open TCP ports, '
         'banners, HTTP behavior, virtual hosts and TLS metadata. Follow the '
-        'service map scan_mode: full_scan only when no map exists or old reports '
-        'have no note hints; spot_check means verify two or three relevant ports '
+        'service map scan_mode and scan_mode_reason: full_scan means structured '
+        'coverage is missing or stale; spot_check means verify two or three relevant ports '
         'and advance. Transferred notes are hints from another IP: verify them '
         'on this target before treating them as proof. Prefer nmap '
         '(tcp_ports/service_versions), http_* profiles and curl argv. '
@@ -428,7 +428,7 @@ def estimate_prompt_tokens(text):
     return max(1, len(str(text or '')) // 3)
 
 
-def compact_history(db, task_id, tail=6, log_path=None):
+def compact_history(db, task_id, tail=6, log_path=None, iteration=1):
     """Compact representation of the stage history; nothing here is deleted.
 
     The authoritative text of every result stays in the capability log and
@@ -470,7 +470,8 @@ def compact_history(db, task_id, tail=6, log_path=None):
     return {'note': COMPACT_MODE_NOTE, 'full_results': full_results,
             'result_summaries': result_summaries, 'refutations': refutations,
             'assets': assets, 'open_hypotheses': open_hypotheses,
-            'essential_state': essential_state(db, task_id)}
+            'essential_state': essential_state(db, task_id),
+            'service_map': service_map(db, task_id, iteration)}
 
 
 def worknote_tail(task_id, keep=40, work_root=None):
@@ -496,18 +497,18 @@ VERSION_MENTION = re.compile(r'\b(?:v)?([0-9]+\.[0-9]+(?:\.[0-9]+){0,2}(?:[a-z][
 SERVICE_NAMES = {'openssh': 'ssh', 'httpd': 'apache', 'postgres': 'postgresql'}
 
 
-def service_map(db, task_id, iteration, keep=12, work_root=None, note_keep=40):
+def _text_service_hints(db, task_id, iteration, keep=12, work_root=None, note_keep=40):
     """Compact factual hints from reports and notes, with source and age."""
     try:
         rows = db.execute(
-            'SELECT role, iteration, report_json, created_at FROM pm_agent_action_reports '
-            'WHERE task_id = ? ORDER BY created_at', (task_id,)
+            'SELECT role, iteration, report_json, created_at, target FROM pm_agent_action_reports '
+            'WHERE task_id = ? ORDER BY created_at,iteration,role', (task_id,)
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
-    entries = {}
+    entries, hints = {}, []
 
-    def add(text, evidence, source, when, round_number=None, result_id=''):
+    def add(text, evidence, source, when, round_number=None, result_id='', reference=None):
         mentioned = set()
         matches = [(m.start(), m.end(), int(m.group(1) or m.group(2)), False)
                    for m in PORT_MENTION.finditer(text)]
@@ -552,6 +553,13 @@ def service_map(db, task_id, iteration, keep=12, work_root=None, note_keep=40):
             service = SERVICE_NAMES.get(service_match.group(1).lower(),
                                         service_match.group(1).lower()) if service_match else ''
             version = version_match.group(1) if version_match else ''
+            if isinstance(result_id, str) and re.fullmatch(r'[a-f0-9]{24}', result_id):
+                reference = {**(reference or {}), 'result_id': result_id}
+            transport = re.search(r'/(tcp|udp)$', text[start:stop], re.I)
+            hints.append({'port': port, 'protocol': transport.group(1).lower() if transport else 'unknown', 'service': service, 'version': version,
+                          'evidence': short_text(evidence, 140), 'source': source, 'when': when,
+                          'round': round_number, 'reference': reference or {},
+                          'kind': 'text', 'requires_verification': True})
             previous = entries.get(port)
             if previous and not (service or version) and (previous['service'] or previous['version']):
                 continue
@@ -563,27 +571,36 @@ def service_map(db, task_id, iteration, keep=12, work_root=None, note_keep=40):
                              'result_id': str(result_id or '')[:24]}
         return mentioned
 
-    for role, round_number, raw, when in rows:
+    for role, round_number, raw, when, report_target in rows:
         try:
             report = json.loads(raw)
         except ValueError:
             continue
-        for finding in report.get('findings') or []:
+        if not isinstance(report, dict):
+            continue
+        for finding_index, finding in enumerate(report.get('findings') or []):
             if isinstance(finding, dict):
+                probe = finding.get('probe') if isinstance(finding.get('probe'), dict) else {}
                 title = str(finding.get('title') or '')
                 evidence = str(finding.get('evidence') or '')
                 add(title + ' ' + evidence, evidence, role, when, round_number,
-                    finding.get('result_id'))
+                    finding.get('result_id') or probe.get('result_id'), reference={'table': 'pm_agent_action_reports',
+                        'task_id': task_id, 'target': report_target, 'role': role,
+                        'iteration': round_number, 'finding_index': finding_index})
     notes_path = (Path(work_root) if work_root is not None else TASK_WORK_BASE) / str(task_id) / 'NOTES.md'
     try:
         when = datetime.fromtimestamp(notes_path.stat().st_mtime, timezone.utc).isoformat()
     except OSError:
         when = 'unknown'
-    note_lines = worknote_tail(task_id, keep=note_keep, work_root=work_root)
+    note_lines = worknote_tail(task_id, keep=None, work_root=work_root)
+    note_lines_total = len(note_lines)
+    note_lines_omitted = max(0, note_lines_total - note_keep) if note_keep is not None else 0
+    note_lines = note_lines[note_lines_omitted:]
     note_ports = set()
-    for line in note_lines:
+    for line_number, line in enumerate(note_lines, note_lines_omitted + 1):
         if '[ОПРОВЕРГНУТО]' not in line:
-            note_ports.update(add(line, line, 'NOTES.md', when))
+            note_ports.update(add(line, line, 'NOTES.md', when, reference={
+                'path': 'NOTES.md', 'task_id': task_id, 'line': line_number}))
     transferred_notes = False
     try:
         if notes_path.is_file() and not notes_path.is_symlink():
@@ -597,11 +614,70 @@ def service_map(db, task_id, iteration, keep=12, work_root=None, note_keep=40):
     scan_mode = ('full_scan' if not entries or
                  (not report_fresh and not note_ports and latest_round is not None)
                  else 'spot_check')
-    return {'max_age_rounds': 2, 'last_confirmed_round': latest_round,
+    return {'hints': hints, 'note_lines_total': note_lines_total,
+            'note_lines_omitted': note_lines_omitted, 'max_age_rounds': 2, 'last_confirmed_round': latest_round,
             'fresh': report_fresh, 'scan_mode': scan_mode,
             'needs_spot_check': bool(note_ports and not report_fresh),
             'transferred_notes': transferred_notes and not report_fresh,
             'entries': sorted(entries.values(), key=lambda item: item['port'])[:keep]}
+
+
+SERVICE_MAP_HEADING = 'Port and service map (structured evidence; text and prior-IP records are hints):'
+HINT_CONTEXT_LIMIT = 12
+
+
+def service_map(db, task_id, iteration, keep=12, work_root=None, note_keep=40, *,
+                include_inherited=True, at=None):
+    """One bounded context view; structured rows and unverified hints stay separate."""
+    mapped = service_inventory.collect(db, task_id, keep=keep, at=at)
+    legacy = _text_service_hints(db, task_id, iteration, keep=keep,
+                                 work_root=work_root, note_keep=note_keep)
+    hints = legacy['hints']
+    inherited, inherited_context = False, None
+    if include_inherited:
+        parent = lineage_predecessor(db, task_id)
+        source = lineage_map_source(db, parent['task_id'], work_root=work_root) if parent else None
+        if source:
+            inherited = True
+            inherited_context = {'task_id': source['task_id'], 'target': source['target'],
+                                 'entries_total': source['map']['total_entries'],
+                                 'entries_omitted': source['map']['omitted_entries'],
+                                 'hints_total': source['map']['hints_total'],
+                                 'hints_omitted': source['map']['hints_omitted']}
+            for entry in source['map']['entries']:
+                hints.append({'kind': 'previous_ip', 'requires_verification': True,
+                              'task_id': source['task_id'], 'target': source['target'],
+                              'protocol': entry['protocol'], 'port': entry['port'],
+                              'sources': entry['sources'], 'sources_omitted': entry['sources_omitted'],
+                              'sources_total': entry['sources_total'],
+                              'identifications_omitted': entry['identifications_omitted'],
+                              'identifications_total': entry['identifications_total'],
+                              'identifications': entry['identifications']})
+            for hint in source['map']['hints']:
+                hints.append({**hint, 'kind': 'previous_ip', 'requires_verification': True,
+                              'task_id': source['task_id'], 'target': source['target']})
+    hints.sort(key=lambda item: (item['kind'] != 'text', item['port'], json.dumps(item, sort_keys=True)))
+    mapped.update(hints=hints[:HINT_CONTEXT_LIMIT], hints_total=len(hints),
+                  hints_omitted=max(0, len(hints) - HINT_CONTEXT_LIMIT),
+                  max_age_rounds=2, last_hint_round=legacy['last_confirmed_round'],
+                  transferred_notes=legacy['transferred_notes'] or inherited,
+                  inherited_context=inherited_context,
+                  notes_selection={'lines_total': legacy['note_lines_total'],
+                                   'lines_omitted': legacy['note_lines_omitted'], 'line_limit': note_keep})
+    # Text can suggest a cheap spot check, but cannot refresh existing structured evidence.
+    if not mapped['total_entries'] and hints and (inherited or legacy['scan_mode'] == 'spot_check'):
+        mapped['scan_mode'] = 'spot_check'
+        mapped['scan_mode_reason'] = 'unverified_hints_require_spot_check'
+    mapped['needs_spot_check'] = bool(mapped['total_entries'] or hints)
+    diagnostics.emit('service_map.selected', task_id=task_id, reason=mapped['scan_mode_reason'],
+                     parameters={'scan_mode': mapped['scan_mode'], 'sources': mapped['source_counts'],
+                                 'entries': mapped['total_entries'], 'omitted': mapped['omitted_entries'],
+                                 'scope_valid': mapped['scope_valid']})
+    return mapped
+
+
+def service_map_block(mapped):
+    return SERVICE_MAP_HEADING + '\n' + json.dumps(mapped, ensure_ascii=False)
 
 
 def close_task_sessions(task_id):
@@ -804,8 +880,8 @@ def lineage_map_source(db, task_id, work_root=None, max_hops=8):
         except sqlite3.OperationalError:
             round_number = 1
         mapped = service_map(db, current, round_number, work_root=work_root,
-                             note_keep=None)
-        if mapped['entries']:
+                             note_keep=None, include_inherited=False)
+        if mapped['total_entries'] or mapped['hints']:
             target = db.execute('SELECT target FROM tasks WHERE id=?', (current,)).fetchone()
             return {'task_id': current, 'target': str(target[0]) if target else '',
                     'map': mapped}
@@ -990,10 +1066,10 @@ def predecessor_context(db, task_id, iteration, current_map, role):
             lines.append(f"Карта сохранена в задаче #{source['task_id']} ({source['target']}).")
         if role != 'recon' or not current_map.get('entries'):
             ports = []
-            for item in source['map']['entries'][:8]:
-                label = ' '.join(part for part in
-                                 (item.get('service'), item.get('version')) if part)
-                ports.append(f"{item['port']}/tcp {label}".strip())
+            for item in (source['map']['entries'] or source['map']['hints'])[:8]:
+                identities = item.get('identifications') or [item]
+                label = ', '.join(sorted({str(i.get('service_hint') or i.get('service') or '') for i in identities}))
+                ports.append(f"{item['port']}/{item.get('protocol', 'unknown')} {label}".strip())
             lines.append('Прежняя карта: ' + ', '.join(ports))
     path_source = source['task_id'] if source else parent['task_id']
     paths = report_paths(db, path_source)
@@ -1346,12 +1422,6 @@ def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit
     current_map = service_map(db, context['task_id'], iteration)
     predecessor, source = predecessor_context(db, context['task_id'], iteration,
                                                current_map, role)
-    ports = current_map if role == 'recon' else None
-    if role == 'recon' and source and not current_map['entries']:
-        ports = dict(current_map, scan_mode='spot_check', needs_spot_check=True,
-                     transferred_notes=True, inherited_from=source['task_id'],
-                     entries=[dict(item, round=None, source='предшественник')
-                              for item in source['map']['entries']])
     return f'''You are the {role.upper()} agent of an authorised penetration test.
 Charter: {CHARTERS[role]}
 
@@ -1382,8 +1452,7 @@ inherited dead is only a prior-address hint):
 
 {predecessor}
 
-Port and service map (untrusted evidence hints; round age controls a full scan):
-{json.dumps(ports, ensure_ascii=False) if ports is not None else 'recon only'}
+{service_map_block(current_map)}
 
 How to work:
 1. Plan the shortest path to a verified result. Prefer one decisive call over
@@ -1440,9 +1509,10 @@ def compact_prompt(db, context, role, objective, iteration, poc_budget,
     contract as the first prompt, so the stage keeps working and still
     returns its report.
     """
-    history = compact_history(db, context['task_id'])
+    history = compact_history(db, context['task_id'], iteration=iteration)
     # Render shared state as separate sections, without duplicating it in history.
     state = history.pop('essential_state')
+    mapped = history.pop('service_map')
     notes = worknote_tail(context['task_id'])
     target = context.get('target') or 'unknown'
     # The policy blocks are repeated here on purpose: the compact switch happens
@@ -1462,6 +1532,8 @@ budget_warning of the tool replies.
 {tool_manual(context['task_id'], target)}
 
 {COMPACT_MODE_NOTE}
+
+{service_map_block(mapped)}
 
 {essential_state_block(state)}
 

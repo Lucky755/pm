@@ -1597,21 +1597,25 @@ def build_transfer_notes(snapshot, new_ip):
             finding_block += section
     if finding_block:
         chunks.append(finding_block)
-    entries = snapshot.get('service_map', {}).get('entries') or []
+    mapped = snapshot.get('service_map', {})
+    entries = (mapped.get('entries') or []) + (mapped.get('hints') or [])
     if entries:
         lines = ['# Карта прежней цели — перепроверь порты на новом IP']
         for item in entries:
             port = int(item['port'])
             if not 1 <= port <= 65535:
                 continue
-            service = str(item.get('service') or '')
-            version = str(item.get('version') or '')
+            identities = item.get('identifications') or [item]
+            service = ', '.join(sorted({str(i.get('service_hint') or i.get('service') or '') for i in identities}))
+            version = ', '.join(sorted({str(i.get('version_hint') or i.get('version') or '') for i in identities}))
             label = ' '.join(part for part in (service, version) if part)
             if version and not service:
                 label = 'версия ' + version
             evidence = (str(item.get('result_id') or '') or
-                        f"{item.get('source') or 'отчёт'} round {item.get('round') or '?'}")
-            lines.append(f'{port}/tcp {label} → прежний IP {map_ip}; evidence {safe_display(evidence)[:120]}')
+                        json.dumps(item.get('sources') or item.get('reference') or {}, ensure_ascii=False))
+            protocol = item.get('protocol') or 'tcp'  # old snapshots used TCP-only entries
+            anchor = f'{port}/{protocol}' if protocol != 'unknown' else f'порт {port}'
+            lines.append(f'{anchor} {label} → прежний IP {map_ip}; evidence {safe_display(evidence)[:120]}')
         chunks.append(('\n'.join(lines) + '\n').encode('utf-8'))
     payload = b''.join(chunks)
     if len(payload) > 131072:

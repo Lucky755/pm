@@ -222,13 +222,7 @@ def has_service_map(task_id, iteration):
     db = agent_actions.connect()
     try:
         current = agent_actions.service_map(db, task_id, iteration)
-        if current.get('scan_mode') == 'spot_check':
-            return True
-        if current.get('entries'):
-            return False  # stale map: recon may need another broad pass
-        inherited = agent_actions.lineage_map_source(db, task_id)
-        return bool(inherited and inherited['task_id'] != task_id and
-                    inherited['map'].get('entries'))
+        return current['scan_mode'] == 'spot_check'
     finally:
         db.close()
 
