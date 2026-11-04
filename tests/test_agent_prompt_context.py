@@ -25,6 +25,7 @@ class AgentPromptContextTests(unittest.TestCase):
         self.db = sqlite3.connect(':memory:')
         self.addCleanup(self.db.close)
         actions.ensure_schema(self.db)
+        actions.fact_state.ensure_schema(self.db)
         self.db.executescript('''
             CREATE TABLE tasks(id INTEGER PRIMARY KEY, target TEXT);
             INSERT INTO tasks VALUES(11, '203.0.113.10');
@@ -109,6 +110,111 @@ class AgentPromptContextTests(unittest.TestCase):
             self.assertIn(record['id'], compact)
         self.assertIn('evidence 7', compact)
         self.assertIn('Access state (a previous prose claim is not proof):', full)
+
+    def section(self, prompt, heading):
+        self.assertIn(heading + '\n', prompt)
+        return json.JSONDecoder().raw_decode(prompt.split(heading + '\n', 1)[1])[0]
+
+    def saved_access(self, task_id=11, level='user', categories=('who',)):
+        report = {'access_level': level, 'access_signal': 'shell',
+                  'access_probe_result_id': f'access-{task_id}-{level}',
+                  'triage': {category: {'summary': f'{level}: {category}',
+                                       'result_id': f'{task_id}-{level}-{category}',
+                                       'quote': f'exact {category} output'}
+                             for category in categories}}
+        actions.fact_state.save_access_report(self.db, task_id, report)
+        return report
+
+    def test_access_and_current_level_triage_survive_compaction(self):
+        for categories in ((), ('who', 'where'), actions.fact_state.TRIAGE_FIELDS):
+            with self.subTest(categories=categories):
+                self.db.execute('DELETE FROM pm_access_triage')
+                self.db.execute('DELETE FROM pm_access_state')
+                report = self.saved_access(categories=categories)
+                expected = actions.fact_state.access_state(self.db, 11)
+                self.assertEqual(expected['triage_done'], len(categories) == 6)
+                self.assertEqual(expected['pending'], len(categories) != 6)
+                context = self.context('без брутфорса')
+                before = list(self.db.iterdump())
+                for prompt in reversed(self.prompts(context)):
+                    self.assertEqual(self.section(prompt, 'Access state (a previous prose claim is not proof):'),
+                                     expected)
+                    triage = self.section(prompt, 'Saved triage for current access level (evidence-linked):')
+                    self.assertEqual(triage, {'level': 'user', 'categories': report['triage']})
+                self.assertEqual(list(self.db.iterdump()), before)
+
+    def test_no_access_and_unverified_claim_are_not_upgraded(self):
+        for signal in ('none', 'claimed_unverified'):
+            with self.subTest(signal=signal):
+                if signal != 'none':
+                    self.db.execute('INSERT INTO pm_access_state '
+                                    '(task_id,level,signal,updated_at) VALUES (11,?,?,?)',
+                                    ('none', signal, 'before'))
+                expected = actions.fact_state.access_state(self.db, 11)
+                for prompt in self.prompts(self.context('Find flags')):
+                    self.assertEqual(self.section(prompt, 'Access state (a previous prose claim is not proof):'),
+                                     expected)
+                    self.assertEqual(self.section(prompt, 'Saved triage for current access level (evidence-linked):'),
+                                     {'level': 'none', 'categories': {}})
+
+    def observation(self, claim, task_id=11, kind='observation', status='confirmed',
+                    quote='exact output', result_id='old-result'):
+        actions.fact_state.save_hypotheses(self.db, task_id, 'test', {'hypotheses': [
+            {'claim': claim, 'kind': kind, 'result': status,
+             'probe_result_id': result_id, 'quote': quote}]})
+
+    def test_old_observation_is_structured_and_task_and_level_scoped(self):
+        self.saved_access(level='exec', categories=actions.fact_state.TRIAGE_FIELDS)
+        report = self.saved_access(level='user', categories=('who',))
+        self.saved_access(task_id=22, level='privileged', categories=actions.fact_state.TRIAGE_FIELDS)
+        self.observation('Старое подтверждённое наблюдение')
+        self.observation('FOREIGN observation', task_id=22)
+        self.observation('unverified hypothesis', kind='hypothesis', status='untested')
+        self.observation('confirmed inference', kind='inference')
+        self.observation('missing quote', quote='')
+        self.observation('missing result', result_id='')
+        actions.CAPABILITY_LOG.mkdir()
+        records = [{'id': 'old-result' if i == 0 else f'result-{i}', 'task_id': 11,
+                    'tool': 'net_exec', 'result': {'status': 'completed', 'stdout': 'exact output'}}
+                   for i in range(8)]
+        (actions.CAPABILITY_LOG / 'task_11.jsonl').write_text(
+            ''.join(json.dumps(record) + '\n' for record in records), encoding='utf-8')
+        context = self.context('Find flags; no brute force')
+        before = list(self.db.iterdump())
+        history = actions.compact_history(self.db, 11)
+        self.assertNotIn('old-result', [item['result_id'] for item in history['full_results']])
+        self.assertIn('essential_state', history)
+        for prompt in self.prompts(context):
+            observations = self.section(prompt, 'Confirmed observations (evidence-linked; bounded selection):')
+            self.assertEqual(observations['items'], [
+                {'claim': 'Старое подтверждённое наблюдение', 'probe_result_id': 'old-result',
+                 'quote': 'exact output'}])
+            self.assertEqual(observations['omitted'], 0)
+            self.assertEqual(observations, history['essential_state']['observations'])
+            self.assertEqual(self.section(prompt, 'Access state (a previous prose claim is not proof):'),
+                             history['essential_state']['access_state'])
+            self.assertNotIn('FOREIGN', prompt)
+            self.assertNotIn('access-22', prompt)
+            self.assertEqual(self.section(prompt, 'Saved triage for current access level (evidence-linked):'),
+                             {'level': 'user', 'categories': report['triage']})
+        self.assertEqual(list(self.db.iterdump()), before)
+
+    def test_observation_limit_reports_omissions_and_filters_before_limiting(self):
+        # More recent open hypotheses must not displace proved observations.
+        for index in range(15):
+            self.observation(f'confirmed {index}')
+        for index in range(110):
+            self.observation(f'open {index}', kind='hypothesis', status='untested')
+        self.db.execute("UPDATE pm_hypotheses SET updated_at='2020-01-01' WHERE kind='observation'")
+        context = self.context('Find flags')
+        for prompt in self.prompts(context):
+            observations = self.section(prompt, 'Confirmed observations (evidence-linked; bounded selection):')
+            self.assertEqual(len(observations['items']), 12)
+            self.assertEqual(observations['total'], 15)
+            self.assertEqual(observations['omitted'], 3)
+            self.assertEqual(observations['limit'], 12)
+        # Repeated builds select the same records even when timestamps tie.
+        self.assertEqual(self.prompts(context), self.prompts(context))
 
 
 if __name__ == '__main__':
