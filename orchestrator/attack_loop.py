@@ -964,9 +964,11 @@ def main(argv=None):
     try:
         if args.command == 'run':
             roles = tuple(item.strip().lower() for item in args.roles.split(',') if item.strip())
-            render(run(args.task_id, args.iterations, roles,
-                       args.poc_budget, args.step_limit, max_tokens=args.max_tokens,
-                       expect_flags=args.expect_flags))
+            from orchestrator.coordinated_attack import task_lock
+            with task_lock(args.task_id):
+                render(run(args.task_id, args.iterations, roles,
+                           args.poc_budget, args.step_limit, max_tokens=args.max_tokens,
+                           expect_flags=args.expect_flags))
     except (ValueError, RuntimeError, OSError) as exc:
         render({'status': 'error', 'error': str(exc)})
         return 1

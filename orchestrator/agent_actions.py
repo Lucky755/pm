@@ -16,6 +16,9 @@ Security model that still holds:
 """
 
 import argparse
+import fcntl
+from functools import wraps
+import inspect
 import getpass
 import ipaddress
 import json
@@ -52,6 +55,7 @@ REPORT_DIR = ROOT / 'storage/agent_reports'
 POC_DIR = ROOT / 'storage/pocs'
 ISOLATED_EXECUTOR = ROOT / 'executor/network_executor_isolated.py'
 TASK_WORK_BASE = Path('/var/lib/pentest-master/work')
+ROLE_LOCK_DIR = ROOT / 'runtime/role_report_locks'
 
 ROLES = ('recon', 'vuln', 'access', 'verify')
 
@@ -2036,8 +2040,38 @@ def validate_triage_objective(state, objective):
             objective, re.I)):
         raise ValueError('Не завершён триаж доступа: цель повышения уровня отклонена')
 
+def exclusive_report_slot(function):
+    """Reserve a role/report number for the entire turn, across processes."""
+    signature = inspect.signature(function)
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        task_id, role, iteration = int(bound.arguments['task_id']), bound.arguments['role'], int(bound.arguments['iteration'])
+        if role not in ROLES or iteration < 1:
+            raise ValueError('Invalid role report slot')
+        ROLE_LOCK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (ROLE_LOCK_DIR / f'{task_id}-{role}-{iteration}.lock').open('a+') as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError('Role report slot is already running') from exc
+            try:
+                db = connect()
+                try:
+                    exists = db.execute('SELECT 1 FROM pm_agent_action_reports WHERE task_id=? AND role=? AND iteration=?',
+                                        (task_id,role,iteration)).fetchone()
+                finally:
+                    db.close()
+                if exists:
+                    raise ValueError('Role report already exists; allocate a new iteration')
+                return function(*args, **kwargs)
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+    return guarded
 
 @diagnostics.stage
+@exclusive_report_slot
 def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
              step_limit=15, api_key=None, max_tokens=DEFAULT_MAX_TOKENS):
     if role not in ROLES:

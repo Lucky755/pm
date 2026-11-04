@@ -2135,11 +2135,15 @@ def op_attack(args):
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from orchestrator import attack_loop
+    if not getattr(args,'coordinated',False) and (
+            getattr(args,'continue_coordinated',False) or getattr(args,'approve_step',None) is not None
+            or getattr(args,'abandon_running_step',None) is not None
+            or getattr(args,'coordinator_steps',8) != 8 or getattr(args,'decision_retries',1) != 1):
+        raise OperatorError('Параметры координатора требуют --coordinated')
     with connect() as db:
         save_flag_options(db, args.task_id, args)
         objective_state = save_objective_options(db, args.task_id, args)
 
-    key = session_api_key(args, required=True)
     roles = tuple(item.strip().lower() for item in
                   str(getattr(args, 'roles', 'recon,vuln,access,verify')).split(',')
                   if item.strip())
@@ -2150,6 +2154,32 @@ def op_attack(args):
                   if objective_state['primary'] else attack_loop.DEFAULT_EXPECTED_FLAGS))
     if not 1 <= expect <= attack_loop.MAX_EXPECTED_FLAGS:
         raise OperatorError(f'Ожидаемое число флагов должно быть от 1 до {attack_loop.MAX_EXPECTED_FLAGS}')
+    if getattr(args, 'coordinated', False):
+        from orchestrator import coordinated_attack
+        heading(f'Координатор — задача #{args.task_id}')
+        result = coordinated_attack.run(
+            args.task_id, roles=roles, max_steps=getattr(args,'coordinator_steps',8),
+            decision_retries=getattr(args,'decision_retries',1), poc_budget=args.poc_budget,
+            step_limit=args.step_limit, max_tokens=limit, expect_flags=expect,
+            key_provider=lambda: session_api_key(args, required=True),
+            continue_run=getattr(args,'continue_coordinated',False),
+            approve_step=getattr(args,'approve_step',None),
+            abandon_running_step=getattr(args,'abandon_running_step',None))
+        line('  Остановка: ' + safe_display(result['stop_reason']))
+        line(f"  Исследовательская цель подтверждена: {result['succeeded']}")
+        for step in result['steps']:
+            decision=step['decision']
+            line(f"  Шаг #{step['id']} {step['status']} · {decision.get('role') or decision.get('action','invalid')} · отчёт {step['report_iteration']}")
+            if decision:
+                line('    Вопрос: ' + safe_display(decision['question']))
+                line('    Основание: ' + safe_display(decision['reason']))
+                line('    Ожидается: ' + safe_display(decision['expected_result']))
+        if result['status']=='waiting_operator':
+            line('  Пауза сохранена. --continue-coordinated продолжает после проверки результатов.')
+            line('  --approve-step ID подтверждает показанный шаг ACCESS; --abandon-running-step ID '
+                 'после ручной проверки оставляет прерванный исход неизвестным и разрешает другую проверку.')
+        return result
+    key = session_api_key(args, required=True)
     heading(f'Ролевой цикл - задача #{args.task_id}')
     line('  ' + tint('решает оркестратор: ' + ' -> '.join(roles), 'bright'))
     line('  ' + tint(f'итераций {args.iterations} · шагов на роль {args.step_limit} '
@@ -2168,9 +2198,11 @@ def op_attack(args):
                      'выполнения', 'muted'))
     line('')
     try:
-        result = attack_loop.run(args.task_id, args.iterations, roles,
-                                 args.poc_budget, args.step_limit, api_key=key,
-                                 max_tokens=limit, expect_flags=expect)
+        from orchestrator.coordinated_attack import task_lock
+        with task_lock(args.task_id):
+            result = attack_loop.run(args.task_id, args.iterations, roles,
+                                     args.poc_budget, args.step_limit, api_key=key,
+                                     max_tokens=limit, expect_flags=expect)
     except KeyboardInterrupt:
         line('')
         line('  ' + tint('[СТОП]', 'danger') +
@@ -2521,6 +2553,12 @@ def parser_main():
                         help='Архивировать старый /work до teardown (не более 200 МБ)')
     attack = sub.add_parser('attack', help='Запустить ролевой цикл атаки (recon/vuln/access/verify)')
     attack.add_argument('task_id', type=int)
+    attack.add_argument('--coordinated', action='store_true', help='Выбирать одну роль по сохранённому состоянию задачи')
+    attack.add_argument('--coordinator-steps', type=int, default=8, help='Решений/шагов на ручной запуск (1..32)')
+    attack.add_argument('--decision-retries', type=int, default=1, help='Исправлений ответа координатора (0..2)')
+    attack.add_argument('--continue-coordinated', action='store_true', help='Продолжить после сохранённой паузы оператора')
+    attack.add_argument('--approve-step', type=int, help='Подтвердить конкретный сохранённый шаг ACCESS')
+    attack.add_argument('--abandon-running-step', type=int, help='После проверки отметить running-шаг как имеющий неизвестный исход')
     attack.add_argument('--iterations', type=int, default=7)
     attack.add_argument('--roles', default='recon,vuln,access,verify')
     attack.add_argument('--poc-budget', type=int, default=7)
@@ -2611,7 +2649,7 @@ def interactive():
         ('4', 'ЗАКРЫТЬ', 'Удалить правила только после yes'),
         ('5', 'ДОМЕНЫ', 'Привязать имена к IP внутри namespace'),
         ('6', 'СМЕНИТЬ IP', 'Новый адрес машины с сохранением истории'),
-        ('7', 'АТАКА', 'Ролевой цикл: recon -> vuln -> access -> verify'),
+        ('7', 'АТАКА', 'Координатор или прежний ролевой цикл'),
         ('8', 'УБОРКА', 'Удалить сети закрытых и забытых задач'),
         ('0', 'ВЫХОД', 'Оставить сетевые правила без изменений'),
     )
@@ -2693,8 +2731,22 @@ def interactive():
                 args.task_id = int(input('Номер задачи: ').strip())
                 patterns = input('Дополнительные шаблоны флагов (Enter — стандартные): ').strip()
                 args.flag_pattern = [patterns] if patterns else None
-                raw = input('Итераций (Enter — 7): ').strip()
-                args.iterations = int(raw) if raw else 7
+                mode = input('Режим: 1 — координатор, 2 — прежний цикл (Enter — 2): ').strip()
+                if mode not in ('', '1', '2'):
+                    raise OperatorError('Выбери режим 1 или 2')
+                args.coordinated = mode == '1'
+                if args.coordinated:
+                    raw = input('Шагов координатора (Enter — 8): ').strip()
+                    args.coordinator_steps = int(raw) if raw else 8
+                    action = input('Пауза: Enter — показать/запустить; c — продолжить; a:ID — одобрить ACCESS; r:ID — разобранный running: ').strip()
+                    args.continue_coordinated = action == 'c'
+                    args.approve_step = int(action[2:]) if action.startswith('a:') else None
+                    args.abandon_running_step = int(action[2:]) if action.startswith('r:') else None
+                    if action and action != 'c' and not action.startswith(('a:', 'r:')):
+                        raise OperatorError('Неизвестное действие продолжения')
+                if not args.coordinated:
+                    raw = input('Итераций (Enter — 7): ').strip()
+                    args.iterations = int(raw) if raw else 7
                 args.roles = (input('Роли через запятую '
                                     '(Enter — recon,vuln,access,verify): ').strip()
                               or 'recon,vuln,access,verify')

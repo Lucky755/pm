@@ -125,7 +125,8 @@ def display(event, stream=None):
                       ('run_id', 'task_id', 'role', 'iteration', 'status', 'duration_seconds',
                        'exit_code', 'executor_exit_code', 'result_id', 'reason', 'reason_category', 'reason_summary', 'error_type', 'parameters', 'table', 'identifiers',
                        'previous_state', 'current_state', 'input_tokens', 'cache_read_tokens',
-                       'output_tokens', 'unfinished', 'journal')
+                       'output_tokens', 'coordinator_run_id', 'step_id', 'question', 'expected_result',
+                       'changed', 'unfinished', 'journal')
                       if event.get(key) is not None)
     try:
         print(f"[EVENT] {event['kind']} {event.get('name', '')} "
