@@ -242,6 +242,9 @@ def exception_status(exc):
 def failure_details(payload=None, exc=None):
     """Classify failure without copying stdout, stderr, commands or environments."""
     payload = payload if isinstance(payload, dict) else {}
+    if payload.get('failure_domain') == 'coordinator_decision' and exc is None:
+        return {'reason_category':'coordinator_decision',
+                'reason_summary':'Coordinator decision validation failed; inspect coordinator.decision_rejected events.'}
     status = payload.get('status')
     text = str(payload.get('error') or payload.get('reason') or payload.get('stderr') or '') if exc is None else str(exc)
     lowered = text.casefold()

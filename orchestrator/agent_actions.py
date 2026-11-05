@@ -108,7 +108,7 @@ CHARTERS = {
         'result_id in the top-level probe field. Do not confirm a finding unless '
         'your probe reproduces it. Never accept agreement between reports as proof. '
         'Check whether a captured flag actually satisfies the operator primary '
-        'objective; include its objective_key and the decisive goal_evidence result_id.'
+        'objective; include its objective_key and the decisive goal_evidence capture reference (http_artifact:ID or a typed capture result_id).'
     ),
 }
 
@@ -207,7 +207,7 @@ Finish with ONE JSON object and no other text:
              "next_level": {"summary": "...", "result_id": "...", "quote": "..."}}},
   "flags": [{"value": "string exactly as captured", "source": "how it was obtained",
              "objective_key": "goal|obj-1|... or null if unknown",
-             "goal_evidence": "result_id proving this objective, or empty",
+             "goal_evidence": "http_artifact:ID or typed capture result_id proving this objective, or empty",
              "goal_confirmed": false}],
   "verified": ["statements backed by captured output"],
   "uncertainties": ["..."],

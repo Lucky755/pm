@@ -198,13 +198,15 @@ def _record_for(task_id, result_id):
 
 @diagnostics.committed_changes
 def process_report(db, task_id, report, registry):
-    """Accept objective claims only with captured network evidence."""
+    """Attribute objectives only to locally validated original capture witnesses."""
     state = objective_status(db, task_id)
     if not state['primary']:
         return state
     rows = {item['key']: item for item in state['objectives']}
     values = {item['value']: item for item in registry['confirmed'] + registry['candidates']}
     patterns = flag_verify.flag_patterns(db, task_id)
+    from orchestrator import flag_evidence
+    witnesses, _ = flag_evidence.collect(db, task_id)
     for claim in report.get('flags') or []:
         if not isinstance(claim, dict) or claim.get('objective_key') not in rows:
             continue
@@ -216,12 +218,9 @@ def process_report(db, task_id, report, registry):
             continue
         key = claim['objective_key']
         result_id = str(claim.get('goal_evidence') or '')
-        record = _record_for(task_id, result_id) if result_id else None
-        payload = (record or {}).get('result') or {}
-        output = '\n'.join(str(payload.get(field) or '') for field in
-                           ('stdout', 'stderr', 'response', 'output'))
-        valid = bool(record and record.get('provenance') == 'network' and
-                     payload.get('status') in ('completed', 'ok') and value in output)
+        record = _record_for(task_id, result_id) if result_id and not result_id.startswith('http_artifact:') else None
+        valid = any(value in text and flag_evidence.reference_matches(db, task_id, result_id, proof, record)
+                    for proof, text in witnesses)
         stored = db.execute('SELECT sources_json FROM pm_verified_flags WHERE task_id=? AND value=?',
                             (task_id, value)).fetchone()
         if not stored:
@@ -235,16 +234,26 @@ def process_report(db, task_id, report, registry):
         if not valid:
             sources['goal_claim_unverified'] = 'заявлено как цель, но result_id не доказывает её'
             item['goal_claim_unverified'] = sources['goal_claim_unverified']
-            status = 'confirmed' if item.get('operator_confirmed') else 'candidate'
+            status = 'confirmed' if item.get('operator_confirmed') or item.get('verified_evidence') else 'candidate'
             db.execute('UPDATE pm_verified_flags SET status=?,sources_json=? WHERE task_id=? AND value=?',
                        (status, json.dumps(sources, ensure_ascii=False), task_id, value))
             if status == 'candidate' and item in registry['confirmed']:
                 registry['confirmed'].remove(item)
                 registry['candidates'].append(item)
                 item['status'] = 'candidate'
+            payload = (record or {}).get('result') or {}
+            if record and payload.get('status') in ('completed','ok') and rows[key]['status']=='open':
+                # A saved execution can establish an attempt, never completion.
+                db.execute("UPDATE pm_objectives SET status='attempted',updated_at=? WHERE task_id=? AND key=?",
+                           (flag_verify.now(),task_id,key))
+            if rows[key]['status']=='confirmed' and rows[key]['evidence_ref']==result_id:
+                # Preserve the evidence reference/history, but a withdrawn or
+                # corrupted witness cannot keep proving the objective.
+                db.execute("UPDATE pm_objectives SET status='attempted',updated_at=? WHERE task_id=? AND key=?",
+                           (flag_verify.now(),task_id,key))
             continue
         row = rows[key]
-        confirmed = item.get('independent_sources', 0) >= 2
+        confirmed = valid
         flag_status = 'confirmed' if confirmed or item.get('operator_confirmed') else 'candidate'
         sources.pop('goal_claim_unverified', None)
         item.pop('goal_claim_unverified', None)

@@ -49,14 +49,14 @@ class FlagExtensionsTests(unittest.TestCase):
         self.assertEqual(state['evidence_source'], 'local')
         self.assertEqual(len(state['local_hits']), 2)
 
-    def test_two_network_sources_confirm_keyed_uuid(self):
+    def test_two_unverified_network_outputs_do_not_confirm_keyed_uuid(self):
         value = '557f6da6-dd18-4421-8cbd-b8197fba9d2b'
         self.record('net_exec', '{"flag":"' + value + '"}', 'network', ['/usr/bin/curl'])
         first = self.state(value)
         self.assertEqual(first['status'], 'candidate')
         self.assertEqual(first['matched_by'], 'kv')
         self.record('session', 'FLAG=' + value, 'network', ['/usr/bin/nc'])
-        self.assertEqual(self.state(value)['status'], 'confirmed')
+        self.assertEqual(self.state(value)['status'], 'candidate')
 
     def test_agent_claim_for_keyed_value_uses_task_patterns(self):
         value = '557f6da6-dd18-4421-8cbd-b8197fba9d2b'

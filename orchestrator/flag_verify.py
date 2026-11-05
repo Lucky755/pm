@@ -4,12 +4,11 @@ A flag is not "found" because an agent says so. This module reads the raw
 records the capabilities actually produced (storage/capability_log) and the
 agent reports, then classifies every candidate:
 
-  confirmed  the same value appears in at least two independent capability
-             sources, or an operator confirmed it explicitly;
-  candidate  seen once in raw output, or only claimed by an agent.
+  confirmed  locally validated target capture/derived artifact, or explicit
+             operator confirmation;
+  candidate  execution output or an agent claim without a validated witness.
 
-That keeps a hallucinated flag from ending an assessment while still letting a
-single decisive PoC output through once a second source corroborates it.
+Execution counts are diagnostic metadata, never a confirmation threshold.
 
 Литеральный поиск самогенерации — эвристика против случайной самогенерации, не
 замена operator_confirm. Склейка строк, base64 и вычисляемый вывод могут её
@@ -231,7 +230,7 @@ def capability_records(task_id, limit=400):
         except ValueError:
             continue
         payload = record.get('result')
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or record.get('task_id', task_id) != task_id:
             continue
         text = normalise_captured('\n'.join([
             str(payload.get('stdout', '')),
@@ -276,6 +275,7 @@ def capability_records(task_id, limit=400):
                 identity = json.dumps(normalized_argv, ensure_ascii=False, separators=(',', ':'))
             records.append({
                 'ref': f'capability:{number}:{record.get("tool")}',
+                'result_id': record.get('id'),
                 'tool': record.get('tool'),
                 'provenance': record.get('provenance', 'unknown'),
                 'time': record.get('timestamp'),
@@ -324,11 +324,7 @@ def agent_claims(db, task_id):
 
 
 def scan(task_id, patterns=None, db=None):
-    """Classify captured flags; literal self-generation detection is heuristic.
-
-    It catches accidental literals in argv or PoC source, not concatenated or
-    encoded output, and does not replace operator_confirm.
-    """
+    """Classify using verified captures; execution literals only explain blockers."""
     if type(task_id) is not int or task_id <= 0:
         raise ValueError('Expected a positive task id')
     owns_db = db is None
@@ -353,7 +349,7 @@ def scan(task_id, patterns=None, db=None):
     def empty_entry():
         return {'raw': [], 'local_hits': [], 'claims': [], 'tools': set(),
                 'independent': set(), 'self_generated': [],
-                'source_unverified': [], 'matched_by': set()}
+                'source_unverified': [], 'matched_by': set(), 'verified_evidence': [], 'result_ids': set()}
     for record in capability_records(task_id):
         for regex in regexes:
             for match in regex.finditer(record['text']):
@@ -363,6 +359,8 @@ def scan(task_id, patterns=None, db=None):
                 if not valid_flag_value(value, regex, target):
                     continue
                 entry = found.setdefault(value, empty_entry())
+                if record['result_id']:
+                    entry['result_ids'].add(record['result_id'])
                 entry['matched_by'].add(pattern_sources.get(regex.pattern,
                     'kv' if regex.pattern == KV_PATTERN else 'default'))
                 if record['source_changed']:
@@ -378,6 +376,20 @@ def scan(task_id, patterns=None, db=None):
                     entry['raw'].append(record['ref'])
                     entry['tools'].add(str(record.get('tool')))
                     entry['independent'].add(record['identity'])
+
+    from orchestrator import flag_evidence
+    witnesses, evidence_errors = flag_evidence.collect(db, task_id)
+    for proof, text in witnesses:
+        for regex in regexes:
+            for match in regex.finditer(text):
+                value = match.group(1) if regex.groups else match.group(0)
+                if not valid_flag_value(value, regex, target):
+                    continue
+                entry = found.setdefault(value, empty_entry())
+                witness = {**proof, 'quote': text[max(0,match.start()-60):match.end()+60]}
+                if witness not in entry['verified_evidence']:
+                    entry['verified_evidence'].append(witness)
+                entry['matched_by'].add(pattern_sources.get(regex.pattern, 'default'))
 
     try:
         for pattern, source in pattern_sources.items():
@@ -414,7 +426,7 @@ def scan(task_id, patterns=None, db=None):
         for value, entry in found.items():
             roles = sorted({ref.split(':')[1] for ref in entry['claims'] if ref.count(':') >= 2})
             independent_sources = len(entry['independent'])
-            status = 'confirmed' if independent_sources >= 2 else 'candidate'
+            status = 'confirmed' if entry['verified_evidence'] else 'candidate'
 
             previous = db.execute(
                 'SELECT operator_confirmed, sources_json, objective_key, weight FROM pm_verified_flags '
@@ -424,14 +436,14 @@ def scan(task_id, patterns=None, db=None):
             operator_confirmed = bool(previous and previous[0])
             if operator_confirmed:
                 status = 'confirmed'
-            evidence_source = ('network' if entry['raw'] else
+            evidence_source = ('network' if entry['raw'] or entry['verified_evidence'] else
                                'local' if entry['local_hits'] else 'none')
             matched_by = sorted(entry['matched_by'])[0] if entry['matched_by'] else 'default'
 
             sources = {
                 'raw': entry['raw'][:8],
                 'local_hits': entry['local_hits'][:8],
-                'local_only': bool(entry['local_hits'] and not entry['raw']),
+                'local_only': bool(entry['local_hits'] and not entry['raw'] and not entry['verified_evidence']),
                 'evidence_source': evidence_source,
                 'matched_by': matched_by,
                 'claims': entry['claims'][:8],
@@ -439,6 +451,16 @@ def scan(task_id, patterns=None, db=None):
                 'independent_sources': independent_sources,
                 'self_generated': entry['self_generated'][:8],
                 'source_unverified': entry['source_unverified'][:8],
+                'verified_evidence': entry['verified_evidence'][:8],
+                'omitted_verified_evidence': max(0, len(entry['verified_evidence'])-8),
+                'result_ids': sorted(entry['result_ids']),
+                'confirmation_reasons': ([] if status == 'confirmed' else ['no_verified_target_capture'] +
+                    (['self_generated_output'] if entry['self_generated'] else []) +
+                    (['local_output_without_capture_link'] if entry['local_hits'] else []) +
+                    (['execution_output_is_not_a_capture'] if entry['raw'] else []) +
+                    (['model_claim_is_not_proof'] if entry['claims'] else []) +
+                    (['source_changed_during_execution'] if entry['source_unverified'] else [])),
+                'evidence_errors':evidence_errors[:8],
             }
             if value in transferred:
                 sources['transfer'] = transferred[value]
@@ -454,8 +476,6 @@ def scan(task_id, patterns=None, db=None):
                     marker = None
                 if marker:
                     sources['goal_claim_unverified'] = marker
-                    if not operator_confirmed:
-                        status = 'candidate'
             reported_by = ','.join(roles + (['transfer'] if value in transferred else []) +
                                    (['operator'] if operator_confirmed else []))
             db.execute(
@@ -466,7 +486,7 @@ def scan(task_id, patterns=None, db=None):
                 'status=excluded.status, evidence_count=excluded.evidence_count, '
                 'reported_by=excluded.reported_by, sources_json=excluded.sources_json, '
                 'updated_at=excluded.updated_at',
-                (task_id, value, status, len(entry['raw']), reported_by,
+                (task_id, value, status, max(len(entry['raw']),len(entry['verified_evidence'])), reported_by,
                  json.dumps(sources, ensure_ascii=False), stamp, stamp),
             )
             results.append({
@@ -474,7 +494,7 @@ def scan(task_id, patterns=None, db=None):
                 'status': status,
                 'raw_hits': len(entry['raw']),
                 'local_hits': entry['local_hits'][:8],
-                'local_only': bool(entry['local_hits'] and not entry['raw']),
+                'local_only': bool(entry['local_hits'] and not entry['raw'] and not entry['verified_evidence']),
                 'evidence_source': evidence_source,
                 'matched_by': matched_by,
                 'independent_sources': independent_sources,
@@ -486,6 +506,8 @@ def scan(task_id, patterns=None, db=None):
                 'roles': roles,
                 'tools': sorted(entry['tools']),
                 'claims': sorted(set(entry['claims'])),
+                **{key: sources[key] for key in ('verified_evidence','omitted_verified_evidence',
+                                                'result_ids','confirmation_reasons','evidence_errors')},
             })
 
         # Drop stale rows: a value that no longer matches any capture (or any
@@ -524,6 +546,7 @@ def scan(task_id, patterns=None, db=None):
         'count': len(results),
         'confirmed': confirmed,
         'candidates': candidates,
+        'evidence_errors': evidence_errors,
         'mismatches': mismatches,
         'patterns_used': list(patterns),
     }
@@ -670,12 +693,12 @@ def self_test():
             CAPABILITY_LOG, DB_PATH = saved_log, saved_db
 
     statuses = {item['value']: item['status'] for item in result['confirmed'] + result['candidates']}
-    expected = {'HTB{first_one}': 'confirmed', 'CTF{lonely}': 'candidate',
+    expected = {'HTB{first_one}': 'candidate', 'CTF{lonely}': 'candidate',
                 'HTB{hallucinated}': 'candidate', 'HTB{first_0ne}': 'candidate',
-                'HTB{repr_capture}': 'confirmed', 'DUP{same_poc}': 'candidate',
+                'HTB{repr_capture}': 'candidate', 'DUP{same_poc}': 'candidate',
                 'FAKE{in_source}': 'candidate',
                 'SESS{only_shell_output}': 'candidate',
-                'SESS{corroborated_output}': 'confirmed'}
+                'SESS{corroborated_output}': 'candidate'}
     if statuses != expected:
         raise ValueError(f'Unexpected flag statuses: {statuses}')
     dup = next(item for item in result['candidates'] if item['value'] == 'DUP{same_poc}')

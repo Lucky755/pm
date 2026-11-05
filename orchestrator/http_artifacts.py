@@ -125,16 +125,18 @@ def set_response_limit(db, task_id, limit, stamp):
                    'SET response_limit=excluded.response_limit,updated_at=excluded.updated_at',(task_id,limit,stamp))
 
 
-def _directory(task_id):
+def _directory(task_id, *, create=True):
     if type(task_id) is not int or task_id <= 0:
         raise ValueError('Invalid artifact task')
     # This writer is unprivileged. Reject links and unsafe existing artifact dirs.
     for directory in (ROOT, ROOT / f'task-{task_id}'):
-        directory.mkdir(mode=0o700, parents=directory == ROOT, exist_ok=True)
+        if create:
+            directory.mkdir(mode=0o700, parents=directory == ROOT, exist_ok=True)
         info = directory.lstat()
         if not stat.S_ISDIR(info.st_mode) or directory.is_symlink() or info.st_uid != os.getuid():
             raise ValueError('Unsafe HTTP artifact directory')
-        directory.chmod(0o700)
+        if create:
+            directory.chmod(0o700)
     return ROOT / f'task-{task_id}'
 
 
@@ -188,7 +190,7 @@ def load(db, task_id, artifact_id):
                      (artifact_id,task_id)).fetchone()
     if not row or not re.fullmatch(r'[0-9a-f]{64}',row[0]):
         raise ValueError('Artifact does not belong to this task')
-    path = _directory(task_id) / (row[0]+'.body')
+    path = _directory(task_id, create=False) / (row[0]+'.body')
     descriptor = os.open(path,os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(descriptor,'rb') as stream:
         details = os.fstat(stream.fileno())

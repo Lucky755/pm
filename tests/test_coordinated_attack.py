@@ -344,25 +344,25 @@ class CoordinatorTests(unittest.TestCase):
         result=self.run_mode([])
         self.assertTrue(result['succeeded']);self.assertEqual(self.prompts,[]);self.assertEqual(self.calls,[])
 
-    def test_goal_requires_existing_evidence_checks_then_operator_review(self):
+    def test_completed_goal_uses_capture_proof_without_operator_verify_round(self):
+        from orchestrator import http_artifacts
         with self.connect() as db:objectives.save_objectives(db,11,'Primary flag',exclusive=True)
-        self.report_extra={'flags':[{'value':'FLAG{offline_proof}','objective_key':'goal',
-                                    'goal_evidence':'0'*23+'2'}]}
         def role(*args,**kwargs):
+            with self.connect() as db:
+                aid=http_artifacts.save(db,11,'10.0.0.1','http','10.0.0.1',80,'/flag.txt',
+                    {'body':b'FLAG{offline_proof}','status':200,'complete':True,
+                     'headers':{'content-type':'text/plain'},'metadata':{}},c.now())
+            self.report_extra={'flags':[{'value':'FLAG{offline_proof}','objective_key':'goal',
+                                        'goal_evidence':f'http_artifact:{aid}'}]}
             self.role(*args,**kwargs)
-            path=a.CAPABILITY_LOG/'task_11.jsonl'
-            records=[]
-            for number in (1,2):
-                records.append({'id':f'{number:024x}','task_id':11,'tool':'net_exec','provenance':'network',
-                                'argv':['offline-fixture',f'check-{number}'],
-                                'result':{'status':'completed','exit_code':0,'stdout':'FLAG{offline_proof}'}})
-            path.write_text(''.join(json.dumps(record)+'\n' for record in records))
-        result=c.run(11,api_key='fake-only',model=self.model([decision('verify','Verify flag evidence?')]),role_runner=role)
-        self.assertEqual(result['stop_reason'],'confirmed_flag_found')
-        self.assertEqual(result['status'],'waiting_operator')
-        self.assertFalse(result['succeeded'])
+        with patch.object(http_artifacts,'ROOT',self.root/'http'):
+            result=c.run(11,api_key='fake-only',model=self.model([decision('recon','Read target capture?')]),role_runner=role)
+        self.assertEqual(result['stop_reason'],'goal_confirmed')
+        self.assertEqual(result['status'],'completed')
+        self.assertTrue(result['succeeded'])
         with self.connect() as db:self.assertEqual(objectives.objective_status(db,11)['primary']['status'],'confirmed')
-        result=self.run_mode([],continue_run=True)
+        with patch.object(http_artifacts,'ROOT',self.root/'http'):
+            result=self.run_mode([],continue_run=True)
         self.assertTrue(result['succeeded'])
         self.assertEqual(len(self.calls),1)
 
