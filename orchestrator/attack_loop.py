@@ -44,6 +44,7 @@ from orchestrator import agent_actions
 from orchestrator import flag_verify
 from orchestrator import fact_state
 from orchestrator import objectives as objective_store
+from orchestrator import report_integrity
 
 ROLE_ORDER = ('recon', 'vuln', 'access', 'verify')
 MAX_ITERATIONS = 7
@@ -60,8 +61,8 @@ NORMAL_STOP_REASONS = frozenset({'iterations_done', 'flag_confirmed', 'no_progre
                                  'goal_confirmed', 'objectives_done'})
 KNOWN_STOP_REASONS = NORMAL_STOP_REASONS | frozenset(
     {'stalled', 'state_unavailable', 'recon_failed', 'vuln_failed',
-     'target_unreachable', 'flags_without_goal'})
-STAGE_STATUSES = frozenset({'completed', 'salvaged', 'error'})
+     'target_unreachable', 'flags_without_goal','report_damaged'})
+STAGE_STATUSES = frozenset({'completed', 'salvaged', 'error','report_damaged'})
 
 
 def now():
@@ -583,6 +584,13 @@ def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
 
             report = outcome['report']
             previous = {'role': role, **report}
+            if report_integrity.quality(report)['status']=='damaged':
+                stages.append({'iteration':iteration,'role':role,'status':'report_damaged',
+                               'report_path':outcome['report_path'],'raw_report_path':report.get('raw_report_path'),
+                               'report_quality':report['report_quality'],
+                               'execution_outcome':report.get('execution_outcome'),'steps_used':outcome['steps_used']})
+                say('[STAGE] отчёт повреждён; исход операции сохранён отдельно. Следующая роль не запускается.')
+                return finish(task_id,stages,'report_damaged',previous,expect)
             registry = flag_verify.scan(task_id, patterns=patterns)
             objective_db = agent_actions.connect()
             try:
@@ -850,6 +858,8 @@ def finish(task_id, stages, stop_reason, previous, expect=DEFAULT_EXPECTED_FLAGS
             problems.append(f"стадия {item.get('role')} итерации "
                             f"{item.get('iteration')} прервана; сохранён промежуточный отчёт"
                             + (f": {str(item['error'])[:200]}" if item.get('error') else ''))
+        elif status == 'report_damaged':
+            problems.append('Отчёт специалиста повреждён; это не классификация исхода операции')
         if item.get('report_incomplete'):
             problems.append(f"стадия {item.get('role')} итерации "
                             f"{item.get('iteration')} завершилась без решающего зонда")

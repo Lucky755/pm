@@ -1310,6 +1310,10 @@ def render_coordinator_result(result, args):
         line(json.dumps(result,ensure_ascii=False,indent=2))
         return result
     line('  Остановка: ' + safe_display(result['stop_reason']))
+    if result['stop_reason']=='role_report_damaged_requires_review':
+        line('  Отчёт специалиста повреждён; исход операции приведён отдельно по журналу исполнителя. '
+             'Новые действия и планирование приостановлены. Изучите исходный ответ и доказательства; '
+             '--continue-coordinated явно признает отчёт неполным и разрешит перепланирование, без повтора шага.')
     if result['stop_reason']=='role_report_incomplete_requires_review':
         line('  Отчёт неполон; результаты сохранены. Исход действий требует проверки оператором. '
              'Автоматический повтор роли заблокирован.')
@@ -1324,6 +1328,22 @@ def render_coordinator_result(result, args):
         line(f"  Шаг #{step['id']} {step['status']} · {decision.get('role') or decision.get('action','invalid')} · отчёт {step['report_iteration']}")
         if step.get('report_path'):
             line('    Сохранённый отчёт: ' + safe_display(step['report_path']))
+        quality=step.get('report_quality') or {}
+        if quality.get('status')=='damaged':
+            line('    Отчёт повреждён: '+safe_display(quality.get('reason','unknown')))
+            if step.get('raw_report_path'):
+                line('    Полный исходный ответ: '+safe_display(step['raw_report_path']))
+        execution=(step.get('execution_outcome') or {}).get('status')
+        labels={'not_started':'Действие не запускалось', 'executed':'Вызов исполнен; достижение цели этим не подтверждено',
+                'nonzero_exit':'Вызов исполнен с ненулевым exit_code', 'refused':'Действие получило отказ до исполнения',
+                'unknown':'Исход операции неизвестен', 'mixed':'Исходы операций различаются; см. result_id'}
+        if execution in labels:
+            line('    '+labels[execution])
+        if step.get('error'):
+            line('    Состояние шага: '+safe_display(step['error']))
+        for record in (step.get('execution_outcome') or {}).get('results',[]):
+            line(f"    result_id={safe_display(record['result_id'])} · {safe_display(record['tool'])} · "
+                 f"{safe_display(record.get('provenance') or 'unknown')} · {safe_display(record['status'])} · exit_code={record.get('exit_code')}")
         if decision:
             line('    Вопрос: ' + safe_display(decision['question']))
             line('    Основание: ' + safe_display(decision['reason']))

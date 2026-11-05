@@ -17,6 +17,7 @@ import uuid
 from orchestrator import agent_actions as actions, attack_loop, diagnostics, flag_verify, objectives
 from orchestrator import evidence_pipeline as evidence
 from orchestrator import coordinator_checkpoints as checkpoints
+from orchestrator import report_integrity
 from orchestrator.harness_env import harness_env
 
 LOCK_DIR = actions.ROOT / 'runtime/coordinator_locks'
@@ -71,7 +72,7 @@ def ensure_schema(db):
             details_json TEXT NOT NULL, created_at TEXT NOT NULL);
     ''')
     columns = {r[1] for r in db.execute('PRAGMA table_info(pm_coordinator_steps)')}
-    for column in ('knowledge_before_sha256','knowledge_after_sha256','assignment_json'):
+    for column in ('knowledge_before_sha256','knowledge_after_sha256','assignment_json','report_reviewed_at'):
         if column not in columns:
             db.execute(f'ALTER TABLE pm_coordinator_steps ADD COLUMN {column} TEXT')
     checkpoints.initialize(db)
@@ -311,6 +312,10 @@ def decision_prompt(state, roles, previous, error=None):
             "distinct probe question and observable result, referencing the earlier evidence it checks; "
             "changing the role alone does not permit repeating the same question. "
             "Never provide hidden reasoning; reason is one short operational justification. "
+            "previous_steps separates report quality from execution_outcome. A failed/cancelled step with "
+            "error=operator_requested_replan, no approval and not_started was never executed; it is not an SSH failure. "
+            "A damaged report does not establish operation failure or access. Never expand a single authorized attempt "
+            "into a credential list or brute force. "
             "Return ONLY JSON with exactly these fields: "
             '{"action":"run_role|wait_operator|stop","role":"recon|vuln|access|verify or null",'
             '"question":"one concrete check","reason":"brief justification",'
@@ -338,7 +343,7 @@ def choose_with_model(prompt, api_key, max_tokens=3000):
 def steps(db, task_id):
     cursor = db.execute('SELECT * FROM pm_coordinator_steps WHERE task_id=? ORDER BY step_no', (task_id,))
     columns = [c[0] for c in cursor.description]
-    return [dict(zip(columns,row)) for row in cursor]
+    return report_integrity.attach_reports(db,task_id,[dict(zip(columns,row)) for row in cursor])
 
 
 def update_step(db, step_id, status, **fields):
@@ -373,7 +378,9 @@ def repeated(db, task_id, decision, state):
         old = json.loads(row['decision_json'])
         if (old.get('action')=='run_role'
                 and row['question_key']==actions.title_key(decision['question'])
-                and (row['status'] in ('running','completed') or row['outcome_uncertain'])
+                and (row['status'] in ('running','completed') or row['outcome_uncertain']
+                     or row['error']=='report_damaged' and
+                     report_integrity.step_execution(row)['status']!='not_started')
                 # Compare with what the check already learned, not its input.
                 # Legacy completed steps have no post-state; conservatively do
                 # not replay their question using an incomparable old hash.
@@ -447,6 +454,9 @@ def changed_records(before, after):
 
 def step_view(row):
     return {**{key:row[key] for key in ('id','step_no','status','report_iteration','report_path','error','outcome_uncertain')},
+            'approved_at':row.get('approved_at'),'report_quality':row.get('report_quality'),
+            'report_reviewed_at':row.get('report_reviewed_at'),'raw_report_path':row.get('raw_report_path'),
+            'execution_outcome':report_integrity.step_execution(row),
             'decision':json.loads(row['decision_json'])}
 
 
@@ -499,7 +509,8 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
             for (raw,) in db.execute('SELECT report_json FROM pm_agent_action_reports WHERE task_id=? ORDER BY iteration',
                                      (task_id,)).fetchall():
                 saved_report = json.loads(raw)
-                if not saved_report.get('stage_aborted') and not saved_report.get('report_incomplete'):
+                if (report_integrity.quality(saved_report)['status']!='damaged'
+                        and not saved_report.get('stage_aborted') and not saved_report.get('report_incomplete')):
                     objectives.process_report(db,task_id,saved_report,registry)
             state = snapshot(db,task_id,expect_flags)
             with db:
@@ -511,6 +522,19 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 return result_view(db,run_id,task_id,state,expect_flags,reason,status)
             if target != state['task']['target']:
                 return finish('task_target_changed','waiting_operator')
+            damaged=report_integrity.unresolved(steps(db,task_id))
+            if damaged:
+                if not continue_run:
+                    return finish('role_report_damaged_requires_review','waiting_operator')
+                # Explicit continuation acknowledges an incomplete report, not a
+                # failed SSH attempt, goal completion or permission to replay it.
+                while damaged:
+                    with db:
+                        db.execute('UPDATE pm_coordinator_steps SET report_reviewed_at=? WHERE id=?',
+                                   (now(),damaged['id']))
+                    diagnostics.emit('report.incomplete_acknowledged',step_id=damaged['id'],
+                                     reason='operator_accepted_incomplete_report')
+                    damaged=report_integrity.unresolved(steps(db,task_id))
             running = next((r for r in steps(db,task_id) if r['status']=='running'),None)
             if running:
                 if abandon_running_step != running['id']:
@@ -579,8 +603,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                         update_step(db,step_id,'failed',error='planned_transition_no_longer_allowed')
                         return finish('invalid_saved_transition','failed')
                 else:
-                    previous = [{'id':r['id'],'status':r['status'],'outcome_uncertain':bool(r['outcome_uncertain']),
-                                 'decision':json.loads(r['decision_json'])} for r in steps(db,task_id)]
+                    previous = [step_view(r) for r in steps(db,task_id)]
                     error = None
                     for attempt in range(decision_retries+1):
                         try:
@@ -644,6 +667,19 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                     if not raw:
                         raise RuntimeError('Role returned without a saved report')
                     report=json.loads(raw[0])
+                    if report_integrity.quality(report)['status']=='damaged':
+                        state=snapshot(db,task_id,expect_flags)
+                        unknown=(report.get('execution_outcome') or {}).get('status','unknown')=='unknown'
+                        update_step(db,step_id,'failed',report_path=report.get('report_path'),
+                                    error='report_damaged',outcome_uncertain=int(unknown),
+                                    knowledge_after_sha256=state['knowledge_sha256'])
+                        with db:
+                            db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
+                        diagnostics.emit('coordinator.pause',step_id=step_id,reason='report_damaged',
+                                         reason_category='report_format',report_path=report.get('report_path'),
+                                         raw_report_path=report.get('raw_report_path'),
+                                         execution_outcome=report.get('execution_outcome'))
+                        return finish('role_report_damaged_requires_review','waiting_operator')
                     if report.get('stage_aborted'):
                         raise RuntimeError('Role saved only an aborted report')
                     if report.get('report_incomplete'):

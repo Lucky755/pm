@@ -43,9 +43,11 @@ def pause(db, task_id):
             rows=coordinator.steps(db,task_id)
             running=next((r for r in rows if r['status']=='running'),None)
             waiting=next((r for r in rows if r['status']=='waiting_operator'),None)
-            if running or waiting or row[1]=='waiting_operator':
+            damaged=coordinator.report_integrity.unresolved(rows)
+            if running or waiting or damaged or row[1]=='waiting_operator':
                 return {'task_id':task_id,'coordinator_run_id':row[0],'status':'waiting_operator','succeeded':False,
-                        'stop_reason':'interrupted_running_step' if running else row[2],
+                        'stop_reason':('interrupted_running_step' if running else
+                                       'role_report_damaged_requires_review' if damaged else row[2]),
                         'checkpoints':coordinator.checkpoints.pause_details(db,task_id),
                         'steps':[coordinator.step_view(r) for r in rows]}
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_tcp_full_scans'").fetchone():
