@@ -1314,6 +1314,11 @@ def render_coordinator_result(result, args):
         line('  Отчёт неполон; результаты сохранены. Исход действий требует проверки оператором. '
              'Автоматический повтор роли заблокирован.')
     line(f"  Исследовательская цель подтверждена: {result['succeeded']}")
+    for point in result.get('checkpoints',[]):
+        line('  Контрольная точка: '+safe_display(diagnostics.clean(point['title'],limit=500)))
+        line('    Доказательство: '+', '.join(safe_display(ref) for ref in point['evidence_refs']))
+        line('    Причина паузы: '+safe_display(point['reason']))
+        line('    Действие оператора: '+safe_display(point['operator_action']))
     for step in result['steps']:
         decision=step['decision']
         line(f"  Шаг #{step['id']} {step['status']} · {decision.get('role') or decision.get('action','invalid')} · отчёт {step['report_iteration']}")
@@ -1324,9 +1329,14 @@ def render_coordinator_result(result, args):
             line('    Основание: ' + safe_display(decision['reason']))
             line('    Ожидается: ' + safe_display(decision['expected_result']))
     if result['status']=='waiting_operator':
-        line('  Пауза сохранена. --continue-coordinated продолжает после проверки результатов.')
-        line('  --approve-step ID подтверждает показанный шаг ACCESS; --abandon-running-step ID '
-             'после ручной проверки оставляет прерванный исход неизвестным и разрешает другую проверку.')
+        if result['stop_reason']=='role_approval_required':
+            step=next((s for s in result['steps'] if s['status']=='waiting_operator'),None)
+            line(f"  Одобрение ACCESS: проверьте вопрос и границы; --approve-step {step['id'] if step else 'ID'} разрешит только этот шаг.")
+        elif result['stop_reason']=='interrupted_running_step':
+            step=next((s for s in result['steps'] if s['status']=='running'),None)
+            line(f"  Исход неизвестен. Проверьте сохранённые результаты; --abandon-running-step {step['id'] if step else 'ID'} разрешит перепланирование без повтора шага.")
+        else:
+            line('  Пауза сохранена. --continue-coordinated продолжает после проверки результатов.')
     return result
 
 

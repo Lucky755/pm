@@ -16,6 +16,7 @@ import uuid
 
 from orchestrator import agent_actions as actions, attack_loop, diagnostics, flag_verify, objectives
 from orchestrator import evidence_pipeline as evidence
+from orchestrator import coordinator_checkpoints as checkpoints
 from orchestrator.harness_env import harness_env
 
 LOCK_DIR = actions.ROOT / 'runtime/coordinator_locks'
@@ -73,6 +74,7 @@ def ensure_schema(db):
     for column in ('knowledge_before_sha256','knowledge_after_sha256','assignment_json'):
         if column not in columns:
             db.execute(f'ALTER TABLE pm_coordinator_steps ADD COLUMN {column} TEXT')
+    checkpoints.initialize(db)
     db.commit()
 
 
@@ -221,6 +223,7 @@ def snapshot(db, task_id, expect):
             'references': refs, 'knowledge_sha256':digest(knowledge),
             'history_sha256':digest({'result_ids':[r['result_id'] for r in results],'reports':reports}),
             'state_sha256':digest(knowledge), 'confirmed_flags': confirmed,
+            'operator_checkpoints':checkpoints.history(db,task_id,context['target']),
             'flag_candidates':flag_candidates,
             'success_verified': success, 'verified_stop_reason': stop,
             'authorization_block': authorization(db, context, mapped)}
@@ -299,6 +302,9 @@ def decision_prompt(state, roles, previous, error=None):
             "flag_candidates lists concrete validation blockers. Prefer original saved capture references (http_artifact:ID) "
             "and local integrity checks; a PoC's printed hash is not an original capture. Never lower the expected flag count. "
             "Do not claim success unless success_verified is true. Access requires explicit per-step operator approval. "
+            "Routine links, headers, versions, HTTP 200/404 and role transitions need no operator checkpoint. "
+            "Continue within the existing budgets. Operator checkpoint review is not proof or permission; "
+            "do not ask to review the same disclosure again without new material evidence. "
             "When access.pending is true, choose ACCESS with a question starting 'ТРИАЖ:'; do not escalate. "
             "Do not repeat a question without new evidence. "
             "A new result ID or reading old output is not new knowledge. To verify independently, choose a "
@@ -378,15 +384,12 @@ def repeated(db, task_id, decision, state):
 
 
 def significant(before, after, report):
-    if access_knowledge(before['essential_state']) != access_knowledge(after['essential_state']):
+    """Reason for an evidence-classified checkpoint, never report confidence."""
+    old=before['essential_state']['access_state'];new=after['essential_state']['access_state']
+    if (old['level'],old['signal']) != (new['level'],new['signal']):
         return 'access_state_changed'
     if set(after['confirmed_flags']) - set(before['confirmed_flags']):
         return 'confirmed_flag_found'
-    if {g['key'] for g in after['objectives']['confirmed']} - {g['key'] for g in before['objectives']['confirmed']}:
-        return 'objective_state_changed'
-    if any(isinstance(f,dict) and (f.get('severity') in ('high','critical')
-            or f.get('confidence')=='high' and f.get('impact')) for f in report.get('findings',[])):
-        return 'significant_finding'
     return None
 
 
@@ -458,6 +461,7 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
             'task_id':task_id,'coordinator_run_id':run_id,'stop_reason':reason,
             'expected_flags':expect,'confirmed_flags':state['confirmed_flags'],
             'objectives_matrix':attack_loop.objective_matrix(state['objectives']['objectives']),
+            'checkpoints':checkpoints.pause_details(db,task_id,state['task']['target']),
             'steps':[step_view(row) for row in rows]}
 
 
@@ -535,6 +539,25 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 raise ValueError('No matching step awaiting approval')
             if run_status=='waiting_operator' and pause_id and not waiting and not running and not continue_run:
                 return finish(old_reason,'waiting_operator')
+            if continue_run and pause_id:
+                if old_reason=='significant_finding' and not checkpoints.pending(db,task_id,target):
+                    # Upgrade review metadata for an old pause using only original
+                    # captures referenced by that report, never unrelated evidence.
+                    refs=checkpoints.finding_refs(checkpoints.legacy_report(db,task_id,pause_id))
+                    checkpoints.register(db,task_id,target,pause_id,
+                        checkpoints.collect(db,task_id,state,state,references=refs))
+                reviewed=checkpoints.review(db,task_id,target,pause_id)
+                if reviewed:
+                    diagnostics.emit('coordinator.checkpoint_reviewed',coordinator_run_id=run_id,
+                                     identifiers={'checkpoint_ids':reviewed},reason='operator_continued_after_review')
+            unreviewed=checkpoints.pending(db,task_id,target)
+            if unreviewed:
+                # A crash after recording a finding but before saving the pause
+                # must not dispatch another role or lose the review request.
+                with db:
+                    db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',
+                               (unreviewed[0]['step_id'],run_id))
+                return finish('significant_finding','waiting_operator')
             with db:
                 db.execute("UPDATE pm_coordinator_runs SET status='running',pause_step_id=NULL WHERE id=?",(run_id,))
             for _ in range(max_steps):
@@ -658,11 +681,13 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                                  history_changed=before['history_sha256']!=state['history_sha256'])
                 if state['success_verified']:
                     return finish(state['verified_stop_reason'])
-                pause=significant(before,state,report)
-                if pause:
+                notices=checkpoints.register(db,task_id,target,step_id,checkpoints.collect(db,task_id,before,state))
+                if notices:
+                    pause=significant(before,state,report) or 'significant_finding'
                     with db:
                         db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
-                    diagnostics.emit('coordinator.pause',step_id=step_id,reason=pause)
+                    diagnostics.emit('coordinator.pause',step_id=step_id,reason=pause,
+                                     identifiers={'checkpoint_ids':[item['id'] for item in notices]})
                     return finish(pause,'waiting_operator')
             return finish('coordinator_step_limit')
         finally:

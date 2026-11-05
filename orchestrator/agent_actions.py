@@ -182,6 +182,8 @@ Finish with ONE JSON object and no other text:
 {"summary": "what you did and what is proven, in Russian",
   "findings": [{"title": "...", "claim": "specific path, offset or port",
                 "kind": "observation|inference|hypothesis",
+                "category": "routine|source_disclosure|secret_disclosure",
+                "artifact_ref": "http_artifact:ID when original bytes are saved, or empty",
                 "quote": "exact output excerpt for an observation",
                 "evidence": "exact command or request and its output",
                 "result_id": "ID from the capability result that proves this finding",
@@ -218,6 +220,10 @@ Keep the report compact: summary up to 1200 characters, each evidence up to
 400 characters, at most 8 findings and 5 proposed actions. It is read by a
 human, so cite the decisive command and its result instead of pasting whole
 outputs; the raw output is already stored in the capability log.
+category labels describe a claim, not proof or severity. Links, headers,
+versions and HTTP status codes are routine. Source/secret disclosure requires
+an original capture, an exact quote and locally checkable bytes. Confidence
+and impact text never request an operator pause. Access uses access_* fields.
 '''
 
 
@@ -1906,7 +1912,8 @@ def validate_report_probes(report, task_id, role, records=None, prior_ids=()):
         probe = report.get('probe') or {}
         record = records.get(probe.get('result_id')) if isinstance(probe.get('result_id'), str) else None
         if not record or record['status'] not in ('completed', 'ok') or not record['text'].strip() or record['tool'] not in (
-                'net_exec', 'poc_run', 'session', 'network_probe'):
+                'net_exec', 'poc_run', 'session', 'network_probe',
+                'http_capture', 'http_get', 'http_path', 'http_document', 'http_headers'):
             report['report_incomplete'] = True
             report['report_warning'] = (report.get('report_warning', '') +
                 '; verify не выполнил прямой зонд').strip('; ')

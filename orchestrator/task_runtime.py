@@ -46,6 +46,7 @@ def pause(db, task_id):
             if running or waiting or row[1]=='waiting_operator':
                 return {'task_id':task_id,'coordinator_run_id':row[0],'status':'waiting_operator','succeeded':False,
                         'stop_reason':'interrupted_running_step' if running else row[2],
+                        'checkpoints':coordinator.checkpoints.pause_details(db,task_id),
                         'steps':[coordinator.step_view(r) for r in rows]}
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_tcp_full_scans'").fetchone():
         if db.execute("SELECT 1 FROM pm_tcp_full_scans WHERE task_id=? AND status='running' "
