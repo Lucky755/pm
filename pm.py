@@ -130,6 +130,36 @@ def validate_target(raw):
     return str(ip)
 
 
+def initialize_tcp_scans(db):
+    """Additive migrations; scan evidence and follow-up queue have separate states."""
+    db.execute('''CREATE TABLE IF NOT EXISTS pm_tcp_full_scans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        target TEXT NOT NULL,
+        status TEXT NOT NULL,
+        open_ports_json TEXT NOT NULL DEFAULT '[]',
+        error TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id,target)
+    )''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(pm_tcp_full_scans)')}
+    for column in ('last_seen_at', 'followup_status', 'followup_error'):
+        if column not in columns:
+            db.execute(f'ALTER TABLE pm_tcp_full_scans ADD COLUMN {column} TEXT')
+    db.execute('''CREATE TABLE IF NOT EXISTS pm_tcp_full_scan_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        target TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error TEXT,
+        created_at TEXT NOT NULL
+    )''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(pm_tcp_full_scan_attempts)')}
+    if 'result_json' not in columns:
+        db.execute('ALTER TABLE pm_tcp_full_scan_attempts ADD COLUMN result_json TEXT')
+    db.commit()
+
+
 def connect():
     if not DB.is_file():
         raise OperatorError(f'Не найдена база задач: {DB}')
@@ -168,28 +198,7 @@ def connect():
         db.execute("ALTER TABLE pm_task_lineage ADD COLUMN transfer_state TEXT NOT NULL DEFAULT 'pending'")
         # Rows created before durable transitions have already finished.
         db.execute("UPDATE pm_task_lineage SET transfer_state='done'")
-    db.execute('''CREATE TABLE IF NOT EXISTS pm_tcp_full_scans (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id INTEGER NOT NULL,
-        target TEXT NOT NULL,
-        status TEXT NOT NULL,
-        open_ports_json TEXT NOT NULL DEFAULT '[]',
-        error TEXT,
-        created_at TEXT NOT NULL,
-        UNIQUE(task_id,target)
-    )''')
-    scan_columns = {row[1] for row in db.execute('PRAGMA table_info(pm_tcp_full_scans)')}
-    if 'last_seen_at' not in scan_columns:
-        db.execute('ALTER TABLE pm_tcp_full_scans ADD COLUMN last_seen_at TEXT')
-    db.execute('''CREATE TABLE IF NOT EXISTS pm_tcp_full_scan_attempts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id INTEGER NOT NULL,
-        target TEXT NOT NULL,
-        status TEXT NOT NULL,
-        error TEXT,
-        created_at TEXT NOT NULL
-    )''')
-    db.commit()
+    initialize_tcp_scans(db)
     return db
 
 
@@ -567,7 +576,8 @@ def plan_reprobe(db, task_id, target, ports_raw):
     if not ports_raw:
         return None
     ports=reprobe_ports(ports_raw)
-    from orchestrator import bootstrap_discovery
+    from orchestrator import bootstrap_discovery, network_jobs
+    network_jobs.initialize(db)
     port_string = ','.join(map(str, ports))
     argv = bootstrap_discovery.validate_plan(task_id, target, port_string)
     params = json.dumps({'ports': port_string}, sort_keys=True)
@@ -1027,23 +1037,68 @@ def full_scan_open_ports(stdout):
 
 
 @diagnostics.stage
+def ensure_scan_followups(db, task_id, target):
+    """Finish a saved scan's queue checkpoint without repeating any attempted plan.
+
+    NULL is a legacy checkpoint: before this migration a completed scan could
+    only be saved AFTER all follow-ups were queued. New results explicitly save
+    'pending' before touching the queue, including before its schema is created.
+    """
+    columns = {row[1] for row in db.execute('PRAGMA table_info(pm_tcp_full_scans)')}
+    if 'followup_status' not in columns:
+        return False
+    scan = db.execute('SELECT id,status,open_ports_json,followup_status FROM pm_tcp_full_scans '
+                      'WHERE task_id=? AND target=?', (task_id, target)).fetchone()
+    if not scan or scan[1] != 'completed' or scan[3] not in ('pending', 'failed'):
+        return False
+    identifiers = {'id': scan[0], 'task_id': task_id}
+    created = []
+    try:
+        if task_target(db, task_id) != target:
+            raise OperatorError('Адрес сохранённого скана не соответствует текущей задаче')
+        ensure_task_scope(db, task_id, target)
+        ports = json.loads(scan[2])
+        if (not isinstance(ports, list) or not ports or
+                any(type(port) is not int or not 1 <= port <= 65535 for port in ports)):
+            raise OperatorError('Некорректный сохранённый результат полного TCP-скана')
+        from orchestrator import bootstrap_discovery, network_jobs
+        network_jobs.initialize(db)
+        # Use the existing discovery coverage: even failed/running attempts must
+        # not be retried implicitly. Subtract by port, not by exact batch string.
+        covered, _, _ = bootstrap_discovery.scan_state(db, task_id, target)
+        missing = sorted(set(ports) - covered)
+        for offset in range(0, len(missing), PORTS_MAX):
+            batch = ','.join(map(str, missing[offset:offset + PORTS_MAX]))
+            created.append(plan_reprobe(db, task_id, target, batch))
+        with db:
+            db.execute("UPDATE pm_tcp_full_scans SET followup_status='completed',followup_error=NULL "
+                       'WHERE id=?', (scan[0],))
+    except BaseException as exc:
+        with db:
+            db.execute("UPDATE pm_tcp_full_scans SET followup_status='failed',followup_error=? WHERE id=?",
+                       (str(exc)[:500], scan[0]))
+        diagnostics.emit('scan.followups', task_id=task_id, status='failed',
+                         table='pm_tcp_full_scans', identifiers=identifiers, plan_ids=created,
+                         reason='followup_planning_failed', **diagnostics.failure_details(exc=exc))
+        line('  [!] Результат TCP-скана сохранён. Очередь follow-up не достроена; '
+             'явное продолжение восстановит её без повторного полного скана.')
+        raise
+    diagnostics.emit('scan.followups', task_id=task_id, status='completed',
+                     table='pm_tcp_full_scans', identifiers=identifiers, plan_ids=created,
+                     parameters={'known_ports': len(set(ports)), 'new_plans': len(created),
+                                 'already_covered_ports': len(set(ports) & covered)},
+                     reason='followup_queue_ready')
+    return True
+
+
+@diagnostics.stage
 def run_full_tcp_scan(db, task_id, target):
     """One bounded full scan per explicit console run, with durable retry audit.
 
     A previous COMPLETED positive scan is cached. A failure or empty result
     may be retried only after the operator explicitly resumes the task.
     """
-    scan_columns = {row[1] for row in db.execute('PRAGMA table_info(pm_tcp_full_scans)')}
-    if 'last_seen_at' not in scan_columns:
-        db.execute('ALTER TABLE pm_tcp_full_scans ADD COLUMN last_seen_at TEXT')
-    db.execute('''CREATE TABLE IF NOT EXISTS pm_tcp_full_scan_attempts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id INTEGER NOT NULL,
-        target TEXT NOT NULL,
-        status TEXT NOT NULL,
-        error TEXT,
-        created_at TEXT NOT NULL
-    )''')
+    initialize_tcp_scans(db)
     entry = db.execute('SELECT status,open_ports_json,error FROM pm_tcp_full_scans WHERE task_id=? AND target=?',
                        (task_id, target)).fetchone()
     if entry and entry[0] == 'completed':
@@ -1060,13 +1115,15 @@ def run_full_tcp_scan(db, task_id, target):
             stale = False
         if stale:
             line(f'  [!] Кэш полного TCP-скана старше {minutes} минут; список портов может быть устаревшим.')
+        ensure_scan_followups(db, task_id, target)
         return 0
     if entry and entry[0] == 'running':
         raise OperatorError('Предыдущий TCP-скан был прерван без подтверждения завершения. '
                             'Сначала убедись, что процесс Nmap уже остановлен.')
     with db:
         if entry:
-            db.execute("UPDATE pm_tcp_full_scans SET status='running',error=NULL WHERE task_id=? AND target=?",
+            db.execute("UPDATE pm_tcp_full_scans SET status='running',error=NULL,followup_status=NULL,"
+                       'followup_error=NULL WHERE task_id=? AND target=?',
                        (task_id, target))
         else:
             db.execute('INSERT INTO pm_tcp_full_scans(task_id,target,status,created_at) VALUES (?,?,?,?)',
@@ -1086,34 +1143,34 @@ def run_full_tcp_scan(db, task_id, target):
         if ports:
             line('  ' + tint('[OPEN]', 'success') + ' Найдены порты: ' + ', '.join(map(str, ports[:40])) +
                  (' …' if len(ports)>40 else ''))
-            # Reuse existing executor/observation pipeline instead of writing
-            # ad-hoc, incompatible network_observations into SQLite.
-            for offset in range(0, len(ports), PORTS_MAX):
-                batch = ','.join(map(str, ports[offset:offset+PORTS_MAX]))
-                try:
-                    plan_reprobe(db, task_id, target, batch)
-                except OperatorError as exc:
-                    if 'уже проверен' not in str(exc):
-                        raise
-                    line('  Набор портов уже проверялся и не будет дублироваться: ' + batch)
         else:
             line('  ' + tint('[!]', 'warning') + ' Открытые TCP-порты не обнаружены; автоматическое исследование приостановлено.')
         final_state = 'completed' if ports else 'empty'
         with db:
-            db.execute('UPDATE pm_tcp_full_scans SET status=?,open_ports_json=?,error=NULL,last_seen_at=? '
+            db.execute('UPDATE pm_tcp_full_scans SET status=?,open_ports_json=?,error=NULL,last_seen_at=?, '
+                       'followup_status=?,followup_error=NULL '
                        'WHERE task_id=? AND target=?',
                        (final_state, json.dumps(ports),
-                        datetime.now(timezone.utc).isoformat() if ports else None, task_id, target))
-            db.execute('UPDATE pm_tcp_full_scan_attempts SET status=? WHERE id=?',
-                       (final_state, attempt))
-        return 1
+                        datetime.now(timezone.utc).isoformat() if ports else None,
+                        'pending' if ports else 'completed', task_id, target))
+            db.execute('UPDATE pm_tcp_full_scan_attempts SET status=?,result_json=? WHERE id=?',
+                       (final_state, json.dumps(payload, ensure_ascii=False), attempt))
+        diagnostics.emit('scan.result', task_id=task_id, status=final_state,
+                         table='pm_tcp_full_scan_attempts', identifiers={'id': attempt},
+                         parameters={'target': target, 'open_ports': len(ports)}, reason='nmap_result_saved')
     except Exception as exc:
         with db:
             db.execute('UPDATE pm_tcp_full_scans SET status=?,error=? WHERE task_id=? AND target=?',
                        ('failed', str(exc)[:500], task_id, target))
             db.execute('UPDATE pm_tcp_full_scan_attempts SET status=?,error=? WHERE id=?',
                        ('failed', str(exc)[:500], attempt))
+        diagnostics.emit('scan.result', task_id=task_id, status='failed',
+                         table='pm_tcp_full_scan_attempts', identifiers={'id': attempt},
+                         reason='tcp_full_scan_failed', **diagnostics.failure_details(exc=exc))
         raise
+    # Queue failures must never overwrite the committed scan evidence/status.
+    ensure_scan_followups(db, task_id, target)
+    return 1
 
 
 @diagnostics.stage
@@ -1325,6 +1382,7 @@ def launch_coordinated_task(db, task_id, target, args):
         line(f'  Бюджет разведки: {args.max_jobs} сетевых операций, до {args.max_rounds} раундов.')
     task_runtime.reconnaissance(db,task_id,'running')
     try:
+        repaired=ensure_scan_followups(db,task_id,target) if ports else False
         used=0 if ports else run_full_tcp_scan(db,task_id,target)
         if not ports:
             ports=known_tcp_ports()
@@ -1334,7 +1392,7 @@ def launch_coordinated_task(db, task_id, target, args):
         if not checked['reachable'] and not getattr(args,'force_unreachable',False):
             return pause('reconnaissance_preflight_incomplete' if checked.get('unchecked')
                          else 'reconnaissance_target_unreachable')
-        if cached and not getattr(args,'reprobe',None) and not getattr(args,'sync_burp',False):
+        if cached and not repaired and not getattr(args,'reprobe',None) and not getattr(args,'sync_burp',False):
             diagnostics.emit('cache.hit',name='initial_reconnaissance',task_id=task_id,
                              reason='saved_scoped_service_map')
         else:
@@ -1347,8 +1405,13 @@ def launch_coordinated_task(db, task_id, target, args):
                 return pause('reconnaissance_'+scout['stop_reason'])
         task_runtime.reconnaissance(db,task_id,'completed')
     except BaseException as exc:
+        columns={row[1] for row in db.execute('PRAGMA table_info(pm_tcp_full_scans)')}
+        queue_failed=('followup_status' in columns and db.execute(
+            "SELECT 1 FROM pm_tcp_full_scans WHERE task_id=? AND target=? AND followup_status='failed'",
+            (task_id,target)).fetchone())
         task_runtime.reconnaissance(db,task_id,'waiting_operator',
-                                   'reconnaissance_interrupted' if isinstance(exc,KeyboardInterrupt) else 'reconnaissance_failed')
+                                   'reconnaissance_interrupted' if isinstance(exc,KeyboardInterrupt) else
+                                   'reconnaissance_followup_planning_failed' if queue_failed else 'reconnaissance_failed')
         raise
     return run_task_coordinator(db,task_id,args)
 

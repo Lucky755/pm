@@ -61,6 +61,28 @@ def emit(value):
 
 
 def initialize(db):
+    """Idempotent schema entry point for planners, jobs and observations."""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS network_phase_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            goal TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            target TEXT NOT NULL,
+            parameters_json TEXT NOT NULL,
+            argv_json TEXT NOT NULL,
+            model_summary TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (
+                task_id,
+                goal,
+                profile,
+                target,
+                parameters_json
+            )
+        )
+    """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS network_job_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

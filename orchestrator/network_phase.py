@@ -66,28 +66,8 @@ def utc_now():
 
 
 def initialize_database(db):
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS network_phase_plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id INTEGER NOT NULL,
-            goal TEXT NOT NULL,
-            profile TEXT NOT NULL,
-            target TEXT NOT NULL,
-            parameters_json TEXT NOT NULL,
-            argv_json TEXT NOT NULL,
-            model_summary TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE (
-                task_id,
-                goal,
-                profile,
-                target,
-                parameters_json
-            )
-        )
-    """)
-    db.commit()
+    from orchestrator.network_jobs import initialize
+    initialize(db)
 
 
 def load_task(db, task_id):

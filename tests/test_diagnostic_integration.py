@@ -132,10 +132,7 @@ with patch.object(sys, 'argv', ['planner', '--target', '10.0.0.1', '--task', 'In
     def db(self):
         db = sqlite3.connect(':memory:')
         self.addCleanup(db.close)
-        db.executescript('''CREATE TABLE pm_tcp_full_scans(task_id INTEGER,target TEXT,status TEXT,
-                            created_at TEXT,open_ports_json TEXT,error TEXT,last_seen_at TEXT);
-                           CREATE TABLE pm_tcp_full_scan_attempts(id INTEGER PRIMARY KEY,task_id INTEGER,
-                            target TEXT,status TEXT,error TEXT,created_at TEXT);''')
+        pm.initialize_tcp_scans(db)
         return db
 
     def test_full_scan_and_preflight_use_one_action_per_broker_call(self):
@@ -212,9 +209,8 @@ with patch.object(sys, 'argv', ['planner', '--target', '10.0.0.1', '--task', 'In
         db = sqlite3.connect(':memory:')
         self.addCleanup(db.close)
         enrichment.initialize(db)
-        db.execute('CREATE TABLE network_phase_plans(id INTEGER,task_id INTEGER,profile TEXT,'
-                   'target TEXT,parameters_json TEXT,status TEXT)')
-        db.execute('INSERT INTO network_phase_plans VALUES(1,11,?,?,?,?)',
+        db.execute('INSERT INTO network_phase_plans(id,task_id,profile,target,parameters_json,status,'
+                   "goal,argv_json,model_summary,created_at) VALUES(1,11,?,?,?,?, 'fixture','[]','fixture','saved')",
                    ('service_versions', TARGET, '{"ports":"80"}', 'planned'))
         db.commit()
         runner = Mock(side_effect=FileNotFoundError('executor unavailable'))

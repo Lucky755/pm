@@ -21,14 +21,15 @@ def db_test(path=':memory:'):
     db = sqlite3.connect(path)
     db.executescript('''
     CREATE TABLE tasks(id INTEGER PRIMARY KEY,target TEXT);
-    CREATE TABLE task_scope_settings(task_id INTEGER PRIMARY KEY,initial_target TEXT);
+    CREATE TABLE task_scope_settings(task_id INTEGER PRIMARY KEY,initial_target TEXT,
+        allow_pivot INTEGER NOT NULL DEFAULT 1,allow_port_forward INTEGER NOT NULL DEFAULT 1);
     CREATE TABLE pm_operator_approvals(task_id INTEGER PRIMARY KEY,target TEXT,allowed TEXT,egress TEXT,approved_at TEXT,closed_at TEXT);
     CREATE TABLE pm_task_intents(task_id INTEGER PRIMARY KEY,intent TEXT,created_at TEXT);
     CREATE TABLE pm_task_lineage(previous_task_id INTEGER NOT NULL UNIQUE,successor_task_id INTEGER NOT NULL UNIQUE,previous_target TEXT NOT NULL,successor_target TEXT NOT NULL,changed_at TEXT NOT NULL);
     CREATE TABLE pm_tcp_full_scans(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,target TEXT NOT NULL,status TEXT NOT NULL,open_ports_json TEXT NOT NULL DEFAULT '[]',error TEXT,created_at TEXT NOT NULL, UNIQUE(task_id,target));
     CREATE TABLE pm_tcp_full_scan_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER,target TEXT,status TEXT,error TEXT,created_at TEXT);
     INSERT INTO tasks VALUES(11,'10.10.10.65');
-    INSERT INTO task_scope_settings VALUES(11,'10.10.10.65');
+    INSERT INTO task_scope_settings(task_id,initial_target) VALUES(11,'10.10.10.65');
     ''')
     return db
 
@@ -102,7 +103,7 @@ class Tests(unittest.TestCase):
         def create_successor(args,*,defer_execution):
             with db:
                 db.execute('INSERT INTO tasks VALUES(?,?)',(12,args.target))
-                db.execute('INSERT INTO task_scope_settings VALUES(?,?)',(12,args.target))
+                db.execute('INSERT INTO task_scope_settings(task_id,initial_target) VALUES(?,?)',(12,args.target))
                 db.execute('INSERT INTO pm_operator_approvals VALUES(?,?,?,?,?,NULL)',
                            (12,args.target,args.target+'/32','tun0','2026-10-31'))
                 db.execute('INSERT INTO pm_task_intents VALUES(?,?,?)',(12,args.task,'2026-10-31'))
