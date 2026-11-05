@@ -211,7 +211,11 @@ for line in sys.stdin:
                 self.assertEqual(harness_env()['PM_RUN_ID'], d.context()['run_id'])
                 with actions.action_policy_patch(3) as policy:
                     overlays = json.loads(Path(policy).read_text())
-                    self.assertEqual(overlays[1]['config']['env']['PM_RUN_ID'], d.context()['run_id'])
+                    forwarded=harness_env()
+                    for key,value in d.child_env().items():
+                        self.assertEqual(forwarded[key],value)
+                    self.assertFalse(any(item.get('id')=='mcp-pentest-master' for item in overlays),
+                                     'env-only config replacement disables the real MCP client')
         self.assertEqual(self.console.getvalue().count('tool.start pm_capability_read'), 1)
         self.assertEqual(self.console.getvalue().count('tool.end pm_capability_read'), 1)
 

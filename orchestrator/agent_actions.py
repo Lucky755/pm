@@ -295,9 +295,9 @@ def action_policy_patch(step_limit=None, poc_budget=7):
             overlays = [{'insert': [{
                 'id': 'pm-agent-actions', 'name': str(POLICY_PLUGIN.resolve()),
             }]}]
-            if diagnostics.active():
-                overlays.append({'id': 'mcp-pentest-master',
-                                 'config': {'env': diagnostics.child_env()}})
+            # MCP inherits the non-secret PM_* values from harness_env(). A
+            # Cordis config overlay replaces the whole MCP config, so an env-only
+            # overlay would erase command/serverName and disable the real client.
             path.write_text(json.dumps(overlays), encoding='utf-8')
             yield str(path)
     finally:

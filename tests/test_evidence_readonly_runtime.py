@@ -27,7 +27,7 @@ REPORT = {'summary': 'Анализ сохранённых наблюдений.'
 
 
 class LocalAPI:
-    def __init__(self, marker, tool_first=False):
+    def __init__(self, marker, tool_first=False, responder=None):
         self.marker = marker
         self.tool_first = tool_first
         self.requests = []
@@ -44,9 +44,13 @@ class LocalAPI:
                 if len(api.requests) > 4:
                     self.send_error(500, 'local test request budget exhausted')
                     return
-                tool = api.tool_first and len(api.requests) == 1
-                args = json.dumps({'command': 'touch ' + shlex.quote(str(api.marker))})
-                text = json.dumps(REPORT, ensure_ascii=False)
+                reply = (responder(body) if responder else {
+                    'tool_name': 'bash' if api.tool_first and len(api.requests)==1 else None,
+                    'arguments': {'command': 'touch ' + shlex.quote(str(api.marker))},
+                    'text': json.dumps(REPORT,ensure_ascii=False)})
+                tool = reply.get('tool_name')
+                args = json.dumps(reply.get('arguments',{}))
+                text = reply.get('text','')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Connection', 'close')
@@ -65,7 +69,7 @@ class LocalAPI:
                         'stop_sequence': None, 'usage': {'input_tokens': 1, 'output_tokens': 0}})
                     if tool:
                         event('content_block_start', index=0, content_block={
-                            'type': 'tool_use', 'id': 'denied-test', 'name': 'bash', 'input': {}})
+                            'type': 'tool_use', 'id': 'denied-test', 'name': tool, 'input': {}})
                         event('content_block_delta', index=0, delta={
                             'type': 'input_json_delta', 'partial_json': args})
                         stop = 'tool_use'
@@ -79,7 +83,7 @@ class LocalAPI:
                     event('message_stop')
                 else:
                     delta = ({'tool_calls': [{'index': 0, 'id': 'denied-test', 'type': 'function',
-                              'function': {'name': 'bash', 'arguments': args}}]} if tool else {'content': text})
+                              'function': {'name': tool, 'arguments': args}}]} if tool else {'content': text})
                     for content, stop in [(delta, None), ({}, 'tool_calls' if tool else 'stop')]:
                         send({'id': 'local-test', 'object': 'chat.completion.chunk', 'created': 1,
                               'model': 'deepseek-chat', 'choices': [
