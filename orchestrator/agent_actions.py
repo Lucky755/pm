@@ -105,7 +105,11 @@ CHARTERS = {
         'by a captured tool result or PoC output is unverified and must be marked '
         'so. Prefer local integrity checks of saved captures; do not repeat a GET '
         'just to corroborate the same bytes. Cite the original capture result_id '
-        'in the top-level probe field. If evidence is missing, perform one scoped '
+        'in the top-level probe field. Include artifact_ref and an exact quote '
+        'from the saved response (decoded body for a Git blob) in each audited '
+        'finding, or in probe for an audit with no findings. Local audit validates '
+        'the quotation, not a new observation or the interpretation of its meaning. '
+        'If evidence is missing, perform one scoped '
         'decisive probe. Never accept agreement between reports as proof. '
         'Check whether a captured flag actually satisfies the operator primary '
         'objective; include its objective_key and the decisive goal_evidence capture reference (http_artifact:ID or a typed capture result_id).'
@@ -196,7 +200,9 @@ Finish with ONE JSON object and no other text:
                   "quote": "exact contradicting or supporting output excerpt",
                   "cost": "0 local read | 1 one scoped request | 2 multi-step | 3 unknown",
                   "reason": "required for dropped"}],
-  "probe": {"result_id": "verify stage's direct probe result ID, if role is verify"},
+  "probe": {"result_id": "verify direct probe or original saved capture result ID",
+            "artifact_ref": "http_artifact:ID for local audit, otherwise empty",
+            "quote": "exact saved body excerpt for a local audit without findings"},
   "access_level": "none|exec|user|privileged",
   "access_signal": "none|credential|execution|shell",
   "access_probe_result_id": "fresh evidence for a new access claim",
@@ -1805,6 +1811,12 @@ def fallback_report(role, text):
 CLAIM_ARTIFACT = re.compile(
     r'(?<![\w.])(?:/[A-Za-z0-9_./%-]{2,}|0x[0-9a-fA-F]{3,}|'
     r'\d{1,5}/(?:tcp|udp)|(?:порт|port)\s*[:#]?\s*\d{1,5})', re.I)
+LOCAL_READ_TOOLS = frozenset(('capability_read','read_file','grep','unpack'))
+
+
+def readback_record(record):
+    return (record['tool'] in LOCAL_READ_TOOLS or
+            (record.get('capture_record') or {}).get('provenance')=='local')
 
 
 def report_probe_records(task_id):
@@ -1826,6 +1838,13 @@ def report_probe_records(task_id):
                     'status': result.get('status'),
                     'text': '\n'.join(str(result.get(key) or '') for key in
                                       ('stdout', 'stderr', 'response', 'output')),
+                    # Preserve typed provenance for local capture validation;
+                    # stdout itself must never establish an artifact link.
+                    'capture_record': {**{key:record.get(key) for key in
+                                         ('id','task_id','tool','provenance')},
+                                       'result':{key:result[key] for key in
+                                                 ('task_id','target','status','exit_code','artifact_id')
+                                                 if key in result}},
                 }
     except FileNotFoundError:
         pass
@@ -1861,14 +1880,43 @@ def probe_polarity(claim, output):
     return True, ''
 
 
-def validate_report_probes(report, task_id, role, records=None, prior_ids=()):
+def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *, db=None):
     """Check traceability and polarity heuristically; operator decides truth."""
-    records = report_probe_records(task_id) if records is None else records
-    records = {key: value for key, value in records.items() if key not in prior_ids}
+    from orchestrator import flag_evidence
+    all_records = report_probe_records(task_id) if records is None else records
+    prior_ids=set(prior_ids)
+    records = {key: value for key, value in all_records.items() if key not in prior_ids}
+    local_audits=[]
+    report.pop('local_audits',None)
     accepted, unverified = [], []
     for finding in report.get('findings', []):
+        finding.pop('evidence_reused',None)
+        finding.pop('verification_status',None)
         probe = finding.get('probe') if isinstance(finding.get('probe'), dict) else {}
+        result_id=probe.get('result_id')
+        if role=='verify' and isinstance(result_id,str) and result_id in prior_ids:
+            artifact_ref=finding.get('artifact_ref') or probe.get('artifact_ref')
+            audit,error=flag_evidence.audit_saved_capture(db,task_id,result_id,
+                all_records.get(result_id,{}).get('capture_record'),finding.get('quote'),artifact_ref)
+            if (finding.get('result_id') not in (None,'',result_id) or
+                    probe.get('artifact_ref') not in (None,'',artifact_ref)):
+                audit,error=None,'local_audit_conflicting_references'
+            if audit:
+                kind=str(finding.get('kind') or 'hypothesis').lower()
+                finding['kind']=kind if kind in fact_state.CLAIM_KINDS else 'hypothesis'
+                finding.update(evidence_reused=True,verification_status='local_audit',
+                               artifact_ref=audit['artifact_ref'],result_id=result_id,
+                               verification_warning='Проверена цитата сохранённого capture; это не новое наблюдение и не подтверждение интерпретации.')
+                accepted.append(finding)
+                local_audits.append(audit)
+            else:
+                unverified.append({**finding,'verification_status':'untested','verification_reason':error})
+            continue
         record = records.get(probe.get('result_id')) if isinstance(probe.get('result_id'), str) else None
+        if role=='verify' and record and readback_record(record):
+            unverified.append({**finding,'verification_status':'untested',
+                               'verification_reason':'readback_is_not_original_capture_evidence'})
+            continue
         claim = ' '.join(str(finding.get(key) or '') for key in ('title', 'claim'))
         artifacts = []
         for match in CLAIM_ARTIFACT.finditer(claim):
@@ -1911,12 +1959,28 @@ def validate_report_probes(report, task_id, role, records=None, prior_ids=()):
     if role == 'verify':
         probe = report.get('probe') or {}
         record = records.get(probe.get('result_id')) if isinstance(probe.get('result_id'), str) else None
-        if not record or record['status'] not in ('completed', 'ok') or not record['text'].strip() or record['tool'] not in (
+        result_id=probe.get('result_id')
+        audited=False
+        if isinstance(result_id,str) and result_id in prior_ids:
+            if probe.get('quote'):
+                audit,error=flag_evidence.audit_saved_capture(db,task_id,result_id,
+                    all_records.get(result_id,{}).get('capture_record'),probe['quote'],probe.get('artifact_ref'))
+                if audit:
+                    local_audits.append(audit)
+                    audited=True
+            else:
+                audited=any(item['result_id']==result_id and probe.get('artifact_ref') in
+                            (None,'',item['artifact_ref']) for item in local_audits)
+        direct=bool(record and not readback_record(record) and record['status'] in ('completed', 'ok') and record['text'].strip() and record['tool'] in (
                 'net_exec', 'poc_run', 'session', 'network_probe',
-                'http_capture', 'http_get', 'http_path', 'http_document', 'http_headers'):
+                'http_capture', 'http_get', 'http_path', 'http_document', 'http_headers'))
+        if not direct and not audited:
             report['report_incomplete'] = True
             report['report_warning'] = (report.get('report_warning', '') +
-                '; verify не выполнил прямой зонд').strip('; ')
+                '; verify: нет прямого зонда или допустимого локального аудита сохранённого capture').strip('; ')
+    if local_audits:
+        report['local_audits']=list({(item['result_id'],item['artifact_ref'],item['quote']):item
+                                    for item in local_audits}.values())
     return report
 
 
@@ -2322,11 +2386,17 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                     degraded = True
                     report = fallback_report(
                         role, getattr(result, 'final_response', ''))
-            report = validate_report_probes(report, task_id, role, prior_ids=prior_probe_ids)
+            probe_records=report_probe_records(task_id)
+            report = validate_report_probes(report, task_id, role, records=probe_records,
+                                             prior_ids=prior_probe_ids, db=db)
+            # A fresh readback wrapper is not a new probe either. Keep the
+            # original IDs excluded from hypothesis/access closure validation.
+            closure_prior_ids=prior_probe_ids | ({rid for rid,record in probe_records.items()
+                if readback_record(record)} if role=='verify' else set())
             report = fact_state.validate_hypotheses(
-                report, report_probe_records(task_id), prior_probe_ids)
+                report, probe_records, closure_prior_ids)
             report = fact_state.validate_access_report(
-                report, report_probe_records(task_id), prior_probe_ids)
+                report, probe_records, closure_prior_ids)
             stats_unknown = tool_calls['calls'] is None
             steps_used = tool_calls['calls'] or 0
             session_share = round(tool_calls['sessions'] / steps_used, 3) if steps_used else 0.0
@@ -2385,8 +2455,8 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
         'recovery': recovery,
         'recovered_from_truncation': bool(recovery and recovery.startswith('max-tokens')),
         'degraded': degraded,
-        # A stage that ran no tool at all proved nothing, whatever its summary
-        # says. The loop reports it instead of counting it as work.
+        # Execution metric, not a proof verdict: a valid local capture audit
+        # can finish without a new billable tool call.
         'no_tools': tool_calls['calls'] == 0,
     }
 

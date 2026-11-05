@@ -453,6 +453,10 @@ def save_hypotheses(db, task_id, stage, report):
     for finding in list(verified_findings) + (report.get('unverified_findings') or []):
         if not isinstance(finding, dict):
             continue
+        if finding.get('evidence_reused') and finding.get('verification_status')=='local_audit':
+            # A checked citation can be displayed in VERIFY, but re-reading it
+            # neither confirms a new claim nor overwrites an earlier closure.
+            continue
         probe = finding.get('probe') if isinstance(finding.get('probe'), dict) else {}
         kind = finding.get('kind', 'hypothesis')
         claims.append({'claim': finding.get('claim') or finding.get('title'),
@@ -545,7 +549,8 @@ def import_legacy_reports(db, task_id):
         candidates += [(str(item.get('claim') or item.get('title') or ''),
                         str(item.get('kind') or 'hypothesis'))
                        for item in (report.get('findings') or []) +
-                       (report.get('unverified_findings') or []) if isinstance(item, dict)]
+                       (report.get('unverified_findings') or []) if isinstance(item, dict)
+                       and not (item.get('evidence_reused') and item.get('verification_status')=='local_audit')]
         for claim, kind in candidates:
             key = claim_key(claim)
             if not key:

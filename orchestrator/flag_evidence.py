@@ -128,3 +128,34 @@ def reference_matches(db, task_id, reference, proof, record=None):
             and payload.get('status') in ('completed','ok') and payload.get('exit_code',0) == 0
             and type(payload.get('artifact_id')) is int
             and f"http_artifact:{payload['artifact_id']}" in proof['capture_refs'])
+
+
+def audit_saved_capture(db, task_id, result_id, record, quote, artifact_ref=None):
+    """Validate a quotation of an original capture, without creating a witness.
+
+    Uses the same task/target/scope, private-file checksum and loose-Git object
+    checks as flag verification. A PoC/readback wrapper is never a capture.
+    The returned metadata proves only the source of the quotation, not the
+    report's interpretation, a new observation, or an access/goal transition.
+    """
+    if db is None:
+        return None, 'local_audit_database_required'
+    payload=(record or {}).get('result') or {}
+    if (not isinstance(payload,dict) or type(payload.get('artifact_id')) is not int
+            or (record or {}).get('tool') not in ('http_capture','http_document','http_path','http_get')):
+        return None, 'local_audit_requires_original_capture_result'
+    ref=f"http_artifact:{payload['artifact_id']}"
+    if artifact_ref not in (None,'',ref):
+        return None, 'local_audit_result_artifact_mismatch'
+    witnesses,errors=collect(db,task_id,artifact_id=payload['artifact_id'])
+    if not witnesses:
+        return None, errors[0]['reason'] if errors else 'local_audit_capture_unavailable_for_task_target'
+    proof,text=witnesses[0]
+    if not reference_matches(db,task_id,result_id,proof,record):
+        return None, 'local_audit_capture_result_mismatch'
+    if not isinstance(quote,str) or not quote.strip():
+        return None, 'local_audit_quote_required'
+    if quote not in text:
+        return None, 'local_audit_quote_not_in_capture'
+    return {**{k:proof[k] for k in ('kind','task_id','target','path','sha256','capture_sha256')},
+            'result_id':result_id,'artifact_ref':ref,'quote':quote}, None
