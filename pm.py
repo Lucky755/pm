@@ -1126,7 +1126,9 @@ def preflight_target(db, task_id, target, ports, timeout=2.0):
         raise OperatorError('Некорректные порты или тайм-аут проверки доступности') from exc
     stamp = datetime.now(timezone.utc).isoformat()
     if not selected:
-        return {'reachable': [], 'unreachable': [], 'checked_at': stamp}
+        result={'reachable': [], 'unreachable': [], 'unchecked': [], 'checked_at': stamp}
+        preflight_summary(task_id,target,selected,result)
+        return result
     script = ('import json,socket,sys,time; host=sys.argv[1]; ports=json.loads(sys.argv[2]); '
               'limit=time.monotonic()+10; ok=[]; bad=[]; '
               'exec("for port in ports:\\n if time.monotonic()>=limit: break\\n try:\\n  s=socket.create_connection((host,port),timeout=min(float(sys.argv[3]),max(0.05,limit-time.monotonic()))); s.close(); ok.append(port)\\n except OSError:\\n  bad.append(port)\\n"); '
@@ -1144,8 +1146,10 @@ def preflight_target(db, task_id, target, ports, timeout=2.0):
             raise OperatorError('Проверка доступности через NetGuard не завершилась: ' +
                                 str(payload.get('error') or payload.get('stderr') or 'ошибка')[:200])
         result = json.loads(payload.get('stdout', ''))
-        if not isinstance(result, dict) or sorted(result['reachable'] + result['unreachable'] +
-                                                  result['unchecked']) != selected:
+        if (not isinstance(result,dict)
+                or any(not isinstance(result.get(key),list) or any(type(p) is not int for p in result[key])
+                       for key in ('reachable','unreachable','unchecked'))
+                or sorted(result['reachable']+result['unreachable']+result['unchecked'])!=selected):
             raise ValueError('invalid probe result')
     except OperatorError as exc:
         with db:
@@ -1163,14 +1167,27 @@ def preflight_target(db, task_id, target, ports, timeout=2.0):
                        'VALUES (?,?,?,?,?)', (task_id, target, 'preflight_fail', str(exc)[:500], stamp))
         raise OperatorError('Некорректный результат проверки доступности NetGuard') from exc
     result['checked_at'] = stamp
+    preflight_summary(task_id,target,selected,result)
     with db:
         db.execute('INSERT INTO pm_tcp_full_scan_attempts(task_id,target,status,error,created_at) '
                    'VALUES (?,?,?,?,?)', (task_id, target, 'preflight_ok' if result['reachable'] else
-                   'preflight_fail', json.dumps(result, ensure_ascii=False), stamp))
+                   'preflight_incomplete' if result['unchecked'] else 'preflight_fail',
+                   json.dumps(result, ensure_ascii=False), stamp))
         if result['reachable']:
             db.execute('UPDATE pm_tcp_full_scans SET last_seen_at=? WHERE task_id=? AND target=?',
                        (stamp, task_id, target))
     return result
+
+
+def preflight_summary(task_id, target, ports, result):
+    """Describe coverage separately from the existence of a reachable port."""
+    counts={'known_ports':len(ports),'checked_ports':len(result['reachable'])+len(result['unreachable']),
+            'unchecked_ports':len(result['unchecked']),'reachable_ports':len(result['reachable'])}
+    status,reason=(('empty','no_known_tcp_ports') if not ports else
+                   ('reachable','at_least_one_port_reachable') if result['reachable'] else
+                   ('incomplete','unchecked_ports_remaining') if result['unchecked'] else
+                   ('unreachable','all_known_ports_checked_unreachable'))
+    diagnostics.emit('preflight.summary',task_id=task_id,parameters={'target':target},status=status,reason=reason,**counts)
 
 
 COORDINATOR_OPTIONS = ('coordinator_steps','decision_retries','roles','poc_budget','step_limit','max_tokens')
@@ -1286,13 +1303,17 @@ def launch_configured_task(db, task_id, target, args):
 
 
 def launch_coordinated_task(db, task_id, target, args):
-    from orchestrator import agent_actions, task_runtime
+    from orchestrator import service_inventory, task_runtime
     meta=task_runtime.saved(db,task_id)
     if meta is None:
         task_runtime.save_mode(db,task_id,'coordinated')
         meta=task_runtime.saved(db,task_id)
-    mapped=agent_actions.service_map(db,task_id,1)
-    ports=sorted({entry['port'] for entry in mapped['entries'] if entry['protocol']=='tcp'})
+    def known_tcp_ports():
+        inventory=service_inventory.collect_full(db,task_id)
+        if not inventory['scope_valid'] or inventory['target']!=target:
+            raise OperatorError('Структурированный инвентарь не соответствует текущему scope и адресу задачи')
+        return sorted({entry['port'] for entry in inventory['entries'] if entry['protocol']=='tcp'})
+    ports=known_tcp_ports()
     cached=bool(ports and meta['recon_status'] in ('pending','completed'))
     def pause(reason):
         task_runtime.reconnaissance(db,task_id,'waiting_operator',reason)
@@ -1306,13 +1327,13 @@ def launch_coordinated_task(db, task_id, target, args):
     try:
         used=0 if ports else run_full_tcp_scan(db,task_id,target)
         if not ports:
-            row=db.execute('SELECT open_ports_json FROM pm_tcp_full_scans WHERE task_id=? AND target=?',(task_id,target)).fetchone()
-            ports=json.loads(row[0]) if row else []
+            ports=known_tcp_ports()
         if not ports:
             return pause('reconnaissance_no_tcp_services')
         checked=preflight_target(db,task_id,target,ports)
         if not checked['reachable'] and not getattr(args,'force_unreachable',False):
-            return pause('reconnaissance_target_unreachable')
+            return pause('reconnaissance_preflight_incomplete' if checked.get('unchecked')
+                         else 'reconnaissance_target_unreachable')
         if cached and not getattr(args,'reprobe',None) and not getattr(args,'sync_burp',False):
             diagnostics.emit('cache.hit',name='initial_reconnaissance',task_id=task_id,
                              reason='saved_scoped_service_map')
@@ -1345,6 +1366,9 @@ def launch_legacy_task(db, task_id, target, args):
         return
     preflight = preflight_target(db, task_id, target, ports)
     if not preflight['reachable'] and not getattr(args, 'force_unreachable', False):
+        if preflight.get('unchecked'):
+            raise OperatorError(f"Проверка доступности не завершена: {len(preflight['unchecked'])} "
+                                f"из {len(ports)} портов ещё не проверены; недоступность цели не установлена")
         raise OperatorError('Цель не отвечает на проверенных портах ' +
                             ', '.join(map(str, preflight['unreachable'])) +
                             '; последняя удачная проверка: ' + (scan_row[1] or scan_row[2] or 'нет данных'))

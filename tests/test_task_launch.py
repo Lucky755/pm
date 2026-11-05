@@ -9,7 +9,10 @@ import unittest
 from unittest.mock import patch, Mock
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-import test_coordinated_attack as fixtures
+if __package__:
+    from . import test_coordinated_attack as fixtures
+else:
+    import test_coordinated_attack as fixtures
 decision=fixtures.decision
 import pm
 from orchestrator import coordinated_attack as c, task_runtime as runtime, diagnostics as d
@@ -21,6 +24,7 @@ class TaskLaunchTests(unittest.TestCase):
         self.case=fixtures.CoordinatorTests();self.case.setUp();self.addCleanup(self.case.doCleanups)
         self.trace=[]
         self.scheduler_adapter=pm.call_scheduler
+        self.preflight_adapter=pm.preflight_target
         with self.case.connect() as db:
             db.execute('ALTER TABLE pm_task_intents ADD COLUMN created_at TEXT')
         def configured(db,task,args,**kwargs):
@@ -112,6 +116,121 @@ class TaskLaunchTests(unittest.TestCase):
             result=pm.op_resume(self.args('resume','11','--coordinated'))
         self.assertEqual(self.trace,['scope/NetGuard','preflight'])
         self.assertEqual(result['stop_reason'],'model_stopped_incomplete')
+
+    def full_preflight_fixture(self, *, reachable=(), unchecked=()):
+        """Fake only the broker boundary; never execute its socket script."""
+        ports=list(range(1,13))+[9999]
+        with self.case.connect() as db:
+            db.execute('UPDATE pm_tcp_full_scans SET open_ports_json=?',(json.dumps(ports),))
+            db.execute('CREATE TABLE IF NOT EXISTS pm_tcp_full_scan_attempts('
+                       'id INTEGER PRIMARY KEY,task_id INTEGER,target TEXT,status TEXT,error TEXT,created_at TEXT)')
+        calls=[]
+        def broker(command,**kwargs):
+            argv=[item[7:] for item in command if item.startswith('--argv=')]
+            selected=json.loads(argv[-2]);calls.append(selected)
+            self.assertEqual(command[:5],['run','--task-id','11','--profile','exec'])
+            self.assertEqual(kwargs['timeout'],20)
+            self.assertEqual(command[command.index('--timeout')+1],'12')
+            self.assertIn('time.monotonic()+10',argv[2])
+            payload={'reachable':[p for p in selected if p in reachable],
+                     'unreachable':[p for p in selected if p not in reachable and p not in unchecked],
+                     'unchecked':[p for p in selected if p in unchecked]}
+            return {'status':'completed','exit_code':0,'stdout':json.dumps(payload)},0
+        return ports,calls,broker
+
+    def test_preflight_reaches_port_outside_model_context_selection(self):
+        ports,calls,broker=self.full_preflight_fixture(reachable=[9999])
+        model=self.case.model([decision('vuln','Inspect the reachable service on port 9999?'),decision(action='wait_operator')])
+        with patch.object(pm,'preflight_target',self.preflight_adapter),patch.object(pm,'sudo_checked',side_effect=broker),\
+             patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):
+            result=pm.op_resume(self.args('resume','11','--coordinated'))
+        self.assertEqual(calls,[ports])
+        self.assertEqual(result['stop_reason'],'model_waiting_operator')
+        self.assertEqual([v[0] for v in self.case.calls],['vuln'])
+        self.assertNotIn('scan',self.trace)
+        mapped=self.case.prompts[0]['service_map']
+        self.assertEqual(len(mapped['entries']),12)
+        self.assertEqual(mapped['omitted_entries'],1)
+        self.assertNotIn(9999,[entry['port'] for entry in mapped['entries']])
+
+    def test_partial_preflight_does_not_claim_target_unreachable(self):
+        ports,calls,broker=self.full_preflight_fixture(unchecked=[9999])
+        with d.run('partial preflight',11),patch.object(pm,'preflight_target',self.preflight_adapter),\
+             patch.object(pm,'sudo_checked',side_effect=broker),\
+             patch.object(pm,'session_api_key',side_effect=AssertionError('model key')):
+            result=pm.op_resume(self.args('resume','11','--coordinated'))
+            summaries=[e for e in d.read_events() if e['kind']=='preflight.summary']
+        self.assertEqual(result['stop_reason'],'reconnaissance_preflight_incomplete')
+        self.assertEqual(calls,[ports])
+        self.assertFalse(result['succeeded'])
+        self.assertEqual(len(summaries),1)
+        self.assertEqual([summaries[0][k] for k in ('known_ports','checked_ports','unchecked_ports')],[13,12,1])
+        with self.case.connect() as db:
+            self.assertEqual(db.execute('SELECT status FROM pm_tcp_full_scan_attempts').fetchone()[0],'preflight_incomplete')
+        self.trace.clear()
+        with patch.object(pm,'session_api_key',side_effect=AssertionError('key')),\
+             patch.object(pm,'sudo_checked',side_effect=AssertionError('network')):
+            self.assertEqual(pm.op_resume(self.args('resume','11'))['stop_reason'],'reconnaissance_preflight_incomplete')
+        self.assertEqual(self.trace,[])
+
+    def test_all_known_ports_checked_unreachable_is_definitive(self):
+        ports,calls,broker=self.full_preflight_fixture()
+        with d.run('negative preflight',11),patch.object(pm,'preflight_target',self.preflight_adapter),\
+             patch.object(pm,'sudo_checked',side_effect=broker):
+            result=pm.op_resume(self.args('resume','11','--coordinated'))
+            summaries=[e for e in d.read_events() if e['kind']=='preflight.summary']
+        self.assertEqual(calls,[ports])
+        self.assertEqual(result['stop_reason'],'reconnaissance_target_unreachable')
+        self.assertEqual([summaries[0][k] for k in ('known_ports','checked_ports','unchecked_ports')],[13,13,0])
+
+    def test_unchecked_ports_with_a_reachable_port_still_allow_coordinator(self):
+        ports,calls,broker=self.full_preflight_fixture(reachable=[1],unchecked=list(range(2,13))+[9999])
+        model=self.case.model([decision()])
+        with d.run('reachable partial',11),patch.object(pm,'preflight_target',self.preflight_adapter),\
+             patch.object(pm,'sudo_checked',side_effect=broker),\
+             patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):
+            result=pm.op_resume(self.args('resume','11','--coordinated'))
+            summary=next(e for e in d.read_events() if e['kind']=='preflight.summary')
+        self.assertEqual(result['stop_reason'],'model_stopped_incomplete')
+        self.assertEqual(calls,[ports])
+        self.assertEqual([summary[k] for k in ('known_ports','checked_ports','unchecked_ports','reachable_ports')],[13,1,12,1])
+        self.assertEqual(summary['reason'],'at_least_one_port_reachable')
+
+    def test_legacy_partial_preflight_does_not_claim_target_unreachable(self):
+        _,calls,broker=self.full_preflight_fixture(unchecked=[9999])
+        with self.case.connect() as db,patch.object(pm,'run_full_tcp_scan',return_value=0),\
+             patch.object(pm,'preflight_target',self.preflight_adapter),patch.object(pm,'sudo_checked',side_effect=broker):
+            with self.assertRaisesRegex(pm.OperatorError,'ещё не проверены; недоступность цели не установлена'):
+                pm.launch_configured_task(db,11,'10.0.0.1',self.args('resume','11'))
+        self.assertEqual(len(calls),1)
+        pm.call_scheduler.assert_not_called()
+
+    def test_preflight_uses_tcp_only_and_excludes_foreign_task_and_old_ip(self):
+        ports,calls,broker=self.full_preflight_fixture(reachable=[9999])
+        with self.case.connect() as db:
+            db.executescript('''
+                CREATE TABLE network_phase_plans(id INTEGER PRIMARY KEY,task_id INTEGER,target TEXT,
+                    profile TEXT,parameters_json TEXT);
+                CREATE TABLE network_job_runs(id INTEGER PRIMARY KEY,plan_id INTEGER,status TEXT,result_json TEXT);
+                CREATE TABLE network_observations(id INTEGER PRIMARY KEY,run_id INTEGER,task_id INTEGER,
+                    target TEXT,kind TEXT,data_json TEXT,observed_at TEXT);
+            ''')
+            for number,task,target,protocol,port,status in (
+                    (1,11,'10.0.0.1','udp',53,'completed'),(2,11,'10.0.0.1','tcp',8080,'completed'),
+                    (3,22,'10.0.0.1','tcp',4444,'completed'),(4,11,'10.0.0.9','tcp',5555,'completed'),
+                    (5,11,'10.0.0.1','tcp',7777,'running')):
+                db.execute("INSERT INTO network_phase_plans VALUES(?,?,?,'service_versions','{}')",(number,task,target))
+                db.execute("INSERT INTO network_job_runs VALUES(?,?,?,'{}')",(number,number,status))
+                db.execute("INSERT INTO network_observations VALUES(?,?,?,?, 'service_probe',?,?)",
+                           (number,number,task,target,json.dumps({'port':port,'protocol':protocol,'state':'open'}),c.now()))
+            db.execute("INSERT INTO pm_tcp_full_scans VALUES(2,22,'10.0.0.1','completed','[8888]',?,?)",(c.now(),c.now()))
+            db.execute("INSERT INTO pm_tcp_full_scans VALUES(3,11,'10.0.0.9','completed','[6666]',?,?)",(c.now(),c.now()))
+        model=self.case.model([decision()])
+        with patch.object(pm,'preflight_target',self.preflight_adapter),patch.object(pm,'sudo_checked',side_effect=broker),\
+             patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):
+            pm.op_resume(self.args('resume','11','--coordinated'))
+        self.assertEqual(calls,[sorted(ports+[8080])])
+        self.assertNotIn('scan',self.trace)
 
     def test_running_step_is_only_displayed_even_with_continue(self):
         def interrupt(*args,**kwargs):raise KeyboardInterrupt()
@@ -328,6 +447,27 @@ def demo():
     print('diagnostic runs:',len(runs),'coordinator_run_id:',result['coordinator_run_id'],'goal confirmed:',result['succeeded'])
 
 
+def demo_ports():
+    case=TaskLaunchTests();case.setUp()
+    try:
+        ports,calls,broker=case.full_preflight_fixture(reachable=[9999])
+        model=case.case.model([decision('vuln','Inspect the reachable port 9999?'),decision(action='wait_operator')])
+        with d.run('offline full inventory',11),patch.object(pm,'preflight_target',case.preflight_adapter),\
+             patch.object(pm,'sudo_checked',side_effect=broker),\
+             patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):
+            result=pm.op_resume(case.args('resume','11','--coordinated'))
+            summary=next(e for e in d.read_events() if e['kind']=='preflight.summary')
+        mapped=case.case.prompts[0]['service_map']
+    finally:case.doCleanups()
+    print('preflight ports:',calls[0],'reachable: [9999]')
+    print('preflight.summary '+' '.join(f'{key}={summary[key]}' for key in
+          ('known_ports','checked_ports','unchecked_ports','reachable_ports','reason')))
+    print('model context: entries=',len(mapped['entries']),'omitted=',mapped['omitted_entries'])
+    print('roles:',[call[0] for call in case.case.calls],'stop:',result['stop_reason'],
+          'full scans:',case.trace.count('scan'),'goal confirmed:',result['succeeded'])
+
+
 if __name__=='__main__':
     if sys.argv[1:]==['--demo']:demo()
+    elif sys.argv[1:]==['--demo-ports']:demo_ports()
     else:unittest.main()

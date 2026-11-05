@@ -35,7 +35,12 @@ def decoded(value):
         return None
 
 
-def collect(db, task_id, *, keep=ENTRY_LIMIT, at=None):
+def collect_full(db, task_id, *, at=None):
+    """Complete structured inventory for execution, with the shared source filters.
+
+    Do not pass this unbounded view to a model; collect() provides that view.
+    Text notes and previous-address hints are never execution inventory.
+    """
     now = at or datetime.now(timezone.utc)
     ttl = age_minutes()
     entries, coverage = {}, None
@@ -184,20 +189,30 @@ def collect(db, task_id, *, keep=ENTRY_LIMIT, at=None):
                                                     for i in identities))
         entry['fresh'] = any(s['fresh'] for s in sources)
         entry['sources_total'] = len(sources)
-        entry['sources_omitted'] = max(0, len(sources) - SOURCE_LIMIT)
+        entry['sources_omitted'] = 0
         entry['identifications_total'] = len(identities)
-        entry['identifications_omitted'] = max(0, len(identities) - IDENTIFICATION_LIMIT)
-        entry['sources'] = sorted(sources, key=source_key)[:SOURCE_LIMIT]
-        entry['identifications'] = sorted(identities, key=lambda i: source_key(i['source']))[:IDENTIFICATION_LIMIT]
+        entry['identifications_omitted'] = 0
+        entry['sources'] = sorted(sources, key=source_key)
+        entry['identifications'] = sorted(identities, key=lambda i: source_key(i['source']))
     all_entries = [entries[key] for key in sorted(entries)]
     scan_fresh = bool(coverage and coverage['ports_total'] and coverage['source']['fresh'])
     is_fresh = any(e['fresh'] for e in all_entries)
     reason = ('fresh_full_tcp_scan' if scan_fresh else 'fresh_structured_observations' if is_fresh
               else 'structured_data_stale' if all_entries else 'no_structured_services')
-    limit = min(ENTRY_LIMIT, max(0, int(keep)))
     return {'task_id': task_id, 'target': target, 'scope_valid': scope_valid,
             'max_age_minutes': ttl, 'full_scan': coverage, 'source_status': status,
             'source_counts': counts, 'fresh': is_fresh,
             'scan_mode': 'spot_check' if is_fresh else 'full_scan', 'scan_mode_reason': reason,
-            'total_entries': len(all_entries), 'omitted_entries': max(0, len(all_entries) - limit),
-            'entries': all_entries[:limit]}
+            'total_entries': len(all_entries), 'omitted_entries': 0, 'entries': all_entries}
+
+
+def collect(db, task_id, *, keep=ENTRY_LIMIT, at=None):
+    """Bounded prompt representation of the same inventory; never execution input."""
+    inventory = collect_full(db,task_id,at=at)
+    limit = min(ENTRY_LIMIT,max(0,int(keep)))
+    entries = [{**entry, 'sources':entry['sources'][:SOURCE_LIMIT],
+                'sources_omitted':max(0,entry['sources_total']-SOURCE_LIMIT),
+                'identifications':entry['identifications'][:IDENTIFICATION_LIMIT],
+                'identifications_omitted':max(0,entry['identifications_total']-IDENTIFICATION_LIMIT)}
+               for entry in inventory['entries'][:limit]]
+    return {**inventory,'entries':entries,'omitted_entries':max(0,inventory['total_entries']-limit)}

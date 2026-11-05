@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from orchestrator import agent_actions as a, attack_loop, diagnostics as d, fact_state
+from orchestrator import agent_actions as a, attack_loop, diagnostics as d, fact_state, service_inventory
 
 
 class ServiceInventoryTests(unittest.TestCase):
@@ -164,6 +164,47 @@ class ServiceInventoryTests(unittest.TestCase):
         self.assertEqual(mapped['total_entries'], 30)
         self.assertEqual(mapped['omitted_entries'], 27)
         self.assertEqual(mapped, self.mapped(keep=3))
+
+    def test_full_execution_inventory_and_bounded_context_share_sources(self):
+        self.scan(ports=list(range(1,13))+[9999])
+        for _ in range(20):self.observation(port=1,kind='service_probe',service_hint='http')
+        self.db.commit()
+        before=list(self.db.iterdump())
+        self.db.execute('PRAGMA query_only=ON')
+        full=service_inventory.collect_full(self.db,11,at=self.now)
+        prompt=service_inventory.collect(self.db,11,keep=10000,at=self.now)
+        self.assertEqual([e['port'] for e in full['entries']],list(range(1,13))+[9999])
+        self.assertEqual(full['omitted_entries'],0)
+        self.assertEqual(len(full['entries'][0]['sources']),21)
+        self.assertEqual(len(full['entries'][0]['identifications']),20)
+        self.assertEqual(len(prompt['entries']),12)
+        self.assertEqual(prompt['omitted_entries'],1)
+        self.assertEqual(len(prompt['entries'][0]['sources']),8)
+        self.assertEqual(prompt['entries'][0]['sources_omitted'],13)
+        self.assertEqual(prompt['entries'][0]['identifications_omitted'],12)
+        self.assertEqual(prompt['entries'][0]['sources'],full['entries'][0]['sources'][:8])
+        self.assertEqual(list(self.db.iterdump()),before)
+
+    def test_full_inventory_filters_protocol_task_old_ip_and_unfinished_jobs(self):
+        self.scan(ports=list(range(1,13))+[9999])
+        self.scan(task=22,target='10.0.0.2',ports=[4444])
+        self.scan(task=11,target='10.0.0.9',ports=[5555])
+        self.observation(port=53,kind='service_probe',protocol='udp',service_hint='dns')
+        self.observation(port=8080)
+        self.observation(port=8080)  # one service, both proof row references
+        self.observation(port=9998,run_status='running')
+        self.observation(port=9997,run_status='failed')
+        self.observation(port=9996,task=22,target='10.0.0.2')
+        self.observation(port=9995,target='10.0.0.9')
+        self.observation(port=9994,plan_task=22)
+        self.observation(port=9993,plan_target='10.0.0.9')
+        full=service_inventory.collect_full(self.db,11)
+        tcp=[e['port'] for e in full['entries'] if e['protocol']=='tcp']
+        self.assertEqual(tcp,list(range(1,13))+[8080,9999])
+        self.assertEqual([(e['protocol'],e['port']) for e in full['entries'] if e['protocol']=='udp'],[('udp',53)])
+        self.assertEqual(len(next(e for e in full['entries'] if e['port']==8080)['sources']),2)
+        self.db.execute("UPDATE task_scope_settings SET initial_target='10.0.0.9' WHERE task_id=11")
+        self.assertEqual(service_inventory.collect_full(self.db,11)['entries'],[])
 
     def test_provenance_limits_and_real_capability_reference(self):
         for index in range(20):
