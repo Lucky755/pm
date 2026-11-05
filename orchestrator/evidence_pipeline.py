@@ -58,12 +58,8 @@ def load_burp():
     return module
 
 
-def connect():
-    if not DB_PATH.exists():
-        raise ValueError(f'Task database not found: {DB_PATH}')
-    db = sqlite3.connect(DB_PATH, timeout=10)
-    db.execute('PRAGMA foreign_keys = ON')
-    db.execute('PRAGMA busy_timeout = 5000')
+def initialize(db):
+    """Create the shared evidence schema on an existing connection, preserving data."""
     db.execute('''
         CREATE TABLE IF NOT EXISTS evidence_snapshots (
             task_id INTEGER NOT NULL,
@@ -86,6 +82,15 @@ def connect():
         )
     ''')
     db.commit()
+
+
+def connect():
+    if not DB_PATH.exists():
+        raise ValueError(f'Task database not found: {DB_PATH}')
+    db = sqlite3.connect(DB_PATH, timeout=10)
+    db.execute('PRAGMA foreign_keys = ON')
+    db.execute('PRAGMA busy_timeout = 5000')
+    initialize(db)
     return db
 
 

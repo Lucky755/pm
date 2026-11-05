@@ -805,6 +805,7 @@ def call_scheduler(db, task_id, target, args, *, prior_jobs=0):
     decision.emit = lambda obj: None
     try:
         jobs.initialize(db)
+        evidence.initialize(db)
         scheduler.validate_task(db, task_id)
         from contextlib import redirect_stdout
         progress = ConciseProgress(sys.stdout)
