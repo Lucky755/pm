@@ -375,9 +375,7 @@ def _candidates(db, task_id, target, hosts, *, capture=False):
                 asset_candidates.append(candidate)
 
     # On-page links first, then bounded first-party script and style metadata.
-    prior_static = {tuple(row) for row in db.execute('''
-        SELECT scheme,hostname,port,path FROM pm_http_discovery WHERE task_id=?
-        AND (lower(path) LIKE '%.js' OR lower(path) LIKE '%.css')''', (task_id,))}
+    prior_static = static_attempts(db,task_id)
     static_budget = max(0, MAX_STATIC_TOTAL - len(prior_static))
     for candidate in asset_candidates:
         if static_budget <= 0:
@@ -592,6 +590,127 @@ def attempts_used(db, task_id):
         total += db.execute(f'SELECT COUNT(*) FROM {table} r JOIN pm_http_discovery d '
                             'ON d.id=r.observation_id WHERE d.task_id=?', (task_id,)).fetchone()[0]
     return total
+
+
+def static_attempts(db, task_id):
+    return {tuple(row) for row in db.execute('''SELECT scheme,hostname,port,path FROM pm_http_discovery
+        WHERE task_id=? AND (lower(path) LIKE '%.js' OR lower(path) LIKE '%.css')''',(task_id,))}
+
+
+class CaptureRefused(ValueError):
+    """A refusal before capture I/O; a previous attempt is never replayed blindly."""
+
+
+def _capture_reply(db, task_id, artifact_id, *, cached):
+    from orchestrator import http_artifacts as artifacts
+    body, metadata = artifacts.load(db,task_id,artifact_id)
+    info = artifacts.info(db,artifact_id)
+    target,scheme,host,port,path = db.execute(
+        'SELECT target,scheme,hostname,port,path FROM pm_http_artifacts WHERE id=? AND task_id=?',
+        (artifact_id,task_id)).fetchone()
+    text, flags = artifacts.decode_body(body,metadata['headers'])
+    decoded_artifact = None
+    if '/.git/objects/' in path:
+        from orchestrator import flag_evidence
+        witnesses, _ = flag_evidence.collect(db,task_id,artifact_id=artifact_id)
+        if witnesses and witnesses[0][0]['kind']=='git_blob':
+            proof,text=witnesses[0]
+            decoded_artifact={key:proof[key] for key in ('kind','object_id','sha256','bytes')}
+            flags['text_skipped']=None
+    return {'status':'completed' if info['download_complete'] else 'incomplete',
+            'exit_code':0 if info['download_complete'] else None,
+            'task_id':task_id,'target':target,'profile':'http_capture',
+            'scheme':scheme,'hostname':host,'port':port,'path':path,
+            'artifact_id':artifact_id,'artifact_ref':f'http_artifact:{artifact_id}',
+            'sha256':info['sha256'],'bytes_saved':info['bytes_saved'],
+            'status_code':info['status_code'],'download_complete':info['download_complete'],
+            'stdout':text[:12000],'text_truncated':len(text)>12000,
+            'text_skipped':flags['text_skipped'],'decoded_artifact':decoded_artifact,'cached':cached}
+
+
+def capture_explicit(db, task_id, target, scheme, hostname, port, path, *,
+                     hypothesis_key='', new_evidence_id='', records=None):
+    """One explicit GET sharing discovery's scope, attempt and artifact budgets.
+
+    Claim before I/O. Reuse a saved capture; failures/interrupted claims require
+    operator review. A metadata-only observation has one existing capture
+    upgrade slot. No new queue or automatic retries are introduced.
+    """
+    from orchestrator import http_artifacts as artifacts
+    from orchestrator import fact_state
+    from orchestrator.application_discovery import PARSER_VERSION
+    init(db)
+    try:
+        if target != validate_scope(db,task_id):
+            raise ValueError('Target differs from authorized task scope')
+        if (scheme not in ('http','https') or type(port) is not int or not 1 <= port <= 65535
+                or hostname not in permitted_hosts(db,task_id,target)):
+            raise ValueError('HTTP endpoint is outside approved scope or has invalid parameters')
+        path = _safe_path(path)
+    except ValueError as exc:
+        raise CaptureRefused(str(exc)) from exc
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        cursor=db.execute('SELECT * FROM pm_http_discovery WHERE task_id=? AND scheme=? '
+                          'AND hostname=? AND port=? AND path=?',(task_id,scheme,hostname,port,path))
+        row=cursor.fetchone()
+        old=dict(zip((c[0] for c in cursor.description),row)) if row else None
+        if old and old['target'] != target:
+            raise CaptureRefused('Saved URL belongs to a previous task target; inspect task lineage')
+        if old and old['artifact_id']:
+            db.commit()
+            reply=_capture_reply(db,task_id,old['artifact_id'],cached=True)
+            diagnostics.emit('cache.hit',name='http_capture',task_id=task_id,
+                             identifiers={'artifact_id':old['artifact_id']})
+            return reply
+        if old and str(old['error'] or '').startswith('capture_'):
+            raise CaptureRefused('Previous capture failed or is unfinished; inspect it before retrying')
+        if attempts_used(db,task_id) >= MAX_TOTAL:
+            raise CaptureRefused('Task HTTP request budget exhausted')
+        if not old and path.lower().endswith(('.js','.css')) and len(static_attempts(db,task_id)) >= MAX_STATIC_TOTAL:
+            raise CaptureRefused('Task static HTTP request budget exhausted')
+        assets=(('port',str(port)),('url',f'{scheme}://{hostname}:{port}{path}'))
+        for kind,key in assets:
+            decision=fact_state.may_probe_asset(db,task_id,kind,key,hypothesis_key,new_evidence_id,records,consume=False)
+            if not decision['allowed']:
+                raise CaptureRefused(decision['reason'])
+        for kind,key in assets:
+            fact_state.may_probe_asset(db,task_id,kind,key,hypothesis_key,new_evidence_id,records,consume=True)
+        if old:
+            claimed=db.execute('INSERT OR IGNORE INTO pm_http_capture_refresh VALUES(?,?,?)',
+                               (old['id'],json.dumps(old),now()))
+            if not claimed.rowcount:
+                raise CaptureRefused('A capture upgrade was already attempted; inspect saved evidence')
+            observation_id=old['id']
+            db.execute("UPDATE pm_http_discovery SET error='capture_running' WHERE id=?",(observation_id,))
+        else:
+            observation_id=db.execute('INSERT INTO pm_http_discovery '
+                '(task_id,target,port,scheme,hostname,path,error,created_at) '
+                "VALUES(?,?,?,?,?,?,'capture_running',?)",(task_id,target,port,scheme,hostname,path,now())).lastrowid
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    artifact_id=None
+    try:
+        raw=request_capture(task_id,target,scheme,hostname,port,path,limit_bytes=artifacts.response_limit(db,task_id))
+        artifact_id=artifacts.save(db,task_id,target,scheme,hostname,port,path,raw.capture,now())
+        parsed=analyze_http(raw,target,scheme,hostname,port,path,permitted_hosts(db,task_id,target),artifacts.MAX_BODY,'http_capture')
+        fields={key:parsed[key] for key in ('status','location','content_type','server','title')}
+        for column,key in (('links_json','links'),('forms_json','forms'),('assets_json','assets'),('meta_json','meta'),
+                           ('application_json','application'),('references_json','references'),('response_metrics_json','metrics')):
+            fields[column]=json.dumps(parsed[key],ensure_ascii=False)
+        fields.update(artifact_id=artifact_id,response_limited=int(parsed['limited']),parser_version=PARSER_VERSION,
+                      error=raw.probe_error,created_at=now())
+        with db:
+            db.execute('UPDATE pm_http_discovery SET '+','.join(key+'=?' for key in fields)+' WHERE id=?',
+                       (*fields.values(),observation_id))
+        return _capture_reply(db,task_id,artifact_id,cached=False)
+    except BaseException:
+        with db:
+            db.execute("UPDATE pm_http_discovery SET error='capture_failed',artifact_id=COALESCE(?,artifact_id) WHERE id=?",
+                       (artifact_id,observation_id))
+        raise
 
 
 def script_references(source, base, target, *, inline=False, diagnostics=None, allow_relative=True):

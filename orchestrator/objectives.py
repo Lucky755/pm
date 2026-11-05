@@ -219,7 +219,8 @@ def process_report(db, task_id, report, registry):
         key = claim['objective_key']
         result_id = str(claim.get('goal_evidence') or '')
         record = _record_for(task_id, result_id) if result_id and not result_id.startswith('http_artifact:') else None
-        valid = any(value in text and flag_evidence.reference_matches(db, task_id, result_id, proof, record)
+        valid = any(value in text and not flag_evidence.value_in_request(proof,value)
+                    and flag_evidence.reference_matches(db, task_id, result_id, proof, record)
                     for proof, text in witnesses)
         stored = db.execute('SELECT sources_json FROM pm_verified_flags WHERE task_id=? AND value=?',
                             (task_id, value)).fetchone()

@@ -173,7 +173,7 @@ def snapshot(db, task_id, expect):
                                                "WHERE task_id=? ORDER BY value", (task_id,)):
         sources = json.loads(raw_sources)
         candidate = {'value':value, 'status':status, **{key:sources.get(key,[]) for key in
-                     ('confirmation_reasons','verified_evidence','result_ids','evidence_errors')},
+                     ('confirmation_reasons','verified_evidence','result_ids','evidence_errors','rejected_evidence')},
                      'goal_claim_unverified':sources.get('goal_claim_unverified')}
         if status == 'candidate':
             flag_candidates.append(candidate)

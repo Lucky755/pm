@@ -103,10 +103,10 @@ CHARTERS = {
     'verify': (
         'Audit the other stages against raw capability output. Anything not backed '
         'by a captured tool result or PoC output is unverified and must be marked '
-        'so. Run at least one cheap decisive probe against the actual target in '
-        'this stage (for example ls, test -f or a repeated request), and put its '
-        'result_id in the top-level probe field. Do not confirm a finding unless '
-        'your probe reproduces it. Never accept agreement between reports as proof. '
+        'so. Prefer local integrity checks of saved captures; do not repeat a GET '
+        'just to corroborate the same bytes. Cite the original capture result_id '
+        'in the top-level probe field. If evidence is missing, perform one scoped '
+        'decisive probe. Never accept agreement between reports as proof. '
         'Check whether a captured flag actually satisfies the operator primary '
         'objective; include its objective_key and the decisive goal_evidence capture reference (http_artifact:ID or a typed capture result_id).'
     ),
@@ -1119,6 +1119,15 @@ def tool_manual(task_id, target):
 TARGET  = {target}   (the only reachable address)
 
 Tools (all of them act inside the task network namespace):
+  pm_http_capture(task_id, target, port, path, scheme="http", hostname="")
+      one bounded GET through NetGuard; saves original bytes, returns artifact_ref
+      and result_id. Use for a discovered HTTP file or /.git/objects/aa/<38 hex>.
+      No query, fragment, request body, custom headers or automatic redirects.
+      Repeated calls reuse the saved capture; failed/unfinished attempts need review.
+      Cite artifact_ref or result_id in goal_evidence. A flag copied into the URL
+      (including percent encoding) is request input, not discovered evidence.
+      HTTP/loose Git captures support local flag validation; arbitrary SSH/shell
+      or PoC stdout does not. Shell results need verifiable provenance or operator review.
   pm_net_exec(task_id, target, argv_json, timeout)   any installed Kali binary,
       argv_json is a JSON list, argv[0] an absolute path, no shell syntax:
       "[\"/usr/bin/nmap\",\"-sT\",\"-Pn\",\"-sV\",\"-p-\",\"{target}\"]"

@@ -168,6 +168,8 @@ def save(db, task_id, target, scheme, host, port, path, capture, stamp):
     # Only these headers may be persisted; no cookies/auth/location query.
     metadata['headers'] = {k:v for k,v in capture['headers'].items()
                           if k in ('content-type','content-length','content-encoding','server')}
+    # These are the actual fixed-GET parameters, not response/model annotations.
+    metadata['request'] = {'method':'GET','scheme':scheme,'hostname':host,'port':port,'path':path}
     with db:
         cursor = db.execute('INSERT INTO pm_http_artifacts '
             '(task_id,target,scheme,hostname,port,path,status_code,sha256,bytes_saved,complete,metadata_json,created_at) '

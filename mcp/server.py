@@ -1287,6 +1287,59 @@ def pm_net_exec(
 
 @mcp.tool()
 @diagnostics.tool
+def pm_http_capture(
+    task_id: int,
+    target: str,
+    port: int = 80,
+    path: str = "/",
+    scheme: str = "http",
+    hostname: str = "",
+    hypothesis_key: str = "",
+    new_evidence_id: str = "",
+) -> str:
+    """Save one bounded HTTP(S) GET as original evidence through NetGuard.
+
+    Exact authorized task target; only approved hostnames. No query, request
+    body, custom headers, redirects or shell. Returns artifact_ref and result_id.
+    A previously saved URL is read from the artifact store without another GET.
+    """
+    from contextlib import closing
+    from orchestrator import http_discovery as web
+    started=time.monotonic()
+    address=valid_ipv4(target)
+    phase='validation'
+    command=['http_capture','--task-id',str(task_id),'--target',str(target),
+             '--scheme',scheme,'--hostname',hostname or str(target),'--port',str(port),'--path',path]
+    try:
+        if not valid_task(task_id) or not address or not ASSET_DB.is_file():
+            raise web.CaptureRefused('Invalid task, target or missing task database')
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            # Permission validation precedes asset-recheck consumption and I/O.
+            if address != web.validate_scope(db,task_id):
+                raise web.CaptureRefused('Target differs from authorized task scope')
+            host=hostname or address
+            if scheme not in ('http','https') or host not in web.permitted_hosts(db,task_id,address):
+                raise web.CaptureRefused('HTTP hostname/scheme is outside approved scope')
+            path=web._safe_path(path)
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise web.CaptureRefused('Invalid TCP port')
+            phase='capture'
+            payload=web.capture_explicit(db,task_id,address,scheme,host,port,path,
+                hypothesis_key=hypothesis_key,new_evidence_id=new_evidence_id,
+                records=fact_state.capability_index(task_id,CAPABILITY_LOG / f'task_{task_id}.jsonl'))
+    except (web.CaptureRefused, ValueError) as exc:
+        # Input/scope refusals are separate from capture protocol/IO failures.
+        refused=phase=='validation' or isinstance(exc,web.CaptureRefused)
+        payload={'status':'blocked' if refused else 'error','kind':'policy' if refused else 'capture_protocol',
+                 'error':str(exc)[:240],'task_id':task_id,'target':target}
+    except (OSError,sqlite3.Error,subprocess.SubprocessError) as exc:
+        payload={'status':'error','kind':'broker','error':str(exc)[:240],'task_id':task_id,'target':target}
+    record_id=log_capability('http_capture',task_id,payload,time.monotonic()-started,command)
+    return tool_response(capability_digest(payload,record_id,'http_capture'))
+
+
+@mcp.tool()
+@diagnostics.tool
 def pm_research(task_id: int, target: str, host: str, path: str = "/") -> str:
     """Fetch CVE and exploit data from the fixed research allowlist.
 

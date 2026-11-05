@@ -349,7 +349,8 @@ def scan(task_id, patterns=None, db=None):
     def empty_entry():
         return {'raw': [], 'local_hits': [], 'claims': [], 'tools': set(),
                 'independent': set(), 'self_generated': [],
-                'source_unverified': [], 'matched_by': set(), 'verified_evidence': [], 'result_ids': set()}
+                'source_unverified': [], 'matched_by': set(), 'verified_evidence': [], 'result_ids': set(),
+                'rejected_evidence': []}
     for record in capability_records(task_id):
         for regex in regexes:
             for match in regex.finditer(record['text']):
@@ -386,6 +387,10 @@ def scan(task_id, patterns=None, db=None):
                 if not valid_flag_value(value, regex, target):
                     continue
                 entry = found.setdefault(value, empty_entry())
+                if flag_evidence.value_in_request(proof,value):
+                    entry['rejected_evidence'].append({'capture_ref':proof['capture_ref'],
+                                                       'reason':'flag_value_in_request'})
+                    continue
                 witness = {**proof, 'quote': text[max(0,match.start()-60):match.end()+60]}
                 if witness not in entry['verified_evidence']:
                     entry['verified_evidence'].append(witness)
@@ -454,11 +459,13 @@ def scan(task_id, patterns=None, db=None):
                 'verified_evidence': entry['verified_evidence'][:8],
                 'omitted_verified_evidence': max(0, len(entry['verified_evidence'])-8),
                 'result_ids': sorted(entry['result_ids']),
+                'rejected_evidence':entry['rejected_evidence'][:8],
                 'confirmation_reasons': ([] if status == 'confirmed' else ['no_verified_target_capture'] +
                     (['self_generated_output'] if entry['self_generated'] else []) +
                     (['local_output_without_capture_link'] if entry['local_hits'] else []) +
                     (['execution_output_is_not_a_capture'] if entry['raw'] else []) +
                     (['model_claim_is_not_proof'] if entry['claims'] else []) +
+                    (['flag_value_in_request'] if entry['rejected_evidence'] else []) +
                     (['source_changed_during_execution'] if entry['source_unverified'] else [])),
                 'evidence_errors':evidence_errors[:8],
             }
@@ -507,7 +514,7 @@ def scan(task_id, patterns=None, db=None):
                 'tools': sorted(entry['tools']),
                 'claims': sorted(set(entry['claims'])),
                 **{key: sources[key] for key in ('verified_evidence','omitted_verified_evidence',
-                                                'result_ids','confirmation_reasons','evidence_errors')},
+                                                'result_ids','confirmation_reasons','evidence_errors','rejected_evidence')},
             })
 
         # Drop stale rows: a value that no longer matches any capture (or any

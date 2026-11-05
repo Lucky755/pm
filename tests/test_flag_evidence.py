@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import quote
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -58,6 +59,39 @@ class FlagEvidenceTests(unittest.TestCase):
         self.capture(status=404)
         proof = self.registry()['confirmed'][0]['verified_evidence'][0]
         self.assertEqual(proof['status_code'],404)
+
+    def test_request_reflection_is_candidate_and_cannot_finish(self):
+        for path in ('/echo/'+self.value, '/echo/'+quote(self.value,safe=''),
+                     '/echo/'+quote(quote(self.value,safe=''),safe='')):
+            self.capture(path=path)
+        registry = self.registry()
+        self.assertEqual(registry['confirmed'], [])
+        self.assertIn('flag_value_in_request',registry['candidates'][0]['confirmation_reasons'])
+        result = self.case.run_mode([fixtures.decision()],expect_flags=1)
+        self.assertFalse(result['succeeded'])
+        self.assertNotEqual(result['stop_reason'],'flag_confirmed')
+
+    def test_reflection_does_not_revoke_a_genuine_witness(self):
+        good = self.capture()
+        reflected = self.capture(path='/echo/'+quote(self.value,safe=''))
+        registry = self.registry()
+        proof = registry['confirmed'][0]['verified_evidence']
+        self.assertEqual([p['capture_ref'] for p in proof],[f'http_artifact:{good}'])
+        with self.case.connect() as db:
+            objectives.save_objectives(db,11,'Capture the flag',exclusive=True)
+            report = {'flags':[{'value':self.value,'objective_key':'goal','goal_evidence':f'http_artifact:{reflected}'}]}
+            state = objectives.process_report(db,11,report,registry)
+            self.assertNotEqual(state['primary']['status'],'confirmed')
+            report['flags'][0]['goal_evidence']=f'http_artifact:{good}'
+            self.assertEqual(objectives.process_report(db,11,report,registry)['primary']['status'],'confirmed')
+
+    def test_path_reflection_with_literal_plus_is_not_discovery(self):
+        value='THM{known+reflected+value}'
+        path='/echo/'+quote(value,safe='+')
+        self.capture(body=value.encode(),path=path)
+        registry=self.registry()
+        self.assertEqual(registry['confirmed'],[])
+        self.assertIn('flag_value_in_request',registry['candidates'][0]['confirmation_reasons'])
 
     def test_model_claim_and_two_arbitrary_outputs_are_not_proof(self):
         self.case.report_extra = {'flags': [{'value': self.value}]}

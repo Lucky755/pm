@@ -747,6 +747,12 @@ def operation(function):
     def wrapped(*args, **kwargs):
         if not active():
             return function(*args, **kwargs)
+        # A registered MCP tool already owns the single executor action.
+        current = _action.get()
+        if current and current.kind == 'tool' and current.fields.get('source') == 'mcp':
+            value = function(*args, **kwargs)
+            _record_return(value)
+            return value
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         values = parameters(bound.arguments)

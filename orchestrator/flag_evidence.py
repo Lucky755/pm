@@ -8,11 +8,12 @@ import hashlib
 import re
 import sqlite3
 import zlib
+from urllib.parse import unquote, unquote_plus
 
 from orchestrator import http_artifacts as artifacts
 
 
-def collect(db, task_id):
+def collect(db, task_id, *, artifact_id=None):
     from executor.task_scope import check_action
     from orchestrator.network_workflow import load_task_target
     witnesses, errors = [], []
@@ -26,7 +27,8 @@ def collect(db, task_id):
     except (sqlite3.Error, ValueError):
         return [], [{'reason': 'capture_scope_unavailable'}]
     rows = db.execute('SELECT id,path,sha256,status_code,complete,scheme,hostname,port FROM pm_http_artifacts '
-                      'WHERE task_id=? AND target=? ORDER BY id', (task_id, target))
+                      'WHERE task_id=? AND target=? AND (? IS NULL OR id=?) ORDER BY id',
+                      (task_id, target, artifact_id, artifact_id))
     seen = {}
     for aid, path, capture_sha, status, complete, scheme, hostname, port in rows:
         if not complete or not 200 <= status < 600:
@@ -44,6 +46,7 @@ def collect(db, task_id):
         proof = {'kind': 'http_capture', 'task_id': task_id, 'target': target,
                  'capture_ref': ref, 'capture_refs':[ref], 'path': path, 'capture_sha256': capture_sha,
                  'scheme':scheme,'hostname':hostname,'port':port,'status_code':status}
+        proof['request'] = {'method':'GET','scheme':scheme,'hostname':hostname,'port':port,'path':path}
         if object_path:
             try:
                 decoder = zlib.decompressobj()
@@ -84,6 +87,30 @@ def collect(db, task_id):
         seen[key] = proof
         witnesses.append((proof, text))
     return witnesses, errors
+
+
+def value_in_request(proof, value):
+    """Reject values supplied by the requester, including nested URL encoding.
+
+    Capture proves received bytes, not discovery. Derive request data from the
+    capture's canonical DB fields; legacy captures need no metadata migration.
+    The tool accepts neither caller headers nor a request body.
+    """
+    request = proof['request']
+    text = '\n'.join(str(request[k]) for k in ('method','scheme','hostname','port','path'))
+    text += '\n' + proof['target']
+    pending, seen = [text], {text}
+    while pending:
+        current = pending.pop()
+        if value in current:
+            return True
+        # '+' is literal in URL paths; some applications apply form decoding.
+        # Check both fixed transformations, including nested percent escapes.
+        for decoded in (unquote(current), unquote_plus(current)):
+            if decoded not in seen:
+                seen.add(decoded)
+                pending.append(decoded)
+    return False
 
 
 def reference_matches(db, task_id, reference, proof, record=None):
