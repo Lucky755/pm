@@ -95,14 +95,20 @@ class ModelResult:
 
 
 def statistics(events):
-    stats={'input_tokens':0,'output_tokens':0,'cache_read_tokens':0,'peak_context_tokens':0}
-    for event in events:
-        if event.get('type')!='assistant/message':continue
-        usage=(event.get('data') or {}).get('usage') or {}
-        for source,destination in (('inputTokens','input_tokens'),('outputTokens','output_tokens'),('cacheReadTokens','cache_read_tokens')):
-            stats[destination]+=max(0,int(usage.get(source) or 0))
-        stats['peak_context_tokens']=max(stats['peak_context_tokens'],int(usage.get('totalTokens') or 0))
+    usages=[(event.get('data') or {}).get('usage') or {} for event in events if event.get('type')=='assistant/message']
+    stats={}
+    for source,destination in (('inputTokens','input_tokens'),('outputTokens','output_tokens'),
+                               ('cacheReadTokens','cache_read_tokens'),('totalTokens','peak_context_tokens')):
+        values=[u.get(source) for u in usages]
+        valid=bool(values) and all(type(v) in (int,float) and v>=0 for v in values)
+        stats[destination]=(max(values) if source=='totalTokens' else sum(values)) if valid else None
     return stats
+
+
+def combine_statistics(turns):
+    keys=('input_tokens','output_tokens','cache_read_tokens','peak_context_tokens')
+    return {k:(max(t[k] for t in turns) if k=='peak_context_tokens' else sum(t[k] for t in turns))
+            if turns and all(t.get(k) is not None for t in turns) else None for k in keys}
 
 
 class HarnessAdapter:
@@ -198,9 +204,14 @@ class AdapterSession:
         record={'request_id':request_id,'session_id':self.id,'mode':self.owner.mode,
                 'provider':self.owner.options['provider'],'model':self.owner.options['model'],
                 'status':'running','recovery_attempt':recovery_attempt,
+                'statistics':statistics([]),'prefix_cache':'unknown',
                 'prompt_sha256':hashlib.sha256(str(prompt).encode()).hexdigest(),
                 'run_id':(diagnostics.context() or {}).get('run_id')}
         record.update({key:(diagnostics.context() or {}).get(key) for key in ('task_id','role','iteration')})
+        stable=str(prompt).split('<pm_dynamic_context>',1)[0]
+        record.update(prompt_bytes=len(str(prompt).encode()),stable_prefix_sha256=hashlib.sha256(stable.encode()).hexdigest(),
+                      stable_prefix_bytes=len(stable.encode()),usage_source='SDK reported values; missing fields unknown',
+                      cache_attribution='unknown; a provider/SDK cache counter does not identify the cached PM prefix')
         try:save_record(record)
         except OSError as exc:raise HarnessCallError('audit_error',request_id,exc) from None
         diagnostics.emit('model.request_start',request_id=request_id,session_id=self.id,mode=self.owner.mode)
@@ -228,6 +239,8 @@ class AdapterSession:
             record.update(status='policy_violation' if violation else str(reason or 'unknown'),
                           finish_reason=reason,runtime_message_id=message_id,statistics=statistics(events),
                           duration_seconds=round(time.monotonic()-started,3))
+            cached=record['statistics']['cache_read_tokens']
+            record['prefix_cache']='hit_observed' if cached is not None and cached>0 else 'not_observed' if cached==0 else 'unknown'
             save_record(record,text,self.owner.key)
             return ModelResult(getattr(raw,'session_id',self.id),'' if violation else text,
                                'policy_violation' if violation else reason,events,notifications,record)

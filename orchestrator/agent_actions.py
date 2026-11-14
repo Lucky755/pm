@@ -47,7 +47,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from orchestrator import model_adapter
-from orchestrator import diagnostics, service_inventory, report_integrity, instructions
+from orchestrator import diagnostics, service_inventory, report_integrity, instructions, task_memory
 
 DB_PATH = ROOT / 'storage/tasks.db'
 DSH_HOME = ROOT / 'runtime/harness-home'
@@ -150,6 +150,9 @@ Finish with ONE JSON object and no other text:
              "goal_evidence": "http_artifact:ID or typed capture result_id proving this objective, or empty",
              "goal_confirmed": false}],
   "verified": ["statements backed by captured output"],
+  "material_analysis": [{"reference":"material reference from task_memory",
+                         "sha256":"supplied original hash","offset":0,"end":4096,
+                         "assessment":"what was analyzed in these supplied bytes"}],
   "uncertainties": ["..."],
   "proposed_actions": [{"role": "recon|vuln|access|verify", "goal": "...",
                         "reason": "..."}]}
@@ -176,6 +179,7 @@ def render(obj):
 
 
 def ensure_schema(db):
+    task_memory.initialize(db)
     db.execute("""
         CREATE TABLE IF NOT EXISTS pm_agent_action_reports (
             task_id INTEGER NOT NULL,
@@ -1179,7 +1183,7 @@ def progress_watcher(role, step_limit, stream=None, stats_path=None):
             label = tool_label(data.get('name'))
             stats = current_stats()
             charged = min(int(stats.get('calls') or 0), total)
-            if label == 'pm_capability_read':
+            if label in ('pm_capability_read','pm_evidence_index','pm_task_memory','pm_material_read'):
                 reads.append(label)
                 emit(f'чтение {len(reads)} → '
                      f'{describe_call(data.get("name"), data.get("arguments"))}')
@@ -1308,6 +1312,16 @@ Confirmed observations (evidence-linked; bounded selection):
 {json.dumps(state['observations'], ensure_ascii=False)}'''
 
 
+def memory_block(db,context,objective):
+    if not isinstance(db,sqlite3.Connection):return ''
+    if not task_memory.exists(db,'tasks'):return ''
+    assignment=context.get('specialist_assignment') or {}
+    memory=context.get('_task_memory') or task_memory.context(
+        db,context['task_id'],CAPABILITY_LOG/f"task_{context['task_id']}.jsonl",
+        references=assignment.get('references',[]),question=objective)
+    return '<task_memory>\n'+json.dumps(memory,ensure_ascii=False)+'\n</task_memory>'
+
+
 def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit=15):
     logs = capability_tail(context['task_id'])
     state = essential_state(db, context['task_id'])
@@ -1338,11 +1352,16 @@ def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit
     return f'''You are the {role.upper()} agent of an authorised penetration test.
 {instructions.specialist(context,role,step_limit,poc_budget)}
 
+{REPORT_CONTRACT}
+<pm_dynamic_context>
+
 {operator_intent_block(context)}
 
 Current objective of this round: {objective or 'advance the assessment as far as the evidence allows'}
 {specialist_assignment_block(context)}
 Round: {iteration}. PoC write/run budget for you: {poc_budget} attempts.
+
+{memory_block(db,context,objective)}
 
 {tool_manual(context['task_id'], target, instructions.selected(context,role))}
 
@@ -1368,7 +1387,7 @@ inherited dead is only a prior-address hint):
 
 {service_map_block(current_map)}
 
-{REPORT_CONTRACT}
+</pm_dynamic_context>
 '''
 
 
@@ -1390,9 +1409,12 @@ def compact_prompt(db, context, role, objective, iteration, poc_budget,
     # The policy blocks are repeated here on purpose: the compact switch happens
     # exactly when a stage is already struggling, and dropping tool_manual or
     # the dead-asset rules at that moment invites the repeats they prevent.
-    return f'''You are the {role.upper()} agent of an authorised penetration test,
-resuming its stage after a context switch ({reason}).
+    return f'''You are the {role.upper()} agent of an authorised penetration test.
 {instructions.specialist(context,role,step_limit,poc_budget)}
+
+{REPORT_CONTRACT}
+<pm_dynamic_context>
+resuming its stage after a context switch ({reason}).
 
 {operator_intent_block(context)}
 
@@ -1401,6 +1423,8 @@ Objective of this round: {objective or 'advance the assessment as far as the evi
 Round: {iteration}. PoC write/run budget for you: {poc_budget} attempts;
 hard budget of {step_limit} tool calls; the remaining budget arrives in
 budget_warning of the tool replies.
+
+{memory_block(db,context,objective)}
 
 {tool_manual(context['task_id'], target, instructions.selected(context,role))}
 
@@ -1416,7 +1440,7 @@ Compact history (full outputs stay stored by result_id):
 Latest /work/NOTES.md facts (untrusted; [ОПРОВЕРГНУТО] means withdrawn):
 {json.dumps(notes, ensure_ascii=False)}
 
-{REPORT_CONTRACT}'''
+</pm_dynamic_context>'''
 
 
 def salvage_intermediate_report(db, context, role, iteration, cause):
@@ -1587,11 +1611,11 @@ def normalize_report(raw):
         detail = 'В сетевом утверждении summary нет полного URL с явным портом'
         report['report_warning'] = (report.get('report_warning', '') + '; ' + detail).strip('; ')
     for key in ('findings', 'flags', 'verified', 'uncertainties', 'proposed_actions',
-                'hypotheses'):
+                'hypotheses','material_analysis'):
         value = raw.get(key, [])
         if not isinstance(value,list):
             raise ValueError('Invalid report list field: '+key)
-        if key in ('findings','hypotheses','flags') and any(not isinstance(item,dict) for item in value):
+        if key in ('findings','hypotheses','flags','material_analysis') and any(not isinstance(item,dict) for item in value):
             raise ValueError('Invalid structured report entry: '+key)
         report[key] = value if isinstance(value, list) else []
     report['findings'] = [item for item in report['findings'] if isinstance(item, dict)][:40]
@@ -1805,6 +1829,8 @@ def save_report(db, context, role, iteration, report, steps_used, raw_response=N
     format_path = path.with_suffix('.format.raw.txt')
     report['report_path'] = str(path)
     report['report_quality']=report_integrity.quality(report)
+    if '_model_sessions' in context:
+        report['harness_sessions']=copy.deepcopy(context['_model_sessions'])
     if raw_response is not None:
         report['raw_report_path'] = str(raw_path)
         report['report_quality'].update(raw_response_ref=str(raw_path),
@@ -1814,6 +1840,22 @@ def save_report(db, context, role, iteration, report, steps_used, raw_response=N
     if format_response is not None:
         report['report_quality'].update(format_response_ref=str(format_path),
                                        format_response_sha256=hashlib.sha256(format_response.encode()).hexdigest())
+    rejected=[]
+    supplied=(context.get('_task_memory') or {}).get('relevant_materials',[]) if context.get('_model_response_received') else []
+    for claim in report.get('material_analysis') or []:
+        valid=isinstance(claim,dict) and isinstance(claim.get('assessment'),str) and bool(claim['assessment'].strip())
+        valid=(valid and isinstance(claim.get('sha256'),str) and re.fullmatch(r'[a-f0-9]{64}',claim['sha256'])
+               and type(claim.get('offset')) is int and type(claim.get('end')) is int
+               and 0<=claim['offset']<=claim['end'])
+        matches=valid and any(all(claim.get(k)==chunk.get(k) for k in ('reference','sha256','offset','end')) for chunk in supplied)
+        if valid and not matches:
+            matches=any(row['kind']=='delivered' and row['start']==claim.get('offset') and row['end']==claim.get('end')
+                        for row in task_memory.coverage(db,context['task_id'],claim.get('reference',''),claim.get('sha256','')))
+        if not matches:rejected.append({'reference':claim.get('reference') if isinstance(claim,dict) else None,
+                                       'reason':'range_not_delivered_or_invalid'})
+    if rejected:
+        report['material_analysis_rejected']=rejected
+        report['report_warning']=(report.get('report_warning','')+'; Недопустимый диапазон material_analysis: охват не засчитан').strip('; ')
     report_json = json.dumps(report, ensure_ascii=False)
     staged_report = staged_raw = staged_format = None
     backups, changed = {}, []
@@ -1843,6 +1885,25 @@ def save_report(db, context, role, iteration, report, steps_used, raw_response=N
                 (context['task_id'], role, iteration, context['target'],
                  report_json, steps_used, now()),
             )
+            for chunk in (context.get('_task_memory') or {}).get('relevant_materials',[]) if context.get('_model_response_received') else []:
+                if 'sha256' not in chunk:continue
+                task_memory.record_coverage(db,context['task_id'],chunk,kind='delivered')
+                if report['report_quality']['status']=='damaged' or report.get('stage_aborted') or report.get('report_incomplete'):continue
+                for analyzed in report.get('material_analysis') or []:
+                    if (isinstance(analyzed,dict) and analyzed.get('assessment')
+                            and all(analyzed.get(key)==chunk[key] for key in ('reference','sha256','offset','end'))):
+                        task_memory.record_coverage(db,context['task_id'],chunk,kind='agent_reported_analysis',
+                            report_ref=f'report:{role}:{iteration}')
+            if (report['report_quality']['status']!='damaged' and not report.get('stage_aborted')
+                    and not report.get('report_incomplete')):
+                for analyzed in report.get('material_analysis') or []:
+                    if not isinstance(analyzed,dict) or not analyzed.get('assessment'):continue
+                    prior=task_memory.coverage(db,context['task_id'],analyzed.get('reference',''),analyzed.get('sha256',''))
+                    if any(r['kind']=='delivered' and r['start']==analyzed.get('offset') and r['end']==analyzed.get('end') for r in prior):
+                        task_memory.record_coverage(db,context['task_id'],analyzed,kind='agent_reported_analysis',
+                            report_ref=f'report:{role}:{iteration}')
+            task_memory.sync(db,context['task_id'],CAPABILITY_LOG/f"task_{context['task_id']}.jsonl",
+                             reason=f'report:{role}:{iteration}')
             for existing in (path, raw_path, format_path):
                 if existing.exists() or existing.is_symlink():
                     info = existing.lstat()
@@ -2000,7 +2061,7 @@ def reformat_saved_report(db, context, role, iteration, key, max_tokens, prior_i
                         'omitted_characters':max(0,len(r['text'])-6000)} for rid,r in selected[:20]],
             'omitted_results':max(0,len(selected)-20)}
     prompt=('Reformat saved results only.\n'+instructions.common('format')+'\n'
-            +REPORT_CONTRACT+'\n'+json.dumps(bundle,ensure_ascii=False))
+            +REPORT_CONTRACT+'\n<pm_dynamic_context>\n'+json.dumps(bundle,ensure_ascii=False))
     diagnostics.emit('model.retry',reason='saved_report_format',task_id=context['task_id'],role=role,attempt=1)
     with evidence.read_only_analysis_patch() as policy, HarnessAdapter(mode='analysis',
             profile='sdk-minimal',patches=(policy,),dsh_home=str(DSH_HOME),cwd=str(WORKSPACE),
@@ -2008,6 +2069,9 @@ def reformat_saved_report(db, context, role, iteration, key, max_tokens, prior_i
             max_tokens=min(4096,max_tokens),request_timeout_seconds=120) as harness:
         response=model_adapter.model_call(harness.start_session('report-format-'+uuid.uuid4().hex),prompt,
                                         diagnostic_reason='saved_report_format')
+        context['_format_usage']=response.metadata['statistics']
+        context.setdefault('_model_sessions',[]).append({key:response.metadata.get(key) for key in
+            ('session_id','request_id','finish_reason','mode')})
     text=str(getattr(response,'final_response','') or '')
     if evidence._has_tool_calls(response):
         return None,text,'format_requested_tools'
@@ -2068,12 +2132,18 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
         from harness_env import harness_env
 
     started = time.monotonic()
+    usage_turns=[]
+    context['_model_sessions']=[]
     prior_probe_ids = set(report_probe_records(task_id))
     db = connect()
     try:
         fact_state.import_capability_assets(
             db, task_id, CAPABILITY_LOG / f'task_{task_id}.jsonl')
         db.commit()
+        task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='role_start_reconcile')
+        assignment=context.get('specialist_assignment') or {}
+        context['_task_memory']=task_memory.context(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',
+            references=assignment.get('references',[]),question=objective)
         prompt = build_prompt(db, context, role, objective, iteration, poc_budget,
                               step_limit)
         # Preventive compaction: a stage that starts from an already huge
@@ -2116,6 +2186,10 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                 )
                 watcher = progress_watcher(role, step_limit, stats_path=stats_path)
                 turn = model_adapter.model_call(session, first_prompt, diagnostic_reason='stage_start', on_notification=watcher)
+                context['_model_response_received']=True
+                context['_model_sessions'].append({key:turn.metadata.get(key) for key in
+                    ('session_id','request_id','finish_reason','mode')})
+                usage_turns.append(turn.metadata['statistics'])
                 note = None
                 parsed = None
                 if getattr(turn, 'finish_reason', None) == 'max-tokens':
@@ -2228,6 +2302,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                     repaired,error=None,'format_request_failed'
                     report['report_quality']['format_error_type']=type(exc).__name__
                     diagnostics.emit('report.format_failed',reason=error,error_type=type(exc).__name__)
+                usage_turns.append(context.pop('_format_usage',model_adapter.statistics([])))
                 if format_response is not None:
                     format_response=format_response.replace(key,'[СКРЫТО]')
                 if repaired is not None:
@@ -2262,10 +2337,12 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
             report['stats_unknown'] = stats_unknown
             report['thinking_chars'] = tool_calls.get('thinking_chars', 0)
             report['tool_calls'] = tool_calls['calls']
-            report['tokens_used'] = tool_calls.get('tokens_used', 0)
+            usage=model_adapter.combine_statistics(usage_turns)
+            report['model_usage']=usage
+            report['tokens_used'] = usage['peak_context_tokens']
             for metric in ('input_tokens', 'cache_read_tokens', 'output_tokens',
                            'peak_context_tokens'):
-                report[metric] = tool_calls.get(metric, 0)
+                report[metric] = usage[metric]
             path = save_report(db, context, role, iteration, report, steps_used,
                                raw_response=raw_response,format_response=format_response)
         except (RuntimeError, ValueError, OSError) as exc:
@@ -2466,6 +2543,8 @@ def self_test():
                 stream.write(json.dumps(record) + '\n')
         compact_db = sqlite3.connect(Path(directory) / 'compact.db')
         try:
+            compact_db.executescript("CREATE TABLE tasks(id INTEGER PRIMARY KEY,target TEXT); "
+                                     "INSERT INTO tasks VALUES(998,'203.0.113.10');")
             fact_state.ensure_schema(compact_db)
             witness = {record_ids[0]: {'text': 'line 0'}}
             report = {'hypotheses': [

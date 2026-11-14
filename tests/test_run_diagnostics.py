@@ -244,6 +244,7 @@ for line in sys.stdin:
         self.addCleanup(db.close)
         actions.ensure_schema(db)
         fact_state.ensure_schema(db)
+        db.executescript("CREATE TABLE tasks(id INTEGER PRIMARY KEY,target TEXT); INSERT INTO tasks VALUES(11,'203.0.113.10');")
         report = {'summary': 'done', 'hypotheses': [{'claim': 'observed /health',
                   'kind': 'observation', 'result': 'confirmed', 'probe_result_id': 'a' * 24,
                   'quote': 'SECRET raw quote'}]}

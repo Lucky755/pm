@@ -14,7 +14,7 @@ import re
 import sqlite3
 import uuid
 
-from orchestrator import model_adapter, instructions
+from orchestrator import model_adapter, instructions, task_memory
 from orchestrator import agent_actions as actions, attack_loop, diagnostics, flag_verify, objectives
 from orchestrator import evidence_pipeline as evidence
 from orchestrator import coordinator_checkpoints as checkpoints
@@ -148,7 +148,7 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
     services = [{**{k:entry[k] for k in ('target','protocol','port','state')},
                  'identifications':semantic_set({k:v for k,v in item.items() if k!='source'}
                                                 for item in entry['identifications'])}
-                for entry in mapped['entries']]
+                for entry in actions.service_inventory.collect_full(db,task_id)['entries']]
     return {'version':2,'intent':context['intent'],'target':context['target'],
             'goals':[{k:g.get(k) for k in ('key','title','role','weight','status')} for g in goals['objectives']],
             'goal_policy':{k:goals.get(k) for k in ('mode','exclusive','expected_flags')},
@@ -164,12 +164,12 @@ def snapshot(db, task_id, expect):
     mapped = actions.service_map(db, task_id, int(row[0]))
     essential = actions.essential_state(db, task_id)
     goals = objectives.objective_status(db, task_id)
-    facts = actions.fact_state.list_hypotheses(db, task_id, limit=200)
-    assets = actions.fact_state.list_assets(db, task_id, limit=80)
+    facts = task_memory.rows(db,'pm_hypotheses',task_id)
+    assets = task_memory.rows(db,'pm_assets',task_id)
     results = actions.stage_results(task_id,include_metadata=True)
     reports = [dict(zip(('role','iteration'), r)) for r in db.execute(
         'SELECT role,iteration FROM pm_agent_action_reports WHERE task_id=? '
-        'ORDER BY iteration DESC,role LIMIT 12', (task_id,))]
+        'AND target=? ORDER BY iteration DESC,role', (task_id,context['target']))]
     confirmed = [r[0] for r in db.execute(
         "SELECT value FROM pm_verified_flags WHERE task_id=? AND status='confirmed' ORDER BY value", (task_id,))]
     flag_candidates = []
@@ -193,7 +193,7 @@ def snapshot(db, task_id, expect):
     refs[scope_ref]={'task_id':task_id,'target':context['target'],'intent_ref':'intent'}
     for item in goals['objectives']:
         refs['objective:' + item['key']] = {'kind': 'objective', 'key': item['key'], 'status': item['status']}
-    for item in mapped['entries']:
+    for item in actions.service_inventory.collect_full(db,task_id)['entries']:
         refs[f"service:{context['target']}:{item['protocol']}:{item['port']}"] = item
         for source in item['sources']:
             if source['table'] == 'network_observations':
@@ -209,19 +209,19 @@ def snapshot(db, task_id, expect):
         refs[f"report:{item['role']}:{item['iteration']}"] = item
     recent = results[-20:]
     for item in results:
-        if item not in recent and item['result_id'] not in flag_result_ids:
-            continue
         if isinstance(item['result_id'], str) and item['result_id']:
             refs['result:' + item['result_id']] = {
                 **{k:item[k] for k in ('result_id','tool','status','provenance','exit_code')},
-                'excerpt_untrusted':actions.clip_result(item['text'],max_chars=1200),
+                'excerpt_untrusted':actions.clip_result(item['text'],max_chars=600) if item in recent else '',
                 'text_sha256':digest(item['text'])}
     for item in mapped['hints']:
         refs['hint:' + digest(item)] = item
     stop = attack_loop.objective_stop_reason(goals, len(confirmed), expect)
     success = stop in ('flag_confirmed','goal_confirmed','objectives_done')
     knowledge = knowledge_state(db,task_id,context,mapped,essential,goals,results,confirmed)
-    return {'task': context, 'objectives': goals, 'service_map': mapped, 'essential_state': essential,
+    memory=task_memory.context(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
+    for ref,value in memory['material_index'].items():refs.setdefault(ref,value)
+    return {'task': context, 'objectives': goals, 'service_map': mapped, 'essential_state': essential,'task_memory':memory,
             'open_hypotheses': [f for f in facts if f['status']=='untested'],
             'refutations': [f for f in facts if f['status']=='refuted' and f['probe_result_id'] and f['quote']],
             'recent_results': [{**{k:r[k] for k in ('result_id','tool','status')},
@@ -346,6 +346,7 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             '"question":"one concrete check","reason":"brief justification",'
             '"references":["intent"],"expected_result":"observable evidence expected",'
             '"stop_kind":"success|incomplete for stop, otherwise null"}.\n'
+            + '<pm_dynamic_context>\n'
             + ('Previous response rejected: ' + error + '.\n' if error else '')
             + encoded(data))
 
@@ -380,6 +381,8 @@ def update_step(db, step_id, status, **fields):
     with db:
         db.execute('UPDATE pm_coordinator_steps SET ' + ','.join(key+'=?' for key in values) + ' WHERE id=?',
                    (*values.values(), step_id))
+        tid=db.execute('SELECT task_id FROM pm_coordinator_steps WHERE id=?',(step_id,)).fetchone()[0]
+        task_memory.sync(db,tid,actions.CAPABILITY_LOG/f'task_{tid}.jsonl',reason='coordinator_step:'+status)
     diagnostics.emit('state.change', table='pm_coordinator_steps', identifiers={'id':step_id}, status=status)
 
 
@@ -397,6 +400,7 @@ def insert_step(db, run_id, task_id, decision, state, budgets, status='planned',
              budgets_json,error,created_at,updated_at,knowledge_before_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (run_id,task_id,step_no,status,encoded(decision),state['state_sha256'],key,iteration,
              encoded(budgets),error,now(),now(),state['knowledge_sha256']))
+        task_memory.sync(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='coordinator_intent:'+status)
     return cursor.lastrowid
 
 
@@ -545,6 +549,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 if (report_integrity.quality(saved_report)['status']!='damaged'
                         and not saved_report.get('stage_aborted') and not saved_report.get('report_incomplete')):
                     objectives.process_report(db,task_id,saved_report,registry)
+            task_memory.sync(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='coordinator_resume_reconcile')
             state = snapshot(db,task_id,expect_flags)
             with db:
                 db.execute('INSERT OR IGNORE INTO pm_coordinator_runs(task_id,target,status,created_at,updated_at) '

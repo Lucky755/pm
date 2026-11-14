@@ -101,11 +101,16 @@ class CaptureMCPTests(unittest.TestCase):
         self.assertEqual([t['name'] for t in tools],['pm_http_capture'])
 
     def test_registered_capture_cache_and_readback_do_not_repeat_request(self):
-        first=self.call();second=self.call()
+        first=self.call()
+        with self.case.connect() as db:before=c.snapshot(db,11,1)['knowledge_sha256']
+        second=self.call()
+        with self.case.connect() as db:self.assertEqual(before,c.snapshot(db,11,1)['knowledge_sha256'])
         self.assertEqual(first['artifact_id'],second['artifact_id'])
         self.assertTrue(second['cached'])
         asyncio.run(server.mcp.call_tool('pm_capability_read',{'task_id':11,'result_id':first['result_id']}))
         self.assertEqual(len(self.calls),1)
+        records=[json.loads(line) for line in (a.CAPABILITY_LOG/'task_11.jsonl').read_text().splitlines()]
+        self.assertEqual([r['provenance'] for r in records],['network','local'])
         with self.case.connect() as db:
             reg=flag_verify.scan(11,db=db)
             self.assertEqual(len(reg['confirmed'][0]['verified_evidence']),1)

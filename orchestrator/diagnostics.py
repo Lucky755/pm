@@ -506,8 +506,9 @@ class Observer:
                      duration_seconds=round(time.monotonic() - self.request_started, 3))
                 self.request_id = None
             usage = data.get('usage') or {}
-            emit('model.usage', input_tokens=usage.get('inputTokens', 0),
-                 cache_read_tokens=usage.get('cacheReadTokens', 0), output_tokens=usage.get('outputTokens', 0))
+            emit('model.usage', input_tokens=usage.get('inputTokens'),
+                 cache_read_tokens=usage.get('cacheReadTokens'), output_tokens=usage.get('outputTokens'),
+                 reason='usage_partially_unknown' if any(k not in usage for k in ('inputTokens','cacheReadTokens','outputTokens')) else 'sdk_usage')
         elif kind == 'tool/call':
             name = data.get('name', 'tool').split('__')[-1]
             dispatch_id = uuid.uuid4().hex

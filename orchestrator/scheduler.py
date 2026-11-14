@@ -12,7 +12,7 @@ except ModuleNotFoundError:
 
 
 
-from orchestrator import instructions
+from orchestrator import instructions, task_memory
 ROLES={role:instructions.role_text(role) for role in instructions.ROLES}
 AGENT_SYSTEM=instructions.common('analysis')+"""
 This is a PLANNING-ONLY evaluation. Use supplied evidence to identify gaps
@@ -116,7 +116,7 @@ def set_run(db, task_id, index, agent, status, output=None):
     db.commit()
 
 
-def ask_agent(api_key, agent, instruction, evidence, target):
+def ask_agent(api_key, agent, instruction, evidence, target, *, memory_view=None):
     messages = [
         {
             "role": "system",
@@ -124,11 +124,12 @@ def ask_agent(api_key, agent, instruction, evidence, target):
         },
         {
             "role": "user",
-            "content": json.dumps({
+            "content": '<pm_dynamic_context>\n'+json.dumps({
 		"authorized_target": target,
                 "assigned_task": instruction,
                 "previous_results": evidence,
-                "execution_mode": "planning_only"
+                "execution_mode": "planning_only",
+                "task_memory":memory_view
             }, ensure_ascii=False)
         }
     ]
@@ -204,7 +205,7 @@ def run_scheduler(db, task_id, api_key):
             set_run(db, task_id, index, agent, "running")
 
             output = ask_agent(
-                api_key, agent, step["instruction"], evidence, target
+                api_key, agent, step["instruction"], evidence, target,memory_view=task_memory.analysis_context(db,task_id)
             )
 
             set_run(db, task_id, index, agent, "completed", output)

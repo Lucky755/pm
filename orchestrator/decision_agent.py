@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from orchestrator import model_adapter, instructions
+from orchestrator import model_adapter, instructions, task_memory
 from orchestrator import diagnostics
 PYTHON = ROOT / '.venv/bin/python'
 MAX_CHOICES = 3
@@ -171,6 +171,7 @@ def decision_prompt(bundle, candidates):
         'target': bundle['authorized_target'],
         'candidates': candidates,
         'operator_task': bundle.get('operator_task'),
+        'task_memory':bundle.get('task_memory'),
         'network_observations': bundle.get('network_observations', []),
         'web_observations': bundle.get('web_observations', []),
         'agent_reports': bundle.get('agent_reports', {}),
@@ -187,7 +188,7 @@ def decision_prompt(bundle, candidates):
     return (instructions.common("analysis")+"\nYou are a read-only planning agent for a manually initiated authorized lab task. "
             "Pick at most three useful checks from existing IDs only. "
             "Return ONLY valid JSON: {\"select\":[\"c1\"]} or {\"select\":[]}. "
-            "Do not call tools.\n" + json.dumps(summary, ensure_ascii=False))
+            "Do not call tools.\n<pm_dynamic_context>\n" + json.dumps(summary, ensure_ascii=False))
 
 
 def choose_with_model(bundle, candidates):
@@ -354,7 +355,7 @@ def plan(db, task_id):
                 'selected': json.loads(cached[0]), 'new_plans': [], 'api_called': False,
                 'diagnostics': details}
     candidates = candidates_from_evidence(db, task_id, bundle)
-    selections = choose_with_model(bundle, candidates) if candidates else []
+    selections = choose_with_model({**bundle,'task_memory':task_memory.analysis_context(db,task_id)}, candidates) if candidates else []
     selected = [next(x for x in candidates if x['id'] == ref) for ref in selections]
     # Validate every command through existing executor planning before DB writes.
     commands = [executor_plan(task_id, candidate) for candidate in selected]

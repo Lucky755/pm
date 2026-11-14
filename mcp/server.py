@@ -23,6 +23,9 @@ import subprocess
 import stat
 import sys
 import time
+from contextlib import closing
+from functools import wraps
+from contextvars import ContextVar
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -35,11 +38,12 @@ sys.path.insert(0, str(ROOT))
 
 from executor.tool_catalog import detect_tools
 from executor.tool_executor_v3 import PROFILES
-from orchestrator import fact_state, diagnostics
+from orchestrator import fact_state, diagnostics, task_memory
 
 
 mcp = FastMCP("pentest-master")
 ASSET_DB = ROOT / 'storage/tasks.db'
+_memory_operation_id=ContextVar('pm_memory_operation_id',default=None)
 
 
 def guard_explicit_assets(task_id, assets, hypothesis_key='', new_evidence_id=''):
@@ -725,6 +729,7 @@ def valid_ipv4(text):
 
 def capability_provenance(tool, payload, command):
     """Classify the source when writing the record, before argv is truncated."""
+    if payload.get('cached') is True:return 'local'
     if tool == 'poc_run':
         return ('network' if payload.get('network_isolated') and
                 payload.get('network_contact') else 'local')
@@ -740,6 +745,9 @@ def capability_provenance(tool, payload, command):
                     'ls', 'unzip', 'tar', '7z', 'strings'):
                 return 'local'
         return 'network'
+    if tool=='session' and '--action' in command:
+        action=list(command)[list(command).index('--action')+1]
+        if action in ('read','list'):return 'local'
     if tool in ('session', 'network_probe', 'http_get', 'http_headers',
                 'http_path', 'http_document', 'http_capture'):
         return 'network'
@@ -778,6 +786,7 @@ def log_capability(tool, task_id, payload, elapsed, command=()):
             "result": payload,
             "provenance": capability_provenance(tool, payload, full_argv),
         }
+        if _memory_operation_id.get():record['memory_operation_id']=_memory_operation_id.get()
         record["input_flag_literals"] = sorted(set(re.findall(
             r"\b[A-Z][A-Z0-9_]{1,19}\{[A-Za-z0-9_!@#$%^&*+.:-]{3,120}\}",
             " ".join(full_argv)
@@ -901,6 +910,96 @@ def parse_tool_response(value):
     return json.loads(value)
 
 
+def track_memory_operation(function):
+    @wraps(function)
+    def tracked(command,timeout,tool='capability',task_id=None):
+        # Test/alternate logs must never cause writes to a different task DB.
+        if not ASSET_DB.is_file() or CAPABILITY_LOG.parent!=ASSET_DB.parent:
+            return function(command,timeout,tool,task_id)
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            if not task_memory.exists(db,'tasks'):
+                return function(command,timeout,tool,task_id)
+            row=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()
+            if not row:return function(command,timeout,tool,task_id)
+            description=task_memory.canonical_operation(tool,command,row[0],capability_provenance(tool,{},command))
+            task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='execution_reconcile')
+            conditions={'target':row[0], 'access':[
+                [r.get('level'),r.get('signal')] for r in task_memory.rows(db,'pm_access_state',task_id)]}
+            from orchestrator import service_inventory
+            services=service_inventory.collect_full(db,task_id)['entries']
+            conditions['services']=[{
+                **{k:entry[k] for k in ('protocol','port','state','identification_conflict','identification_uncertain')},
+                'identifications':[{k:v for k,v in identity.items() if k!='source'} for identity in entry['identifications']]}
+                for entry in services if not description['ports'] or entry['port'] in description['ports']]
+            if tool=='poc_run' and '--poc-file' in command:
+                poc=Path(command[list(command).index('--poc-file')+1])
+                allowed=(POC_ROOT/f'task_{task_id}').resolve()
+                if (poc.resolve().is_relative_to(allowed) and poc.is_file() and not poc.is_symlink()
+                        and poc.stat().st_size<=POC_MAX_BYTES):
+                    conditions['poc_source_sha256']=hashlib.sha256(poc.read_bytes()).hexdigest()
+            fresh=False
+            if task_memory.exists(db,'pm_memory_operations'):
+                previous=db.execute('SELECT created_at FROM pm_memory_operations WHERE task_id=? AND signature=? '
+                                    'ORDER BY rowid DESC LIMIT 1',(task_id,description['signature'])).fetchone()
+                if previous:
+                    from orchestrator import service_inventory
+                    from datetime import datetime,timezone
+                    stamp=service_inventory.timestamp(previous[0])
+                    fresh=bool(stamp and (datetime.now(timezone.utc)-stamp).total_seconds()>service_inventory.age_minutes()*60)
+                    if tool not in ('network_probe','http_get','http_headers','http_path','http_document'):
+                        inner=description['parameters'].get('argv') or []
+                        executable=Path(str(inner[0])).name if inner else ''
+                        fresh=fresh and executable in ('nmap','curl') and not any(
+                            str(arg) in ('-d','--data','--data-raw','--data-binary','-F','--form','-X','--request') for arg in inner)
+            with task_memory.atomic(db):
+                intent=task_memory.begin_operation(db,task_id,description,conditions=conditions,
+                    require_fresh=fresh,reason='saved freshness policy expired' if fresh else '')
+                if intent['allowed']:
+                    task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='operation_intent')
+            if not intent['allowed']:
+                payload={'status':'blocked','kind':'repeat_guard','execution_started':False,**intent}
+                log_capability('check_guard',task_id,payload,0,command)
+                return tool_response(payload)
+            oid=intent['operation_id']
+            with task_memory.atomic(db):
+                task_memory.transition(db,task_id,oid,'dispatching',expected_phase='intent')
+                task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='operation_dispatching')
+            try:
+                token=_memory_operation_id.set(oid)
+                try:reply=function(command,timeout,tool,task_id)
+                finally:_memory_operation_id.reset(token)
+            except BaseException:
+                try:
+                    with task_memory.atomic(db):
+                        task_memory.transition(db,task_id,oid,'unknown',expected_phase='dispatching',outcome='exception_or_interrupt')
+                        task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='operation_unknown')
+                except Exception as failure:
+                    diagnostics.emit('memory.update_failed',task_id=task_id,reason='original_exception_retained',
+                                     error_type=type(failure).__name__,identifiers={'operation_id':oid})
+                    print('[MEMORY-ERROR] '+type(failure).__name__+'; original operation error retained',file=sys.stderr,flush=True)
+                raise
+            payload=json.loads(reply)
+            outcome=payload.get('status','unknown')
+            not_started=payload.get('execution_started') is False
+            if not_started:outcome=payload.get('error_type') or outcome
+            if payload.get('exit_code') not in (None,0) and outcome=='completed':outcome='nonzero_exit'
+            phase='cancelled' if not_started else 'unknown' if outcome in ('timeout','unknown') else 'finished'
+            try:
+                with task_memory.atomic(db):
+                    if not not_started:
+                        task_memory.transition(db,task_id,oid,'started',expected_phase='dispatching')
+                    task_memory.transition(db,task_id,oid,phase,expected_phase='dispatching' if not_started else 'started',outcome=outcome,result_id=payload.get('result_id'))
+                    task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='operation_'+phase)
+            except (sqlite3.Error,task_memory.VersionConflict) as exc:
+                print('[MEMORY-ERROR] '+type(exc).__name__+'; completed evidence retained',file=sys.stderr,flush=True)
+                diagnostics.emit('memory.update_failed',task_id=task_id,reason='completed_evidence_retained',
+                                 identifiers={'operation_id':oid},error_type=type(exc).__name__)
+                return tool_response({**payload,'memory_warning':'state_commit_failed_evidence_preserved'})
+            return reply
+    return tracked
+
+
+@track_memory_operation
 def run_capability(command, timeout, tool="capability", task_id=None):
     """Run a capability helper and return its own JSON payload verbatim."""
     started = time.monotonic()
@@ -943,6 +1042,7 @@ def run_capability(command, timeout, tool="capability", task_id=None):
             "kind": "broker",
             "error_type": "executor_unavailable" if isinstance(exc,FileNotFoundError) else "launch_error",
             "error": str(exc),
+            "execution_started": False,
         }
         log_capability(tool, task_id, payload, time.monotonic() - started, command)
         return tool_response(payload)
@@ -997,6 +1097,58 @@ def pm_evidence_index(task_id: int, offset: int = -1, limit: int = 40) -> str:
         task_id, CAPABILITY_LOG / f'task_{task_id}.jsonl',
         None if offset == -1 else offset, limit)
     return tool_response({'status': 'completed', **data})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_task_memory(task_id:int,section:str='resources',offset:int=0,limit:int=20,version:int=-1)->str:
+    """Page complete task state/history; a local read creates no network observation."""
+    expected=os.environ.get('PM_TASK_ID','')
+    if expected and expected!=str(task_id):
+        return tool_response({'status':'blocked','error':'Memory task differs from active SDK task'})
+    if (not valid_task(task_id) or section not in (*task_memory.SECTIONS,'history')
+            or type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=40
+            or type(version) is not int or version < -1):
+        return tool_response({'status':'blocked','error':'Invalid memory page'})
+    try:
+        with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True,timeout=10)) as db,task_memory.atomic(db):
+            head=task_memory.current(db,task_id,None if version==-1 else version)
+            if section=='history':
+                values=[]
+                if task_memory.exists(db,'pm_memory_revisions'):
+                    values=[{'version':r[0],'reason':r[1],'actor':r[2],'sha256':r[3]} for r in db.execute(
+                        'SELECT version,reason,actor,sha256 FROM pm_memory_revisions WHERE task_id=? ORDER BY version',(task_id,))]
+            else:
+                state=task_memory.source_state(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl') if version==-1 else head['state']
+                for key,value in head['state'][section].items():
+                    if not value.get('source_owned'):state[section][key]=value
+                values=[{'reference':key,'value':value} for key,value in sorted(state[section].items())]
+            part=values[offset:offset+limit]
+            return tool_response({'status':'completed','task_id':task_id,'version':head['version'],
+                'section':section,'items':part,'total':len(values),'next_offset':offset+len(part) if offset+len(part)<len(values) else None,
+                'provenance':'local_read'})
+    except (sqlite3.Error,ValueError,OSError) as exc:
+        return tool_response({'status':'blocked','error_type':type(exc).__name__})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_material_read(task_id:int,reference:str,offset:int=0,limit:int=4096,sha256:str='')->str:
+    """Read one verified original byte range with coverage metadata; never a GET."""
+    expected=os.environ.get('PM_TASK_ID','')
+    if expected and expected!=str(task_id):
+        return tool_response({'status':'blocked','error':'Memory task differs from active SDK task'})
+    if not valid_task(task_id):return tool_response({'status':'blocked','error':'Invalid task'})
+    try:
+        with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True,timeout=10)) as db,task_memory.atomic(db):
+            chunk=task_memory.read_chunk(db,task_id,reference,CAPABILITY_LOG/f'task_{task_id}.jsonl',
+                offset=offset,limit=limit,sha256=sha256 or None)
+        # Delivery is separate from claimed analysis and from evidence status.
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db,db:
+            task_memory.record_coverage(db,task_id,chunk,kind='delivered')
+        return tool_response({'status':'completed','provenance':'local_read',**chunk})
+    except (sqlite3.Error,ValueError,OSError) as exc:
+        return tool_response({'status':'blocked','error_type':type(exc).__name__})
 
 
 @mcp.tool()

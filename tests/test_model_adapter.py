@@ -60,7 +60,7 @@ class AdapterTests(unittest.TestCase):
                                                          'cacheReadTokens':4,'totalTokens':19}}},
                 {'type':'assistant/message','data':{'usage':{'inputTokens':1,'outputTokens':2,'totalTokens':22}}}]
         self.assertEqual(m.statistics(events),{'input_tokens':13,'output_tokens':5,
-                        'cache_read_tokens':4,'peak_context_tokens':22})
+                        'cache_read_tokens':None,'peak_context_tokens':22})
 
     def test_original_transport_exception_is_retained_without_secrets_in_message(self):
         owner=SimpleNamespace(mode='analysis',options={'provider':'test','model':'test'},

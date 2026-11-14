@@ -24,6 +24,11 @@ references; do not repeat completed checks without a new reason. Mark corrected
 notes with their evidence and [ОПРОВЕРГНУТО] when withdrawn. Notes aid continuity;
 they do not replace structured state. Session availability is determined by the
 executor; do not assume a process survives a role boundary.
+The task_memory block is current structured state, not the raw history. Use
+pm_task_memory to page the complete index/state and pm_material_read for relevant
+original byte ranges. Preserve the original reference/hash. Report only actually
+supplied/analyzed ranges in material_analysis; delivery is not analysis, and
+agent-reported analysis is not a new target observation or proof of a claim.
 An asset dead on this address needs new evidence before rechecking. An inherited
 dead asset is only a prior-address hint; a scoped recheck must identify the open
 hypothesis it tests and obey the executor's single-recheck gate.

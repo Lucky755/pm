@@ -88,6 +88,9 @@ class LocalAPI:
                         send({'id': 'local-test', 'object': 'chat.completion.chunk', 'created': 1,
                               'model': 'deepseek-chat', 'choices': [
                                   {'index': 0, 'delta': content, 'finish_reason': stop}]})
+                    if 'usage' in reply:
+                        send({'id':'local-test','object':'chat.completion.chunk','created':1,
+                              'model':'deepseek-chat','choices':[],'usage':reply['usage']})
                     self.wfile.write(b'data: [DONE]\n\n')
                 self.wfile.flush()
                 self.close_connection = True

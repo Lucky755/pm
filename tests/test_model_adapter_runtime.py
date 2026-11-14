@@ -163,6 +163,48 @@ class AdapterRuntimeTests(unittest.TestCase):
             self.assertEqual(record['rejection_reason'],'invalid_json')
         self.assert_preserved()
 
+    def test_memory_reaches_real_sdk_material_stdio_and_observed_cache_usage(self):
+        from orchestrator import task_memory
+        with self.case.connect() as db:
+            db.execute('UPDATE pm_tcp_full_scans SET open_ports_json=?',(json.dumps(list(range(1,14))+[9999]),))
+        number=0;choice=fixture.decision('vuln','Read original saved material; no target operations.',references=['result:'+self.rid])
+        choice['boundaries']['resource_refs']=['service:10.0.0.1:tcp:9999']
+        usage={'prompt_tokens':100,'completion_tokens':20,'total_tokens':120,
+               'prompt_tokens_details':{'cached_tokens':80}}
+        def respond(body):
+            nonlocal number
+            number+=1
+            content='\n'.join(strings(body.get('messages',[])))
+            if number==1:
+                prompt=next(s for s in strings(body['messages']) if s.startswith('You coordinate'))
+                state=json.loads(prompt.rsplit('\n',1)[1])
+                self.assertIn('service:10.0.0.1:tcp:9999',state['references'])
+                self.assertIn(9999,[port for group in state['task_memory']['service_groups'] for port in group['ports']])
+                return {'text':json.dumps(choice),'usage':usage}
+            if number==2:
+                self.assertIn('<task_memory>',content);self.assertIn('без брутфорса',content)
+                self.assertIn('service:10.0.0.1:tcp:9999',content)
+                name=next(t['function']['name'] for t in body['tools'] if t['function']['name'].endswith('pm_material_read'))
+                return {'tool_name':name,'arguments':{'task_id':11,'reference':'result:'+self.rid,'offset':0,'limit':16},'usage':usage}
+            if number==3:
+                self.assertIn('HTTP/1.1 403 Forb',content)
+                return {'text':json.dumps({'summary':'Original bytes read locally; no fresh network observation.',
+                        'findings':[],'flags':[],'verified':[],'uncertainties':[],'proposed_actions':[]}), 'usage':usage}
+            self.assertEqual(number,4)
+            return {'text':json.dumps(fixture.decision(action='wait_operator')),'usage':usage}
+        api=self.setup_api(respond)
+        with d.run('real task memory',11),d.process_environment():
+            result=c.run(11,api_key='local-test-only',max_tokens=1000)
+            events=d.read_events()
+        self.assertEqual(result['stop_reason'],'model_waiting_operator',self.case.console.getvalue())
+        self.assertEqual(len(api.requests),4)
+        records=self.audits();self.assertTrue(any(r.get('prefix_cache')=='hit_observed' for r in records),records)
+        self.assertTrue(all(r['statistics']['output_tokens'] is not None for r in records))
+        with self.case.connect() as db:
+            self.assertGreater(task_memory.current(db,11)['version'],0)
+        self.assertEqual(len([e for e in events if e['kind']=='tool.end' and e.get('source')=='mcp']),1)
+        self.assert_preserved()
+
     def test_specialist_profile_hides_unrelated_tools_and_denies_unsolicited_call(self):
         number=0;choice=fixture.decision('vuln',references=['result:'+self.rid])
         choice['profile']='http-surface'
@@ -234,12 +276,16 @@ class AdapterRuntimeTests(unittest.TestCase):
             if number==1:return {'text':'{bad JSON'}
             if number==2:return {'text':json.dumps({'summary':'Local plan','target':'10.0.0.1',
                                                   'tasks':[],'objectives':[],'checkpoints':[]})}
+            content='\n'.join(strings(body.get('messages',[])))
+            self.assertIn('metadata_only',content);self.assertIn('source_state_sha256',content)
             return {'text':'Analysis of saved evidence only.'}
         api=self.setup_api(respond)
         with patch.object(planner,'RAW_DIR',self.root/'planner-raw'):
             plan=planner.request_plan('local-test-only','10.0.0.1','No external action')
         self.assertEqual(plan['tasks'],[])
-        self.assertIn('saved evidence',scheduler.ask_agent('local-test-only','vuln','Review only',[],'10.0.0.1'))
+        from orchestrator import task_memory
+        with self.case.connect() as db:memory_view=task_memory.analysis_context(db,11)
+        self.assertIn('saved evidence',scheduler.ask_agent('local-test-only','vuln','Review only',[],'10.0.0.1',memory_view=memory_view))
         self.assertEqual(len(api.requests),3)
         self.assertEqual(len(self.audits()),3)
         self.assert_preserved()

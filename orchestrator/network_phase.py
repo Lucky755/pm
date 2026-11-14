@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from orchestrator.model_adapter import HarnessAdapter
-from orchestrator import instructions
+from orchestrator import instructions, task_memory
 from orchestrator.agent_actions import action_policy_patch
 
 
@@ -483,11 +483,15 @@ You are the Recon agent in Pentest Master.
 {instructions.common()}
 {instructions.role_text("recon")}
 
+<pm_dynamic_context>
 Task ID: {task_id}
 Authorized target: {target}
 
 Goal:
 {goal}
+
+Task memory metadata:
+{json.dumps(task_memory.analysis_context(db,task_id),ensure_ascii=False)}
 
 You can use these MCP tools:
 - mcp__pentest_master__list_network_profiles

@@ -199,6 +199,8 @@ def connect():
         # Rows created before durable transitions have already finished.
         db.execute("UPDATE pm_task_lineage SET transfer_state='done'")
     initialize_tcp_scans(db)
+    from orchestrator import task_memory
+    task_memory.initialize(db)
     return db
 
 

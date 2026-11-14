@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from orchestrator.model_adapter import HarnessAdapter
-from orchestrator import instructions
+from orchestrator import instructions, task_memory
 
 
 from executor.task_scope import (
@@ -633,6 +633,7 @@ You are the {stage.upper()} agent in Pentest Master.
 This is a local integration lab; actual network operations already completed.
 Use only the saved evidence below.
 
+<pm_dynamic_context>
 Verified evidence JSON:
 {json.dumps(evidence, ensure_ascii=False)}
 
@@ -659,6 +660,7 @@ def run_agents(db, task_id):
         db,
         task_id,
     )
+    evidence['task_memory']=task_memory.analysis_context(db,task_id)
 
     if (
         evidence["evidence_status"]

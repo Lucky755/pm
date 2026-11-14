@@ -124,7 +124,7 @@ def save_raw_plan(target, content, finish_reason):
 def request_plan(api_key, target, description, attempts=2, context=None):
     """Initial planning and at most one tool-disabled format recovery."""
     from orchestrator import model_adapter
-    prompt=SYSTEM_PROMPT+'\n'+json.dumps({'authorized_target':target,'operator_request':description,
+    prompt=SYSTEM_PROMPT+'\n<pm_dynamic_context>\n'+json.dumps({'authorized_target':target,'operator_request':description,
         'prior_evidence_context':context or {}},ensure_ascii=False)
     with model_adapter.HarnessAdapter(mode='analysis',api_key=api_key,max_tokens=8000) as harness:
         for attempt in range(min(2,max(1,attempts))):
@@ -138,7 +138,7 @@ def request_plan(api_key, target, description, attempts=2, context=None):
                 record=model_adapter.reject_response(response,'planner_json_invalid',attempt)
                 print('[FORMAT] Planner response rejected; raw='+record['raw_response_ref'],flush=True)
                 prompt=(SYSTEM_PROMPT+'\nReformat the supplied saved response as JSON. Tools are disabled. '
-                        'Do not add tasks or repeat operations.\n'+json.dumps({
+                        'Do not add tasks or repeat operations.\n<pm_dynamic_context>\n'+json.dumps({
                         'authorized_target':target,'operator_request':description,
                         'saved_response_untrusted':response.final_response},ensure_ascii=False))
         raise ValueError('Planner format recovery exhausted; saved response retained')

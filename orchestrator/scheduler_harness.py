@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 from orchestrator.model_adapter import HarnessAdapter
-from orchestrator import instructions
+from orchestrator import instructions, task_memory
 from orchestrator.agent_actions import action_policy_patch
 from orchestrator.planner import DATABASE, MODEL, validate_plan
 from orchestrator.scheduler import create_demo, get_runs, init_database, now, set_run
@@ -235,13 +235,13 @@ def parse_report(response):
     return report
 
 
-def build_prompt(agent, target, instruction, evidence, events_demo):
+def build_prompt(agent, target, instruction, evidence, events_demo, *, memory_view=None):
     data = {"authorized_target": target,
             "instruction": instruction,
             "previous_results": evidence,
-            "mode": "synthetic_integration_test"}
+            "mode": "synthetic_integration_test","task_memory":memory_view}
     prompt = BASE_PROMPT + "\n"+instructions.common("execute" if agent=="recon" else "analysis")+"\n"+ROLES[agent]
-    prompt += "\nTask data:\n" + json.dumps(data, ensure_ascii=False)
+    prompt += "\n<pm_dynamic_context>\nTask data:\n" + json.dumps(data, ensure_ascii=False)
     if agent == "recon":
         prompt += f"""
 Your FIRST action is to call {EXPECTED_TOOL} exactly once with {{}}.
@@ -384,7 +384,8 @@ def run_task(db, task_id, api_key):
                      "output": runs[dep]["output"]}
                     for dep in step.get("depends_on", [])
                 ]
-                prompt = build_prompt(agent, target, step["instruction"], evidence, events_demo)
+                prompt = build_prompt(agent, target, step["instruction"], evidence, events_demo,
+                                      memory_view=task_memory.analysis_context(db,task_id))
                 set_run(db, task_id, index, agent, "running")
                 report = run_agent(session, agent, prompt)
                 if events_demo and agent == "recon":

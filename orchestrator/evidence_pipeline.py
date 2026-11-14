@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from orchestrator import model_adapter, instructions
+from orchestrator import model_adapter, instructions, task_memory
 from orchestrator import diagnostics
 DB_PATH = ROOT / 'storage/tasks.db'
 BURP_IMPORT = ROOT / 'integrations/burp-bridge/burp_import.py'
@@ -245,6 +245,7 @@ Each observations_used entry must match a real network:<id>, burp:<id> or web:<i
 from the evidence below. All other array entries must be strings.
 
 EVIDENCE_JSON:
+<pm_dynamic_context>
 {json.dumps(bundle, ensure_ascii=False)}
 
 PREVIOUS_AGENT_REPORTS_JSON:
@@ -261,7 +262,7 @@ def agent_prompt(stage, bundle, previous):
 {instructions.role_text(stage)}
 Respond in Russian, use only evidence supplied below.
 
-EVIDENCE_JSON:\n{json.dumps(bundle, ensure_ascii=False)}
+<pm_dynamic_context>\nEVIDENCE_JSON:\n{json.dumps(bundle, ensure_ascii=False)}
 
 PREVIOUS_AGENT_REPORTS_JSON:\n{json.dumps(previous, ensure_ascii=False)}
 
@@ -381,6 +382,7 @@ def run_agents(db, task_id, digest, bundle):
         return previous
     if not (bundle['network_observations'] or bundle['burp_http_metadata'] or bundle.get('web_observations')):
         raise ValueError('No verified observations for agent analysis')
+    bundle={**bundle,'task_memory':task_memory.analysis_context(db,task_id)}
     if previous:
         done = ', '.join(stage.upper() for stage in STAGES if stage in previous)
         todo = ', '.join(stage.upper() for stage in remaining)

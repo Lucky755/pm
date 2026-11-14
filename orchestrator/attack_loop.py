@@ -659,9 +659,10 @@ def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
                 f'findings={len(report["findings"])} '
                 f'elapsed={outcome["elapsed_seconds"]}s{note}')
             say(f'      рассуждения: {stage["thinking_chars"]} знаков · '
-                f'вызовы: {stage["tool_calls"]} · токены: вход {stage["input_tokens"]}, '
-                f'кеш {stage["cache_read_tokens"]}, вывод {stage["output_tokens"]}, '
-                f'пик контекста {stage["peak_context_tokens"]}')
+                f'вызовы: {stage["tool_calls"]} · токены: вход {stage["input_tokens"] if stage["input_tokens"] is not None else "неизвестно"}, '
+                f'кеш {stage["cache_read_tokens"] if stage["cache_read_tokens"] is not None else "неизвестно"}, '
+                f'вывод {stage["output_tokens"] if stage["output_tokens"] is not None else "неизвестно"}, '
+                f'пик контекста {stage["peak_context_tokens"] if stage["peak_context_tokens"] is not None else "неизвестно"}')
             if stage['report_warning']:
                 say('      предупреждение отчёта: ' + stage['report_warning'])
             if stage['report_repaired']:
