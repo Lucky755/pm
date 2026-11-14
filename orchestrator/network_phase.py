@@ -28,11 +28,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from deepseek_harness import DeepSeekHarness
 
 
-ROOT = Path("/home/lucky/pentest-master")
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from orchestrator.model_adapter import HarnessAdapter
+from orchestrator.agent_actions import action_policy_patch
+
 
 from executor.task_scope import check_action
 
@@ -503,7 +506,7 @@ MANDATORY:
 - Summarize your planned approach in Russian.
 """
 
-        with DeepSeekHarness(
+        with action_policy_patch() as policy, HarnessAdapter(mode='execute', patches=(policy,),
             profile="sdk-minimal",
             dsh_home=str(DSH_HOME),
             cwd=str(WORKSPACE),

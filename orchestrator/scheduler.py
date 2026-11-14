@@ -3,8 +3,6 @@ import argparse
 import getpass
 import json
 import sqlite3
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 
 try:
@@ -13,7 +11,6 @@ except ModuleNotFoundError:
     from planner import DATABASE, MODEL, validate_plan
 
 
-API_URL = "https://api.experientiallabs.ai/v1/chat/completions"
 
 ROLES = {
     "recon": "Recon analyst: organize authorized enumeration tasks.",
@@ -154,31 +151,12 @@ def ask_agent(api_key, agent, instruction, evidence, target):
         }
     ]
 
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "stream": False,
-        "max_tokens": 1500
-    }
-
-    request = urllib.request.Request(
-        API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        method="POST"
-    )
-
-    with urllib.request.urlopen(request, timeout=120) as response:
-        result = json.load(response)
-
-    content = result["choices"][0]["message"].get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("Agent returned an empty response")
-
-    return content.strip()
+    from orchestrator.model_adapter import HarnessAdapter
+    with HarnessAdapter(mode='analysis',api_key=api_key,max_tokens=1500) as harness:
+        result=harness.run(json.dumps(messages,ensure_ascii=False))
+    if result.finish_reason!='completed' or not result.final_response.strip():
+        raise RuntimeError('Scheduler analysis failed; request_id='+result.metadata['request_id'])
+    return result.final_response.strip()
 
 
 def run_scheduler(db, task_id, api_key):

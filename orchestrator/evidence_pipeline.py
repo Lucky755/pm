@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from orchestrator import model_adapter
 from orchestrator import diagnostics
 DB_PATH = ROOT / 'storage/tasks.db'
 BURP_IMPORT = ROOT / 'integrations/burp-bridge/burp_import.py'
@@ -350,8 +351,9 @@ def _run_stage_with_one_retry(harness, task_id, stage, prompt):
         if attempt:
             diagnostics.emit('model.retry', reason='evidence_recovery', task_id=task_id, role=stage)
         with diagnostics.scope(task_id=task_id, role=stage):
-            result = diagnostics.model_call(session, prompt)
+            result = model_adapter.model_call(session, prompt,recovery_attempt=attempt)
         if _has_tool_calls(result):
+            model_adapter.reject_response(result,'evidence_tool_request',attempt)
             if attempt == 0:
                 print(f'[MODEL] {stage.upper()}: tool event in read-only analysis; '
                       'discarding response; retry 1/1', flush=True)
@@ -390,12 +392,12 @@ def run_agents(db, task_id, digest, bundle):
         done = ', '.join(stage.upper() for stage in STAGES if stage in previous)
         todo = ', '.join(stage.upper() for stage in remaining)
         print(f'[MODEL] Resume {digest[:12]}: saved={done}; pending={todo}', flush=True)
-    from deepseek_harness import DeepSeekHarness
+    from orchestrator.model_adapter import HarnessAdapter
     api_key = getpass.getpass('Experiential API key: ').strip()
     if not api_key:
         raise ValueError('API key required')
     diagnostics.register_secret(api_key)
-    with read_only_analysis_patch() as policy_patch, DeepSeekHarness(
+    with read_only_analysis_patch() as policy_patch, HarnessAdapter(mode='analysis',
         profile='sdk-minimal',
         patches=(policy_patch,),
         dsh_home=str(DSH_HOME),
@@ -418,6 +420,7 @@ def run_agents(db, task_id, digest, bundle):
                 report = parse_report(result.final_response)
                 validate_report(report, bundle)
             except ValueError as exc:
+                model_adapter.reject_response(result,'evidence_report_invalid',0)
                 # Do not rerun scans or already completed stages. Only one
                 # additional model response is allowed for this stage.
                 print(f'[FORMAT] {stage}: invalid report, retrying once', flush=True)
@@ -425,16 +428,20 @@ def run_agents(db, task_id, digest, bundle):
                     f'evidence-repair-{task_id}-{stage}-{uuid.uuid4().hex[:12]}'
                 )
                 diagnostics.emit('model.retry', reason='report_format', task_id=task_id, role=stage)
-                repaired = diagnostics.model_call(repair, repair_prompt(
+                repaired = model_adapter.model_call(repair, repair_prompt(
                     stage, bundle, previous, result.final_response or '', str(exc)
-                ))
+                ),diagnostic_reason='report_format')
                 if _has_tool_calls(repaired):
                     raise RuntimeError(f'{stage} format repair requested tools in read-only analysis; '
                                        'report not saved; saved evidence and earlier reports retained')
                 if repaired.finish_reason != 'completed':
                     raise RuntimeError(f'{stage} repair did not finish: {repaired.finish_reason}')
-                report = parse_report(repaired.final_response)
-                validate_report(report, bundle)
+                try:
+                    report = parse_report(repaired.final_response)
+                    validate_report(report, bundle)
+                except ValueError:
+                    model_adapter.reject_response(repaired,'evidence_report_invalid',1)
+                    raise
             with db:
                 db.execute('''
                     INSERT INTO evidence_agent_reports

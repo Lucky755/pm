@@ -27,7 +27,7 @@ REPORT = {'summary': 'Анализ сохранённых наблюдений.'
 
 
 class LocalAPI:
-    def __init__(self, marker, tool_first=False, responder=None):
+    def __init__(self, marker, tool_first=False, responder=None, max_requests=4):
         self.marker = marker
         self.tool_first = tool_first
         self.requests = []
@@ -41,7 +41,7 @@ class LocalAPI:
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 api.requests.append(body)
                 # Bound the fake provider too, so a runtime regression cannot loop.
-                if len(api.requests) > 4:
+                if len(api.requests) > max_requests:
                     self.send_error(500, 'local test request budget exhausted')
                     return
                 reply = (responder(body) if responder else {

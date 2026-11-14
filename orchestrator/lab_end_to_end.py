@@ -36,11 +36,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from deepseek_harness import DeepSeekHarness
 
 
-ROOT = Path("/home/lucky/pentest-master")
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from orchestrator.model_adapter import HarnessAdapter
+
 
 from executor.task_scope import (
     initialize as initialize_scope,
@@ -728,7 +730,7 @@ def run_agents(db, task_id):
             "API key required"
         )
 
-    with DeepSeekHarness(
+    with HarnessAdapter(mode='analysis',
         profile="sdk-minimal",
         dsh_home=str(DSH_HOME),
         cwd=str(WORKSPACE),

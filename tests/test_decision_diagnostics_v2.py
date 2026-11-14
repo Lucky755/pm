@@ -153,8 +153,13 @@ class DecisionTests(unittest.TestCase):
             def start_session(self,name):
                 return types.SimpleNamespace(run=lambda prompt: types.SimpleNamespace(
                     finish_reason='completed',events=[],final_response='{"select":[]}'))
+        temporary=tempfile.TemporaryDirectory(prefix='pm-policy-')
+        self.addCleanup(temporary.cleanup)
+        policy_path=Path(temporary.name)/'policy.json'
+        policy_path.write_text(json.dumps([{'insert':[{'id':'pm-evidence-readonly',
+            'name':str(ROOT/'orchestrator/evidence_readonly.mjs')}]}]))
         @contextlib.contextmanager
-        def policy():yield '/tmp/test-policy.yml'
+        def policy():yield str(policy_path)
         self.evidence.read_only_analysis_patch=policy
         self.evidence.DSH_HOME=Path('/tmp/test-home')
         self.evidence.WORKSPACE=Path('/tmp/test-workspace')
@@ -164,6 +169,6 @@ class DecisionTests(unittest.TestCase):
         with patch.dict(sys.modules,{'deepseek_harness':types.SimpleNamespace(DeepSeekHarness=Harness)}), \
              patch.object(clean.getpass,'getpass',return_value='fake-local-test'):
             self.assertEqual(clean.choose_with_model(BUNDLE,[CANDIDATE]),[])
-        self.assertEqual(calls[0]['patches'],('/tmp/test-policy.yml',))
+        self.assertEqual(calls[0]['patches'],(str(policy_path),))
 
 if __name__=='__main__':unittest.main(verbosity=2)

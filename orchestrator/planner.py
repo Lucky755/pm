@@ -6,14 +6,13 @@ import json
 import re
 import sqlite3
 import sys
-import urllib.request
+import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path("/home/lucky/pentest-master")
+ROOT = Path(__file__).resolve().parents[1]
 DATABASE = ROOT / "storage" / "tasks.db"
-API_URL = "https://api.experientiallabs.ai/v1/chat/completions"
 MODEL = "glm-5.3-uncensored"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -126,88 +125,26 @@ def save_raw_plan(target, content, finish_reason):
 
 
 def request_plan(api_key, target, description, attempts=2, context=None):
-    """Ask for the plan, and survive one malformed or truncated reply.
-
-    max_tokens was fixed at 4000 and finish_reason was never inspected, so a
-    plan for a larger room could be cut off mid-string and the resulting
-    "Expecting ',' delimiter" killed the whole task creation.
-    """
-    diagnostics.register_secret(api_key)
-    last_error = None
-    for attempt in range(1, attempts + 1):
-        request_text = description
-        if attempt > 1:
-            request_text = description + (
-                "\n\nReturn ONLY one compact JSON object: no markdown, no prose, "
-                "every instruction under 200 characters. The previous reply was "
-                "not valid JSON."
-            )
-
-        payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps({
-                    "authorized_target": target,
-                    "operator_request": request_text,
-                    "prior_evidence_context": context or {},
-                    "autonomy": "automatic_with_checkpoints",
-                    "notify_without_pausing": [
-                        "credentials_found",
-                        "initial_access",
-                        "flag_found"
-                    ],
-                    "approval_required": [
-                        "privilege_escalation",
-                        "destructive_operation",
-                        "system_wide_changes"
-                    ]
-                }, ensure_ascii=False)
-            }
-        ],
-        "max_tokens": 8000 if attempt > 1 else 4000,
-        "stream": False
-    }
-
-        request = urllib.request.Request(
-            API_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            method="POST"
-        )
-
-        if attempt > 1:
-            diagnostics.emit('model.retry', reason='planner_format')
-        with diagnostics.Action('model', 'planner_request'):
-            with urllib.request.urlopen(request, timeout=120) as response:
-                result = json.load(response)
-
-        choice = result["choices"][0]
-        content = choice["message"]["content"]
-        finish_reason = choice.get("finish_reason")
-        raw_path = save_raw_plan(target, content, finish_reason)
-
-        try:
-            return parse_json_response(content)
-        except ValueError as exc:
-            last_error = exc
-            print(f"[!] Ответ планировщика не разобран: {exc}", flush=True)
-            print(f"[!] Сырой ответ сохранён: {raw_path}", flush=True)
-            if finish_reason == "length":
-                print("[!] Ответ обрезан по лимиту вывода — повторяю с большим лимитом",
-                      flush=True)
-            elif attempt < attempts:
-                print("[!] Повторяю запрос с требованием компактного JSON", flush=True)
-
-    raise ValueError(
-        f"Planner did not return a parsable JSON plan after {attempts} attempts: "
-        f"{last_error}"
-    )
+    """Initial planning and at most one tool-disabled format recovery."""
+    from orchestrator import model_adapter
+    prompt=SYSTEM_PROMPT+'\n'+json.dumps({'authorized_target':target,'operator_request':description,
+        'prior_evidence_context':context or {}},ensure_ascii=False)
+    with model_adapter.HarnessAdapter(mode='analysis',api_key=api_key,max_tokens=8000) as harness:
+        for attempt in range(min(2,max(1,attempts))):
+            response=harness.start_session('planner-'+uuid.uuid4().hex).run(
+                prompt,recovery_attempt=attempt,diagnostic_reason='planner_format' if attempt else 'initial_plan')
+            save_raw_plan(target,response.final_response,response.finish_reason)
+            try:
+                if response.finish_reason!='completed':raise ValueError('planner_model_not_completed')
+                return parse_json_response(response.final_response)
+            except ValueError as exc:
+                record=model_adapter.reject_response(response,'planner_json_invalid',attempt)
+                print('[FORMAT] Planner response rejected; raw='+record['raw_response_ref'],flush=True)
+                prompt=(SYSTEM_PROMPT+'\nReformat the supplied saved response as JSON. Tools are disabled. '
+                        'Do not add tasks or repeat operations.\n'+json.dumps({
+                        'authorized_target':target,'operator_request':description,
+                        'saved_response_untrusted':response.final_response},ensure_ascii=False))
+        raise ValueError('Planner format recovery exhausted; saved response retained')
 
 
 def stale_addresses(context, target):

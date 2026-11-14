@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from orchestrator import model_adapter
 from orchestrator import diagnostics
 PYTHON = ROOT / '.venv/bin/python'
 MAX_CHOICES = 3
@@ -192,13 +193,13 @@ def decision_prompt(bundle, candidates):
 
 
 def choose_with_model(bundle, candidates):
-    from deepseek_harness import DeepSeekHarness
+    from orchestrator.model_adapter import HarnessAdapter
     from orchestrator import evidence_pipeline as evidence
     key = getpass.getpass('Experiential API key (decision only): ').strip()
     if not key:
         raise ValueError('API key required for agent decisions')
     diagnostics.register_secret(key)
-    with evidence.read_only_analysis_patch() as policy_patch, DeepSeekHarness(
+    with evidence.read_only_analysis_patch() as policy_patch, HarnessAdapter(mode='analysis',
         profile='sdk-minimal', patches=(policy_patch,),
         dsh_home=str(evidence.DSH_HOME), cwd=str(evidence.WORKSPACE),
         provider='experiential', model='glm-5.3-uncensored',
@@ -213,11 +214,12 @@ def choose_with_model(bundle, candidates):
                            '). Return ONLY the required JSON, with valid IDs.')
             if attempt:
                 diagnostics.emit('model.retry', reason='decision_recovery')
-            response = diagnostics.model_call(session, prompt)
+            response = model_adapter.model_call(session, prompt,recovery_attempt=attempt)
             tool_event = any(isinstance(event, dict) and event.get('type') == 'tool/call'
                              for event in (getattr(response, 'events', None) or []))
             reason = getattr(response, 'finish_reason', 'unknown')
             if tool_event or reason != 'completed':
+                model_adapter.reject_response(response,'decision_tool_request' if tool_event else 'decision_not_completed',attempt)
                 previous_error = 'tool request in read-only planning' if tool_event else 'finish_reason=' + str(reason)[:40]
                 if attempt == 0 and (tool_event or reason in ('error', 'timeout')):
                     print('[MODEL] DECIDE: ' + previous_error + '; retry 1/1', flush=True)
@@ -226,6 +228,7 @@ def choose_with_model(bundle, candidates):
             try:
                 return parse_selection(response.final_response, candidates)
             except (ValueError, json.JSONDecodeError) as exc:
+                model_adapter.reject_response(response,'decision_selection_invalid',attempt)
                 previous_error = str(exc)
                 print(f'[FORMAT] Decision output invalid ({attempt+1}/2)', flush=True)
     raise ValueError('Decision output invalid twice; nothing was saved')

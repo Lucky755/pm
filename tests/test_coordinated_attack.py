@@ -19,6 +19,9 @@ from orchestrator import coordinated_attack as c, agent_actions as a, objectives
 
 def decision(role=None, question='Inspect the current evidence?', action=None, references=None, stop_kind=None):
     return {'action':action or ('run_role' if role else 'stop'),'role':role,'question':question,
+            'profile':role if (action or 'run_role')=='run_role' and role else None,
+            'boundaries':{'task_id':11,'target':'10.0.0.1','intent_ref':'intent','resource_refs':['scope:10.0.0.1']},
+            'inputs':[{'reference':ref} for ref in (references or ['intent'])],
             'reason':'Use the saved service and evidence records.', 'references':references or ['intent'],
             'expected_result':'An evidence-linked observation or an explicit unverified result.',
             'stop_kind':stop_kind if stop_kind else ('incomplete' if not role and action!='wait_operator' else None)}
@@ -212,7 +215,9 @@ class CoordinatorTests(unittest.TestCase):
         for iteration,threshold in ((1,10**9),(2,1)):
             choice=decision('vuln',f'Inspect service evidence variant {iteration}?',
                             references=['service:10.0.0.1:tcp:80'])
-            if iteration==2:choice['references'].append('result:'+'f'*24)
+            if iteration==2:
+                choice['references'].append('result:'+'f'*24)
+                choice['inputs'].append({'reference':'result:'+'f'*24})
             choice['expected_result']='ASSIGNMENT_EXPECTED: exact status with evidence, without brute force.'
             choose=self.model([choice])
             def current_model(prompt,key):

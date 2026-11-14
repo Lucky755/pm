@@ -46,6 +46,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from orchestrator import model_adapter
 from orchestrator import diagnostics, service_inventory, report_integrity
 
 DB_PATH = ROOT / 'storage/tasks.db'
@@ -124,20 +125,15 @@ RESEARCH_HOSTS = ('nvd.nist.gov', 'services.nvd.nist.gov',
 
 # The report is written at the end of a long turn with the whole transcript in
 # context; 8000 tokens was hit mid-sentence and killed the turn. The profile
-# allows much more, the compact-retry below catches the rest.
+# allows much more; truncated results are formatted in a tool-disabled session.
 DEFAULT_MAX_TOKENS = 24000
 # A single fresh attempt is allowed only if the first session made no tool call.
 NO_ACTION_RETRY_TOKENS = 32000
 # Hard ceiling for an explicitly configured stage limit.
 MAX_TOKENS_CEILING = 64000
 
-# Context-pressure threshold. peak_context_tokens is collected per stage turn
-# (progress_watcher.metrics); when it crosses this value, later turns of the
-# same stage stop re-sending the full transcript and are rebuilt from a
-# compact representation of the history instead (compact_history). It is
-# deliberately not a hard cutoff: the stage keeps working and still returns
-# its report. Full outputs are never removed: they stay in the capability
-# log, resolvable by result_id through pm_capability_read.
+# Context-pressure threshold for the no-action retry. Executed turns are never
+# replayed to recover their report. Full outputs remain in the capability log.
 CONTEXT_PRESSURE_TOKENS = 24000
 
 COMPACT_MODE_NOTE = (
@@ -152,13 +148,6 @@ MAX_TOKENS_RECOVERY = (
     'и не повторяй исследование. Верни ТОЛЬКО один компактный JSON-отчёт по '
     'требуемой схеме: summary до 600 символов, каждое evidence до 300 символов, '
     'не более 8 находок, без markdown и без пояснений.'
-)
-
-MAX_TOKENS_CONTINUE = (
-    'Предыдущий ход оборвался по лимиту вывода во время работы. Продолжай с '
-    'последнего действия в этой сессии; не пересказывай уже сделанное. '
-    'Следующий ответ — один вызов инструмента или финальный JSON-отчёт. '
-    'Не трать остаток лимита на длинное рассуждение.'
 )
 
 ACT_NOW = (
@@ -1362,14 +1351,12 @@ def read_stage_stats(path):
 
 
 def max_tokens_recovery(stats, step_limit):
-    """Choose one bounded continuation from the gate's charged call count."""
+    """Only a proven zero-action turn may get a fresh execution attempt."""
     if stats.get('calls') is None:
         return MAX_TOKENS_RECOVERY, 'max-tokens-report'
     calls = max(0, int(stats.get('calls') or 0))
     if calls == 0:
         return ACT_NOW, 'max-tokens-act'
-    if calls < step_limit:
-        return MAX_TOKENS_CONTINUE, 'max-tokens-continue'
     return MAX_TOKENS_RECOVERY, 'max-tokens-report'
 
 
@@ -2170,7 +2157,7 @@ def exclusive_report_slot(function):
 
 def reformat_saved_report(db, context, role, iteration, key, max_tokens, prior_ids, objective):
     """One new, tool-disabled session over the already committed report/evidence."""
-    from deepseek_harness import DeepSeekHarness
+    from orchestrator.model_adapter import HarnessAdapter
     from orchestrator import evidence_pipeline as evidence
     from orchestrator.harness_env import harness_env
     saved=json.loads(db.execute('SELECT report_json FROM pm_agent_action_reports '
@@ -2195,11 +2182,11 @@ def reformat_saved_report(db, context, role, iteration, key, max_tokens, prior_i
             'Preserve uncertainty and cite original result IDs; missing evidence stays unverified.\n'
             +REPORT_CONTRACT+'\n'+json.dumps(bundle,ensure_ascii=False))
     diagnostics.emit('model.retry',reason='saved_report_format',task_id=context['task_id'],role=role,attempt=1)
-    with evidence.read_only_analysis_patch() as policy, DeepSeekHarness(
+    with evidence.read_only_analysis_patch() as policy, HarnessAdapter(mode='analysis',
             profile='sdk-minimal',patches=(policy,),dsh_home=str(DSH_HOME),cwd=str(WORKSPACE),
             provider='experiential',model='glm-5.3-uncensored',api_key=key,env=harness_env(),
             max_tokens=min(4096,max_tokens),request_timeout_seconds=120) as harness:
-        response=diagnostics.model_call(harness.start_session('report-format-'+uuid.uuid4().hex),prompt,
+        response=model_adapter.model_call(harness.start_session('report-format-'+uuid.uuid4().hex),prompt,
                                         diagnostic_reason='saved_report_format')
     text=str(getattr(response,'final_response','') or '')
     if evidence._has_tool_calls(response):
@@ -2211,6 +2198,7 @@ def reformat_saved_report(db, context, role, iteration, key, max_tokens, prior_i
         if report_integrity.quality(report)['status']=='damaged':
             raise ValueError('Damaged nested report')
     except ValueError:
+        model_adapter.reject_response(response,'format_response_invalid',1,task_id=context['task_id'],role=role)
         return None,text,'format_response_invalid'
     return report,text,None
 
@@ -2248,7 +2236,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
     key = checked_api_key(key)
     diagnostics.register_secret(key)
 
-    from deepseek_harness import DeepSeekHarness
+    from orchestrator.model_adapter import HarnessAdapter
     try:
         from orchestrator.harness_env import harness_env
     except ImportError:  # imported as a top-level module
@@ -2280,7 +2268,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
 
         def attempt(tokens, first_prompt):
             """One harness session: the first turn, then bounded recoveries."""
-            with temporary_stage_stats() as stats_path, action_policy_patch(step_limit, poc_budget) as policy, DeepSeekHarness(
+            with temporary_stage_stats() as stats_path, action_policy_patch(step_limit, poc_budget) as policy, HarnessAdapter(mode='execute',
                 profile='sdk-minimal',
                 patches=(policy,),
                 dsh_home=str(DSH_HOME),
@@ -2302,49 +2290,32 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                     f'action-{task_id}-{role}-{uuid.uuid4().hex[:10]}'
                 )
                 watcher = progress_watcher(role, step_limit, stats_path=stats_path)
-                turn = diagnostics.model_call(session, first_prompt, diagnostic_reason='stage_start', on_notification=watcher)
+                turn = model_adapter.model_call(session, first_prompt, diagnostic_reason='stage_start', on_notification=watcher)
                 note = None
                 parsed = None
                 if getattr(turn, 'finish_reason', None) == 'max-tokens':
-                    recovery_prompt, note = max_tokens_recovery(
+                    _, note = max_tokens_recovery(
                         read_stage_stats(stats_path), step_limit)
                     print('      лимит вывода исчерпан — ' + {
                         'max-tokens-act': 'прошу выполнить первое действие',
-                        'max-tokens-continue': 'продолжаю работу с последнего действия',
                         'max-tokens-report': 'запрашиваю компактный отчёт',
                     }[note], flush=True)
-                    # No action yet: the only continuation is the fresh 32k
-                    # attempt below. Do not spend another 24k turn first.
-                    if note not in ('max-tokens-act','max-tokens-report'):
-                        if watcher.metrics['peak_context_tokens'] >= CONTEXT_PRESSURE_TOKENS:
-                            # Context pressure crossed the threshold. Re-sending
-                            # the whole transcript would only grow it further, so
-                            # the recovery turn starts a new session built from
-                            # the compact representation. The stage is not stopped.
-                            print(f'      пик контекста '
-                                  f'{watcher.metrics["peak_context_tokens"]} токенов '
-                                  f'превысил порог {CONTEXT_PRESSURE_TOKENS} — '
-                                  f'{COMPACT_MODE_NOTE}', flush=True)
-                            session = harness.start_session(
-                                f'action-{task_id}-{role}-{uuid.uuid4().hex[:10]}-compact')
-                            turn = diagnostics.model_call(session, compact_prompt(
-                                db, context, role, objective, iteration,
-                                poc_budget, step_limit,
-                                f'пик контекста {watcher.metrics["peak_context_tokens"]} '
-                                f'токенов, порог {CONTEXT_PRESSURE_TOKENS}'),
-                                diagnostic_reason='context_pressure_continuation', on_notification=watcher)
-                            note = 'max-tokens-compact'
-                        else:
-                            turn = diagnostics.model_call(session, recovery_prompt, diagnostic_reason='max_tokens_continuation', on_notification=watcher)
+                    # Never recover an executed turn by replaying an action-enabled
+                    # session. Persist its outcome below, then format in analysis mode.
+                    if note=='max-tokens-report':
+                        diagnostics.emit('context.compact',reason='output_truncated_saved_report',
+                                         task_id=task_id,role=role)
                 if getattr(turn, 'finish_reason', None) == 'completed':
                     try:
                         parsed = parse_report(turn.final_response)
                         if report_integrity.quality(parsed)['status']=='damaged':
+                            model_adapter.reject_response(turn,'role_report_damaged',0,task_id=task_id,role=role)
                             parsed=fallback_report(role,turn.final_response)
                             note='fallback'
                     except ValueError:
                         # Local JSON/quote repairs are exhausted. Never ask the
                         # action-enabled session to reformat or repeat actions.
+                        model_adapter.reject_response(turn,'role_report_invalid_json',0,task_id=task_id,role=role)
                         parsed=fallback_report(role,getattr(turn,'final_response',''))
                         note='fallback'
                 stats = read_stage_stats(stats_path)
@@ -2409,6 +2380,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                 except ValueError:
                     report=fallback_report(role,getattr(result,'final_response',''))
             if getattr(result,'finish_reason',None)=='max-tokens':
+                model_adapter.reject_response(result,'role_output_truncated',0,task_id=task_id,role=role)
                 report=fallback_report(role,getattr(result,'final_response',''))
                 report['report_quality']['original_error']={'code':'output_truncated'}
             degraded=report_integrity.quality(report)['status']=='damaged'
@@ -2556,7 +2528,7 @@ def self_test():
         raise ValueError('Unexpected token budget for the bounded no-action retry')
 
     for stats, expected in (({'calls': 0}, 'max-tokens-act'),
-                            ({'calls': 5}, 'max-tokens-continue'),
+                            ({'calls': 5}, 'max-tokens-report'),
                             ({'calls': 15}, 'max-tokens-report')):
         if max_tokens_recovery(stats, 15)[1] != expected:
             raise ValueError('Wrong max-tokens recovery branch')

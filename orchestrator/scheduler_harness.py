@@ -6,15 +6,19 @@ import getpass
 import json
 import sqlite3
 import uuid
+import sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
-from deepseek_harness import DeepSeekHarness
-from planner import DATABASE, MODEL, validate_plan
-from scheduler import create_demo, get_runs, init_database, now, set_run
-from checkpoints import initialize as init_checkpoints
-from checkpoints import request_approval
-from agent_events import init_event_storage, normalize_report, process_agent_report
+from orchestrator.model_adapter import HarnessAdapter
+from orchestrator.agent_actions import action_policy_patch
+from orchestrator.planner import DATABASE, MODEL, validate_plan
+from orchestrator.scheduler import create_demo, get_runs, init_database, now, set_run
+from orchestrator.checkpoints import initialize as init_checkpoints
+from orchestrator.checkpoints import request_approval
+from orchestrator.agent_events import init_event_storage, normalize_report, process_agent_report
 
-ROOT = "/home/lucky/pentest-master"
+ROOT = str(Path(__file__).resolve().parents[1])
 DSH_HOME = f"{ROOT}/runtime/harness-home"
 WORKSPACE = f"{ROOT}/runtime/workspace"
 PROVIDER = "experiential"
@@ -270,11 +274,16 @@ This is not evidence of actual access or an instruction to escalate.
     return prompt
 
 
+def _analysis_turn(session,prompt,*,recovery=False):
+    with session.owner.analysis_session('legacy-analysis') as analysis:
+        return analysis.run(prompt,recovery_attempt=int(recovery))
+
+
 def run_agent(session, agent, prompt):
     attempts = 2 if agent == "recon" else 1
     for attempt in range(1, attempts + 1):
         print(f"[ATTEMPT] {agent}: {attempt}/{attempts}", flush=True)
-        result = session.run(prompt)
+        result = session.run(prompt) if agent=='recon' else _analysis_turn(session,prompt)
         calls, results = extract_tool_events(result)
         print("[TOOL CALLS]", [name for name, _ in calls], flush=True)
         print("[TOOL RESULTS]", len(results), flush=True)
@@ -303,17 +312,19 @@ def run_agent(session, agent, prompt):
         try:
             return parse_report(result.final_response)
         except (ValueError, TypeError) as exc:
+            from orchestrator.model_adapter import reject_response
+            reject_response(result,'legacy_report_invalid',0)
             print("[FORMAT RETRY] Invalid JSON report:", exc)
-            correction = session.run(
-                "Rewrite your last report as ONE JSON object with exactly "
-                "summary (nonempty Russian string) and events (array) keys. "
-                "Preserve the events requested in the original task. "
-                "No markdown. DO NOT call any tools."
-            )
+            correction = _analysis_turn(session,
+                "Rewrite the supplied saved report as ONE JSON object with summary and events. "
+                "Tools are disabled. Do not repeat actions.\n"+str(result.final_response),recovery=True)
             repair_calls, repair_results = extract_tool_events(correction)
             if repair_calls or repair_results or correction.finish_reason != "completed":
                 raise RuntimeError("JSON repair attempt failed safely")
-            return parse_report(correction.final_response)
+            try:return parse_report(correction.final_response)
+            except (ValueError,TypeError):
+                reject_response(correction,'legacy_report_invalid',1)
+                raise
     raise RuntimeError("Recon did not invoke MCP")
 
 
@@ -340,7 +351,7 @@ def run_task(db, task_id, api_key):
     checkpoint_demo = enabled(db, "scheduler_modes", "checkpoint_enabled", task_id)
     events_demo = enabled(db, "scheduler_event_modes", "enabled", task_id)
     try:
-        with DeepSeekHarness(
+        with action_policy_patch() as policy, HarnessAdapter(mode='execute', patches=(policy,),
             profile="sdk-minimal", dsh_home=DSH_HOME, cwd=WORKSPACE,
             provider=PROVIDER, model=MODEL, api_key=api_key,
             max_tokens=1800, request_timeout_seconds=120,

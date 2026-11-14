@@ -125,6 +125,15 @@ class ReportIntegrityTests(unittest.TestCase):
         self.assertEqual(self.executions,1)
         self.assertEqual(report['report_quality']['original_error']['code'],'output_truncated')
 
+    def test_truncated_executed_turn_is_formatted_without_action_enabled_continuation(self):
+        self.initial_finish='max-tokens';self.repair_response=self.structured()
+        with patch.object(a,'read_stage_stats',return_value={'calls':1,'tool_events':1,'reads':0,'denied':0,'sessions':0}):
+            report=self.role()['report']
+        self.assertEqual([request[0] for request in self.requests],[False,True])
+        self.assertEqual(self.executions,1)
+        self.assertEqual(report['report_quality']['status'],'reformatted')
+        self.assertEqual(len(report['findings']),1)
+
     def test_legacy_loop_also_stops_on_damaged_report(self):
         from orchestrator import attack_loop, flag_verify
         with patch.object(flag_verify,'connect',self.case.connect):

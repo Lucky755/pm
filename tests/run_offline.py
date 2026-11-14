@@ -7,11 +7,12 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-OFFLINE = frozenset(('test_agent_prompt_context', 'test_agent_provider_recovery', 'test_application_discovery', 'test_auto_scheduler', 'test_bootstrap_discovery', 'test_console_model_progress', 'test_console_theme_v4', 'test_console_v2', 'test_console_v5', 'test_context_continuation', 'test_coordinated_attack', 'test_coordinator_checkpoints', 'test_decision_diagnostics_v2', 'test_diagnostic_integration', 'test_flag_evidence', 'test_flag_extensions', 'test_full_scan_recovery', 'test_http_artifacts', 'test_http_assets_v3', 'test_http_capture_mcp', 'test_http_discovery_v2', 'test_http_document', 'test_http_evidence_v2', 'test_http_scheduler_v2', 'test_netguard_docker', 'test_netguard_policy', 'test_objectives', 'test_offline_runner', 'test_operator_extensions', 'test_pm_console', 'test_report_integrity', 'test_report_semantics', 'test_run_diagnostics', 'test_scheduler_first_run', 'test_service_inventory', 'test_task_launch', 'test_verify_saved_capture'))
+OFFLINE = frozenset(('test_model_adapter', 'test_agent_prompt_context', 'test_agent_provider_recovery', 'test_application_discovery', 'test_auto_scheduler', 'test_bootstrap_discovery', 'test_console_model_progress', 'test_console_theme_v4', 'test_console_v2', 'test_console_v5', 'test_context_continuation', 'test_coordinated_attack', 'test_coordinator_checkpoints', 'test_decision_diagnostics_v2', 'test_diagnostic_integration', 'test_flag_evidence', 'test_flag_extensions', 'test_full_scan_recovery', 'test_http_artifacts', 'test_http_assets_v3', 'test_http_capture_mcp', 'test_http_discovery_v2', 'test_http_document', 'test_http_evidence_v2', 'test_http_scheduler_v2', 'test_netguard_docker', 'test_netguard_policy', 'test_objectives', 'test_offline_runner', 'test_operator_extensions', 'test_pm_console', 'test_report_integrity', 'test_report_semantics', 'test_run_diagnostics', 'test_scheduler_first_run', 'test_service_inventory', 'test_task_launch', 'test_verify_saved_capture'))
 SCRIPTS = frozenset(('test_burp_import', 'test_decision_agent', 'test_evidence_pipeline', 'test_evidence_recovery', 'test_master_scheduler', 'test_policy'))
-RUNTIME = frozenset(('test_coordinated_runtime', 'test_evidence_readonly_runtime'))
+RUNTIME = frozenset(('test_model_adapter_runtime', 'test_coordinated_runtime', 'test_evidence_readonly_runtime'))
 MANUAL = frozenset(('test_agent_tool_selection', 'test_agent_v3_selection', 'test_approval_mcp', 'test_harness_mcp', 'test_local_tool_mcp', 'test_mcp_connection', 'test_network_mcp', 'test_pi_provider', 'test_shell_disabled', 'test_tool_v3_mcp'))
 
 
@@ -36,8 +37,10 @@ def run_suite(name, timeout=180):
     env=os.environ.copy()
     env['PYTHONPATH']=str(ROOT) # actual checkout; never the historical hardcoded root
     env.pop('PYTHONOPTIMIZE',None) # legacy assert scripts must actually execute assertions
-    return subprocess.run(command(name),cwd=ROOT,env=env,stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout)
+    with tempfile.TemporaryDirectory(prefix='pm-suite-model-audit-') as directory:
+        env['PM_MODEL_AUDIT_DIR']=directory
+        return subprocess.run(command(name),cwd=ROOT,env=env,stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout)
 
 
 def main(argv=None):

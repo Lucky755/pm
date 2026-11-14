@@ -127,6 +127,7 @@ def display(event, stream=None):
                        'previous_state', 'current_state', 'input_tokens', 'cache_read_tokens',
                        'output_tokens', 'coordinator_run_id', 'step_id', 'question', 'expected_result',
                        'known_ports','checked_ports','unchecked_ports','reachable_ports',
+                       'request_id','session_id','mode','recovery_attempt',
                        'changed', 'unfinished', 'journal')
                       if event.get(key) is not None)
     try:
