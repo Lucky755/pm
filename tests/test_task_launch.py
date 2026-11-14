@@ -102,6 +102,7 @@ class TaskLaunchTests(unittest.TestCase):
     def test_continue_keeps_run_and_report_numbers_without_rescanning(self):
         self.new()
         with self.case.connect() as db:run_id=runtime.pause(db,11)['coordinator_run_id']
+        self.case.answer_pending()
         self.trace.clear()
         model=self.case.model([decision('verify','Verify through an independent HTTP probe?'),decision(action='wait_operator')])
         with patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):
@@ -145,7 +146,7 @@ class TaskLaunchTests(unittest.TestCase):
              patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):
             result=pm.op_resume(self.args('resume','11','--coordinated'))
         self.assertEqual(calls,[ports])
-        self.assertEqual(result['stop_reason'],'model_waiting_operator')
+        self.assertEqual(result['stop_reason'],'operator_questions_pending')
         self.assertEqual([v[0] for v in self.case.calls],['vuln'])
         self.assertNotIn('scan',self.trace)
         mapped=self.case.prompts[0]['service_map']
@@ -266,25 +267,23 @@ class TaskLaunchTests(unittest.TestCase):
             ['resume','11','--coordinated','--expect-flags','bad'],
             ['resume','11','--coordinated','--reprobe','80,80'],
             ['resume','11','--coordinated','--continue-coordinated','--approve-step','1']):
-            with self.subTest(command=command),self.assertRaises(pm.OperatorError):
+            with self.subTest(command=command),self.assertRaises((pm.OperatorError,SystemExit)):
                 args=self.args(*command)
                 (pm.op_new if command[0]=='new' else pm.op_resume)(args)
         self.assertEqual(self.trace,[])
         self.assertEqual(self.case.calls,[])
         with self.case.connect() as db:self.assertIsNone(runtime.saved(db,11))
 
-    def test_access_approval_and_bad_id_are_explicit_before_network(self):
-        model=self.case.model([decision('access','Prove the authorized user boundary?')])
+    def test_access_is_automatic_and_obsolete_approval_cli_is_rejected(self):
+        model=self.case.model([decision('access','Prove the authorized user boundary?'),decision()])
         with patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):
             result=pm.op_resume(self.args('resume','11','--coordinated'))
-        step=result['steps'][0]['id'];self.trace.clear()
-        with self.assertRaises(pm.OperatorError):pm.op_resume(self.args('resume','11','--approve-step',str(step+10)))
-        self.assertEqual(self.trace,[]);self.assertEqual(self.case.calls,[])
-        model=self.case.model([decision(action='wait_operator')])
-        with patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):
-            result=pm.op_resume(self.args('resume','11','--approve-step',str(step)))
         self.assertEqual(result['steps'][0]['status'],'completed')
+        self.assertIsNone(result['steps'][0]['approved_at'])
         self.assertEqual([v[0] for v in self.case.calls],['access'])
+        self.trace.clear()
+        with self.assertRaises(SystemExit):self.args('resume','11','--approve-step','1')
+        self.assertEqual(self.trace,[])
 
     def test_pending_pause_cannot_be_bypassed_by_legacy_or_mutating_flags(self):
         self.new();self.trace.clear()
@@ -310,7 +309,7 @@ class TaskLaunchTests(unittest.TestCase):
             pm.interactive()
         self.assertEqual(self.trace,[])
         self.assertIn('Сохранённый режим: coordinated',self.case.console.getvalue())
-        self.assertIn('model_waiting_operator',self.case.console.getvalue())
+        self.assertIn('operator_questions_pending',self.case.console.getvalue())
 
     def test_budget_types_are_independent(self):
         with self.case.connect() as db:db.execute('DELETE FROM pm_tcp_full_scans')
@@ -330,7 +329,7 @@ class TaskLaunchTests(unittest.TestCase):
         old.assert_called_once()
 
     def test_old_task_does_not_infer_launch_mode_from_coordinator_history(self):
-        c.run(11,api_key='fake-only',model=self.case.model([decision(action='wait_operator')]),role_runner=self.case.role)
+        c.run(11,api_key='fake-only',model=self.case.model([decision()]),role_runner=self.case.role)
         with self.case.connect() as db:self.assertIsNone(runtime.saved(db,11))
         with patch.object(pm,'launch_legacy_task',return_value='legacy'):
             self.assertEqual(pm.op_resume(self.args('resume','11')),'legacy')
@@ -372,6 +371,7 @@ class TaskLaunchTests(unittest.TestCase):
 
     def test_one_run_spans_creation_to_pause_and_continuation_keeps_coordinator_id(self):
         with d.run('new fixture',fresh=True):self.new()
+        self.case.answer_pending()
         model=self.case.model([decision('verify','Verify with an independent probe?'),decision(action='wait_operator')])
         with d.run('resume fixture',11,fresh=True),\
              patch.object(c,'choose_with_model',side_effect=lambda prompt,key,tokens:model(prompt,key)):

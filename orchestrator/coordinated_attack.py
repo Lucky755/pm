@@ -18,7 +18,7 @@ from orchestrator import model_adapter, instructions, task_memory
 from orchestrator import agent_actions as actions, attack_loop, diagnostics, flag_verify, objectives
 from orchestrator import evidence_pipeline as evidence
 from orchestrator import coordinator_checkpoints as checkpoints
-from orchestrator import report_integrity
+from orchestrator import report_integrity, operator_questions
 from orchestrator.harness_env import harness_env
 
 LOCK_DIR = actions.ROOT / 'runtime/coordinator_locks'
@@ -27,12 +27,14 @@ MAX_STEPS = 32
 MAX_RETRIES = 2
 FIELDS = {'action', 'role', 'profile', 'question', 'reason', 'references', 'inputs',
           'boundaries', 'expected_result', 'stop_kind'}
+OPTIONAL_FIELDS={'branch_id','operator_question'}
 DECISION_ERRORS = {'decision_fields','decision_action','decision_question','decision_reason',
                    'decision_expected_result','unsafe_decision_text','unknown_reference','role_not_allowed',
                    'access_triage_required','non_role_action_has_role','stop_kind','success_not_evidence_backed',
                    'unexpected_stop_kind','repeated_question_without_new_evidence','coordinator_tool_request',
                    'coordinator_model_not_completed','triage_objective_rejected',
-                   'unknown_profile','invalid_boundaries','resource_not_authorized','invalid_inputs'}
+                   'unknown_profile','invalid_boundaries','resource_not_authorized','invalid_inputs',
+                   'invalid_operator_question','invalid_branch','branch_waiting_operator'}
 
 
 class DecisionRejected(ValueError):
@@ -79,6 +81,7 @@ def ensure_schema(db):
         if column not in columns:
             db.execute(f'ALTER TABLE pm_coordinator_steps ADD COLUMN {column} TEXT')
     checkpoints.initialize(db)
+    operator_questions.initialize(db)
     db.commit()
 
 
@@ -149,7 +152,9 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
                  'identifications':semantic_set({k:v for k,v in item.items() if k!='source'}
                                                 for item in entry['identifications'])}
                 for entry in actions.service_inventory.collect_full(db,task_id)['entries']]
-    return {'version':2,'intent':context['intent'],'target':context['target'],
+    answers=[{'kind':q['kind'],'branch_id':q['branch_id'],'answer':q['answer']}
+             for q in operator_questions.listing(db,task_id) if q['status']=='answered']
+    return {'version':2,**({'operator_answers':semantic_set(answers)} if answers else {}),'intent':context['intent'],'target':context['target'],
             'goals':[{k:g.get(k) for k in ('key','title','role','weight','status')} for g in goals['objectives']],
             'goal_policy':{k:goals.get(k) for k in ('mode','exclusive','expected_flags')},
             'access':access_knowledge(essential),'triage':triage,'services':semantic_set(services),
@@ -207,6 +212,7 @@ def snapshot(db, task_id, expect):
         refs['asset:' + digest([item['kind'], item['key']])] = item
     for item in reports:
         refs[f"report:{item['role']}:{item['iteration']}"] = item
+    for question in operator_questions.listing(db,task_id):refs['operator_question:'+str(question['id'])]=question
     recent = results[-20:]
     for item in results:
         if isinstance(item['result_id'], str) and item['result_id']:
@@ -230,7 +236,8 @@ def snapshot(db, task_id, expect):
             'knowledge_sha256':digest(knowledge),
             'history_sha256':digest({'result_ids':[r['result_id'] for r in results],'reports':reports}),
             'state_sha256':digest(knowledge), 'confirmed_flags': confirmed,
-            'operator_checkpoints':checkpoints.history(db,task_id,context['target']),
+            'operator_checkpoints':{**checkpoints.history(db,task_id,context['target']),'blocking':False},
+            'operator_questions':operator_questions.listing(db,task_id),
             'flag_candidates':flag_candidates,
             'success_verified': success, 'verified_stop_reason': stop,
             'authorization_block': authorization(db, context, mapped)}
@@ -243,7 +250,7 @@ def parse_decision(value, state, roles):
         if fenced:
             value = fenced[1]
     decision = json.loads(value) if isinstance(value, str) else value
-    if not isinstance(decision, dict) or set(decision) != FIELDS:
+    if not isinstance(decision, dict) or not FIELDS<=set(decision) or set(decision)-FIELDS-OPTIONAL_FIELDS:
         raise DecisionRejected('decision_fields', missing=sorted(FIELDS-set(decision)) if isinstance(decision,dict) else sorted(FIELDS),
                                unexpected_count=len(set(decision)-FIELDS) if isinstance(decision,dict) else 0)
     if decision['action'] not in ('run_role','wait_operator','stop'):
@@ -271,7 +278,20 @@ def parse_decision(value, state, roles):
     if (not isinstance(resources,list) or not 1<=len(resources)<=12
             or any(not isinstance(r,str) or r not in state['known_resources'] for r in resources)):
         raise ValueError('resource_not_authorized')
+    branch=operator_questions.branch(decision)
+    if (not isinstance(branch,str) or branch!='task' and (branch not in state['known_resources']
+            or not branch.startswith('service:') or resources!=[branch])):
+        raise ValueError('invalid_branch')
+    if decision['action']=='wait_operator':
+        question=decision.get('operator_question')
+        if not isinstance(question,dict) or set(question)!={'kind'} or question['kind'] not in operator_questions.KINDS:
+            raise ValueError('invalid_operator_question')
+        if question['kind']=='flag_confirmation' and len([ref for ref in refs if ref.startswith('flag:')])!=1:
+            raise ValueError('invalid_operator_question')
+        if operator_questions.blocked(decision,state):raise ValueError('branch_waiting_operator')
+    elif 'operator_question' in decision:raise ValueError('invalid_operator_question')
     if decision['action']=='run_role':
+        if operator_questions.blocked(decision,state):raise ValueError('branch_waiting_operator')
         if not isinstance(decision['profile'],str):raise ValueError('unknown_profile')
         instructions.profile(decision['role'],decision['profile'])
     elif decision['profile'] is not None:
@@ -331,7 +351,15 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
         data['format_recovery']={'attempt':recovery_attempt,'rejected_response_untrusted':raw[:16000],
                                  'omitted_characters':max(0,len(raw)-16000)}
     return ("You coordinate a manually authorized pentest without tools.\n"+instructions.common('analysis')+"\n"
-            "Choose exactly ONE concrete question for ONE allowed role/profile, wait for the operator, or stop. "
+            "Work autonomously inside the saved assignment, including ACCESS and using credential candidates. "
+            "The checkpoint classifier is disabled as an execution gate; labels never require approval. "
+            "Interpret unusual responses from saved bytes; missing fixed-rule classification is not a stop reason. "
+            "Choose exactly ONE concrete question for ONE allowed role/profile, enqueue a necessary operator question, or stop. "
+            "Operator questions are only pivoting, tool installation/acquisition or documentation, budget, flag_confirmation. "
+            "Use branch_id=service reference with boundaries.resource_refs=[branch_id] for a resource branch, or task for a global dependency. "
+            "Pending questions block only their branch; continue useful independent service branches within budgets. "
+            "Never evade a blocked branch by using task-wide boundaries. Answers do not grant new scope or increase budgets. "
+            "Omit operator_question for run_role and stop; it is required only for wait_operator. "
             "Use existing reference keys and a profile listed for that role in specialist_profiles. "
             "flag_candidates lists concrete validation blockers; do not claim success unless success_verified is true. "
             "When access.pending is true, choose ACCESS with a question starting 'ТРИАЖ:'; do not escalate. "
@@ -345,7 +373,9 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             '"inputs":[{"reference":"one entry for every references key in the same order"}],'
             '"question":"one concrete check","reason":"brief justification",'
             '"references":["intent"],"expected_result":"observable evidence expected",'
-            '"stop_kind":"success|incomplete for stop, otherwise null"}.\n'
+            '"stop_kind":"success|incomplete for stop, otherwise null",'
+            '"branch_id":"task or a service known_resources reference",'
+            '"operator_question":{"kind":"pivoting|tool|budget|flag_confirmation; only for wait_operator"}}.\n'
             + '<pm_dynamic_context>\n'
             + ('Previous response rejected: ' + error + '.\n' if error else '')
             + encoded(data))
@@ -424,7 +454,7 @@ def repeated(db, task_id, decision, state):
 
 
 def significant(before, after, report):
-    """Reason for an evidence-classified checkpoint, never report confidence."""
+    """Legacy descriptive helper only. Never used to gate execution."""
     old=before['essential_state']['access_state'];new=after['essential_state']['access_state']
     if (old['level'],old['signal']) != (new['level'],new['signal']):
         return 'access_state_changed'
@@ -508,7 +538,8 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
             'task_id':task_id,'coordinator_run_id':run_id,'stop_reason':reason,
             'expected_flags':expect,'confirmed_flags':state['confirmed_flags'],
             'objectives_matrix':attack_loop.objective_matrix(state['objectives']['objectives']),
-            'checkpoints':checkpoints.pause_details(db,task_id,state['task']['target']),
+            'checkpoints':[], 'checkpoint_classifier_blocking':False,
+            'operator_questions':operator_questions.listing(db,task_id),
             'steps':[step_view(row) for row in rows]}
 
 
@@ -519,7 +550,9 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
         model=None, role_runner=None):
     if not 1 <= max_steps <= MAX_STEPS or not 0 <= decision_retries <= MAX_RETRIES:
         raise ValueError('Coordinator budget out of range')
-    if sum((bool(continue_run),approve_step is not None,abandon_running_step is not None)) > 1:
+    if approve_step is not None:
+        raise ValueError('ACCESS approval has been removed; use the operator question inbox')
+    if sum((bool(continue_run),abandon_running_step is not None)) > 1:
         raise ValueError('Select only one operator continuation action')
     if not roles or any(r not in actions.ROLES for r in roles):
         raise ValueError('Invalid allowed roles')
@@ -542,6 +575,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
         db = actions.connect()
         try:
             ensure_schema(db)
+            operator_questions.retire_legacy(db,task_id,steps(db,task_id))
             registry = flag_verify.scan(task_id, db=db)
             for raw,saved_role,saved_iteration in db.execute('SELECT report_json,role,iteration FROM pm_agent_action_reports WHERE task_id=? ORDER BY iteration',
                                      (task_id,)).fetchall():
@@ -581,49 +615,31 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 diagnostics.emit('coordinator.pause_resolved', step_id=running['id'], reason='operator_reviewed_unknown_outcome')
             elif abandon_running_step is not None:
                 raise ValueError('No matching running step')
-            waiting = next((r for r in steps(db,task_id) if r['status']=='waiting_operator'),None)
-            if waiting:
-                decision = json.loads(waiting['decision_json'])
-                if decision['action']=='run_role':
-                    if approve_step == waiting['id']:
-                        if waiting['state_sha256'] != state['state_sha256']:
-                            return finish('approval_state_changed_use_continue_to_replan','waiting_operator')
-                        update_step(db,waiting['id'],'planned',approved_at=now(),error='')
-                    elif continue_run:
-                        update_step(db,waiting['id'],'failed',error='operator_requested_replan')
-                    else:
-                        return finish('role_approval_required','waiting_operator')
+            # A question step is an intent to ask, never an executed specialist.
+            questions=operator_questions.listing(db,task_id)
+            for waiting in [r for r in steps(db,task_id) if r['status']=='waiting_operator']:
+                question=next((q for q in questions if q['step_id']==waiting['id']),None)
+                if question:
+                    if question['status']=='answered':
+                        update_step(db,waiting['id'],'failed',error='operator_question_answered_no_action')
                 elif continue_run:
-                    update_step(db,waiting['id'],'completed',error='operator_continued')
+                    update_step(db,waiting['id'],'failed',error='operator_requested_replan')
                 else:
-                    return finish('model_waiting_operator','waiting_operator')
-            elif approve_step is not None:
-                raise ValueError('No matching step awaiting approval')
-            if run_status=='waiting_operator' and pause_id and not waiting and not running and not continue_run:
+                    return finish('legacy_operator_question_requires_replan','waiting_operator')
+            state=snapshot(db,task_id,expect_flags)
+            pending_questions=[q for q in questions if q['status']=='pending']
+            if pending_questions and (not operator_questions.available(state) or
+                    run_status=='waiting_operator' and not continue_run):
+                return finish('operator_questions_pending','waiting_operator')
+            if (run_status=='waiting_operator' and pause_id and not running and not continue_run
+                    and old_reason not in operator_questions.RETIRED_PAUSES and not questions):
                 return finish(old_reason,'waiting_operator')
-            if continue_run and pause_id:
-                if old_reason=='significant_finding' and not checkpoints.pending(db,task_id,target):
-                    # Upgrade review metadata for an old pause using only original
-                    # captures referenced by that report, never unrelated evidence.
-                    refs=checkpoints.finding_refs(checkpoints.legacy_report(db,task_id,pause_id))
-                    checkpoints.register(db,task_id,target,pause_id,
-                        checkpoints.collect(db,task_id,state,state,references=refs))
-                reviewed=checkpoints.review(db,task_id,target,pause_id)
-                if reviewed:
-                    diagnostics.emit('coordinator.checkpoint_reviewed',coordinator_run_id=run_id,
-                                     identifiers={'checkpoint_ids':reviewed},reason='operator_continued_after_review')
-            unreviewed=checkpoints.pending(db,task_id,target)
-            if unreviewed:
-                # A crash after recording a finding but before saving the pause
-                # must not dispatch another role or lose the review request.
-                with db:
-                    db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',
-                               (unreviewed[0]['step_id'],run_id))
-                return finish('significant_finding','waiting_operator')
             with db:
                 db.execute("UPDATE pm_coordinator_runs SET status='running',pause_step_id=NULL WHERE id=?",(run_id,))
             for _ in range(max_steps):
                 state = snapshot(db,task_id,expect_flags)
+                if any(q['status']=='pending' for q in state['operator_questions']) and not operator_questions.available(state):
+                    return finish('operator_questions_pending','waiting_operator')
                 if state['authorization_block']:
                     return finish(state['authorization_block'],'waiting_operator')
                 if state['success_verified']:
@@ -667,15 +683,18 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                                      question=decision['question'],reason=decision['reason'],
                                      references=decision['references'],expected_result=decision['expected_result'])
                 if decision['action']=='wait_operator':
-                    update_step(db,step_id,'waiting_operator',error='model_waiting_operator')
-                    return finish('model_waiting_operator','waiting_operator')
+                    question=operator_questions.request(db,task_id,target,decision,step_id)
+                    update_step(db,step_id,'waiting_operator' if question['status']=='pending' else 'failed',
+                                error='operator_question_pending' if question['status']=='pending' else 'operator_question_already_answered')
+                    state=snapshot(db,task_id,expect_flags)
+                    if question['branch_id']=='task' or not operator_questions.available(state):
+                        return finish('operator_questions_pending','waiting_operator')
+                    continue
                 if decision['action']=='stop':
                     update_step(db,step_id,'completed')
+                    if not state['success_verified'] and any(q['status']=='pending' for q in state['operator_questions']):
+                        return finish('operator_questions_pending','waiting_operator')
                     return finish(state['verified_stop_reason'] if state['success_verified'] else 'model_stopped_incomplete')
-                if decision['role']=='access' and not pending['approved_at']:
-                    update_step(db,step_id,'waiting_operator',error='role_approval_required')
-                    diagnostics.emit('coordinator.pause',step_id=step_id,reason='access_requires_operator_approval')
-                    return finish('role_approval_required','waiting_operator')
                 if repeated(db,task_id,decision,state):
                     update_step(db,step_id,'failed',error='repeated_question_without_new_evidence')
                     return finish('repeated_question_without_new_evidence','failed')
@@ -762,14 +781,10 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                                  history_changed=before['history_sha256']!=state['history_sha256'])
                 if state['success_verified']:
                     return finish(state['verified_stop_reason'])
-                notices=checkpoints.register(db,task_id,target,step_id,checkpoints.collect(db,task_id,before,state))
-                if notices:
-                    pause=significant(before,state,report) or 'significant_finding'
-                    with db:
-                        db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
-                    diagnostics.emit('coordinator.pause',step_id=step_id,reason=pause,
-                                     identifiers={'checkpoint_ids':[item['id'] for item in notices]})
-                    return finish(pause,'waiting_operator')
+                # Classifier labels are descriptive only. No collect/pending/review
+                # call is allowed to gate execution here, including on resume.
+            if any(q['status']=='pending' for q in state['operator_questions']):
+                return finish('operator_questions_pending','waiting_operator')
             return finish('coordinator_step_limit')
         finally:
             db.close()

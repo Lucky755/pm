@@ -38,6 +38,7 @@ sys.path.insert(0, str(ROOT))
 
 from executor.tool_catalog import detect_tools
 from executor.tool_executor_v3 import PROFILES
+from executor.netguard_root import reject_password_change
 from orchestrator import fact_state, diagnostics, task_memory
 
 
@@ -1371,6 +1372,8 @@ def pm_poc_run(
 
     if not isinstance(timeout, int) or isinstance(timeout, bool) or not 5 <= timeout <= 300:
         return response("poc_run", "blocked", 1, stderr="Invalid timeout")
+    try:reject_password_change(text=path.read_text(encoding='utf-8',errors='replace'))
+    except ValueError as exc:return response('poc_run','blocked',1,stderr=str(exc))
 
     command = [
         str(PYTHON),
@@ -1446,6 +1449,8 @@ def pm_net_exec(
 
     if not isinstance(timeout, int) or isinstance(timeout, bool) or not 5 <= timeout <= 180:
         return response("net_exec", "blocked", 1, stderr="Invalid timeout")
+    try:reject_password_change(argv)
+    except ValueError as exc:return response('net_exec','blocked',1,stderr=str(exc))
 
     try:
         blocked = guard_explicit_assets(
@@ -1751,6 +1756,8 @@ def pm_session(
 
             if len(parsed) > 64 or any(len(item) > 4096 for item in parsed):
                 return blocked("argv_json is too large")
+            try:reject_password_change(parsed)
+            except ValueError as exc:return blocked(str(exc))
 
             command.extend(["--argv-json", json.dumps(parsed)])
 
@@ -1768,6 +1775,8 @@ def pm_session(
         if len(str(data).encode("utf-8")) > 65536:
             return blocked("data is too large")
 
+        try:reject_password_change(text=data)
+        except ValueError as exc:return blocked(str(exc))
         command.extend(["--data", data])
 
     if action in ("send", "read", "interrupt") and isinstance(wait, (int, float)) and not isinstance(wait, bool):

@@ -67,6 +67,10 @@ def ensure_schema(db):
         task_id INTEGER NOT NULL, level TEXT NOT NULL, category TEXT NOT NULL,
         summary TEXT NOT NULL, result_id TEXT NOT NULL, quote TEXT NOT NULL,
         updated_at TEXT NOT NULL, PRIMARY KEY(task_id,level,category))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS pm_credential_acceptance (
+        id INTEGER PRIMARY KEY,task_id INTEGER NOT NULL,target TEXT NOT NULL,
+        result_id TEXT NOT NULL,quote TEXT NOT NULL,created_at TEXT NOT NULL,
+        UNIQUE(task_id,target,result_id,quote))''')
 
 
 ASSET_KINDS = frozenset({'port', 'url', 'path', 'service', 'file', 'credential', 'host'})
@@ -309,9 +313,9 @@ def access_state(db, task_id):
     if not row:
         return {'level': 'none', 'signal': 'none', 'access_result_id': '',
                 'triage_done': False, 'pending': False}
-    return {'level': row[0], 'signal': row[1], 'access_result_id': row[2],
+    return {'level': 'none' if row[1]=='credential' else row[0], 'signal': row[1], 'access_result_id': row[2],
             'triage_done': bool(row[3]),
-            'pending': row[1] != 'none' and not bool(row[3])}
+            'pending': row[1] not in ('none','credential') and not bool(row[3])}
 
 
 def validate_access_report(report, records, prior_ids=()):
@@ -326,11 +330,16 @@ def validate_access_report(report, records, prior_ids=()):
     result_id = str(report.get('access_probe_result_id') or '')
     quote = str(report.get('access_quote') or '').strip()[:400]
     record = records.get(result_id) if result_id not in prior_ids else None
+    if signal=='credential':
+        source=(record or {}).get('capture_record') or {}
+        if source.get('provenance')!='network' or (source.get('result') or {}).get('cached'):
+            record=None
     if signal != 'none' and (not record or record.get('status') not in ('completed','ok') or not quote or
                              quote not in str(record.get('text') or '') or
                              (signal != 'credential' and (level == 'none' or evidence_claims.PROBE_DENIAL.search(quote)))):
         report['access_warning'] = 'Заявление о доступе без нового вывода и точной цитаты'
         signal, level, result_id, quote = 'none', 'none', '', ''
+    if signal=='credential':level='none'
     report.update(access_level=level, access_signal=signal,
                   access_probe_result_id=result_id if signal != 'none' else '',
                   access_quote=quote if signal != 'none' else '')
@@ -354,6 +363,16 @@ def save_access_report(db, task_id, report):
     ensure_schema(db)
     state = access_state(db, task_id)
     level, signal = report.get('access_level', 'none'), report.get('access_signal', 'none')
+    if signal=='credential':
+        # A quoted authentication acceptance is distinct from obtaining a shell
+        # or execution. Preserve it without overwriting an actual access level.
+        rid=report.get('access_probe_result_id');quote=report.get('access_quote')
+        if rid and quote:
+            target=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()
+            if target:
+                db.execute('INSERT OR IGNORE INTO pm_credential_acceptance(task_id,target,result_id,quote,created_at) '
+                           'VALUES(?,?,?,?,?)',(task_id,target[0],rid,quote,now()))
+        return
     if signal != 'none':
         if ACCESS_LEVELS.index(level) < ACCESS_LEVELS.index(state['level']):
             level = state['level']

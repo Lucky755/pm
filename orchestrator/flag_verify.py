@@ -590,13 +590,14 @@ def listing(task_id):
           objective_key, weight in rows]
 
 
-def operator_confirm(task_id, value, note=''):
-    db = connect()
+def operator_confirm(task_id, value, note='', *, db=None):
+    owned=db is None
+    db = connect() if owned else db
     existing = db.execute('SELECT value,sources_json FROM pm_verified_flags WHERE task_id=? AND value=?',
                           (task_id, str(value).strip())).fetchone()
     value = existing[0] if existing else canonical_flag_value(value, flag_patterns(db, task_id))
     if value is None:
-        db.close()
+        if owned:db.close()
         raise ValueError('Expected exactly one flag value')
     try:
         stamp = now()
@@ -620,9 +621,9 @@ def operator_confirm(task_id, value, note=''):
             (task_id, value, 'confirmed', 0, 'operator',
              json.dumps(sources, ensure_ascii=False), stamp, stamp),
         )
-        db.commit()
+        if owned:db.commit()
     finally:
-        db.close()
+        if owned:db.close()
     return {'status': 'completed', 'task_id': task_id, 'value': value,
             'flag_status': 'confirmed'}
 

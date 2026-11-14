@@ -1277,7 +1277,9 @@ def validate_launch_options(args, mode, *, new=False):
         raise OperatorError('Нужен конкретный интерфейс, например tun0')
     if getattr(args,'reprobe',None):
         reprobe_ports(args.reprobe)
-    controls=(bool(getattr(args,'continue_coordinated',False)),getattr(args,'approve_step',None) is not None,
+    if getattr(args,'approve_step',None) is not None:
+        raise OperatorError('Одобрение ACCESS удалено; используйте очередь вопросов оператору')
+    controls=(bool(getattr(args,'continue_coordinated',False)),False,
               getattr(args,'abandon_running_step',None) is not None)
     if sum(controls)>1 or new and any(controls):
         raise OperatorError('Выбери одно действие продолжения только для существующей задачи')
@@ -1296,15 +1298,14 @@ def validate_launch_options(args, mode, *, new=False):
     roles=getattr(args,'roles',None)
     if roles is not None and (not roles.strip() or any(r.strip().lower() not in ('recon','vuln','access','verify') for r in roles.split(','))):
         raise OperatorError('Недопустимые роли координатора')
-    for name in ('approve_step','abandon_running_step'):
+    for name in ('abandon_running_step',):
         value=getattr(args,name,None)
         if value is not None and value<1:
             raise OperatorError('ID шага должен быть положительным')
 
 
 def continuation_requested(args):
-    return (getattr(args,'continue_coordinated',False) or getattr(args,'approve_step',None) is not None
-            or getattr(args,'abandon_running_step',None) is not None)
+    return (getattr(args,'continue_coordinated',False) or getattr(args,'abandon_running_step',None) is not None)
 
 
 def render_coordinator_result(result, args):
@@ -1320,11 +1321,13 @@ def render_coordinator_result(result, args):
         line('  Отчёт неполон или противоречив; требует проверки оператором. Исход исполнения приведён отдельно. '
              'Автоматический повтор роли заблокирован.')
     line(f"  Исследовательская цель подтверждена: {result['succeeded']}")
-    for point in result.get('checkpoints',[]):
-        line('  Контрольная точка: '+safe_display(diagnostics.clean(point['title'],limit=500)))
-        line('    Доказательство: '+', '.join(safe_display(ref) for ref in point['evidence_refs']))
-        line('    Причина паузы: '+safe_display(point['reason']))
-        line('    Действие оператора: '+safe_display(point['operator_action']))
+    for question in result.get('operator_questions',[]):
+        line(f"  Вопрос #{question['id']} [{question['status']}] · {safe_display(question['kind'])} · ветка {safe_display(question['branch_id'])}")
+        line('    '+safe_display(question['question']))
+        line('    Причина: '+safe_display(question['reason']))
+        line('    Границы: '+safe_display(json.dumps(question['boundaries'],ensure_ascii=False)))
+        line('    Ссылки: '+', '.join(safe_display(ref) for ref in question['references']))
+        if question.get('answer'):line('    Ответ сохранён: '+safe_display(question['answer']['decision']))
     for step in result['steps']:
         decision=step['decision']
         report_label={'reserved':'зарезервирован номер отчёта','saved':'сохранён отчёт',
@@ -1360,12 +1363,11 @@ def render_coordinator_result(result, args):
             line('    Основание: ' + safe_display(decision['reason']))
             line('    Ожидается: ' + safe_display(decision['expected_result']))
     if result['status']=='waiting_operator':
-        if result['stop_reason']=='role_approval_required':
-            step=next((s for s in result['steps'] if s['status']=='waiting_operator'),None)
-            line(f"  Одобрение ACCESS: проверьте вопрос и границы; --approve-step {step['id'] if step else 'ID'} разрешит только этот шаг.")
-        elif result['stop_reason']=='interrupted_running_step':
+        if result['stop_reason']=='interrupted_running_step':
             step=next((s for s in result['steps'] if s['status']=='running'),None)
             line(f"  Исход неизвестен. Проверьте сохранённые результаты; --abandon-running-step {step['id'] if step else 'ID'} разрешит перепланирование без повтора шага.")
+        elif result.get('operator_questions'):
+            line(f"  Ответить: pm questions {result['task_id']}. Ожидание сохраняется; консоль остаётся доступной.")
         else:
             line('  Пауза сохранена. --continue-coordinated продолжает после проверки результатов.')
     return result
@@ -1388,7 +1390,7 @@ def run_task_coordinator(db, task_id, args):
         max_steps=option('coordinator_steps',8),decision_retries=option('decision_retries',1),
         poc_budget=option('poc_budget',7),step_limit=option('step_limit',15),max_tokens=option('max_tokens',24000),
         expect_flags=expect,key_provider=lambda:session_api_key(args,required=True),
-        continue_run=getattr(args,'continue_coordinated',False),approve_step=getattr(args,'approve_step',None),
+        continue_run=getattr(args,'continue_coordinated',False),
         abandon_running_step=getattr(args,'abandon_running_step',None))
     return render_coordinator_result(result,args)
 
@@ -1398,6 +1400,10 @@ def launch_configured_task(db, task_id, target, args):
     with task_lock(task_id):
         if getattr(args,'coordinated',False):
             return launch_coordinated_task(db,task_id,target,args)
+        from orchestrator import task_runtime
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_coordinator_runs'").fetchone():
+            paused=task_runtime.pause(db,task_id)
+            if paused and paused.get('coordinator_run_id'):return render_coordinator_result(paused,args)
         return launch_legacy_task(db,task_id,target,args)
 
 
@@ -1531,13 +1537,12 @@ def op_resume(args):
         paused=task_runtime.pause(db,args.task_id)
         if not args.coordinated and paused and (task_runtime.saved(db,args.task_id) or {}).get('mode')=='coordinated':
             raise OperatorError('Сначала разбери сохранённую паузу coordinated-режима; переключение режима её не отменяет')
+        if not args.coordinated and paused and paused.get('coordinator_run_id'):
+            return render_coordinator_result(paused,args)
         if args.coordinated:
             if paused:
                 running=next((s for s in paused['steps'] if s['status']=='running'),None)
                 waiting=next((s for s in paused['steps'] if s['status']=='waiting_operator'),None)
-                if getattr(args,'approve_step',None) is not None and (
-                        not waiting or waiting['id']!=args.approve_step or waiting['decision']['action']!='run_role'):
-                    raise OperatorError('Нет соответствующего шага ACCESS для одобрения')
                 if getattr(args,'abandon_running_step',None) is not None and (
                         not running or running['id']!=args.abandon_running_step):
                     raise OperatorError('Нет соответствующего running-шага')
@@ -1552,7 +1557,7 @@ def op_resume(args):
                     if not getattr(args,'json',False):
                         line('  Режим задачи: coordinated · сохранённая пауза')
                     return render_coordinator_result(paused,args)
-            elif getattr(args,'approve_step',None) is not None or getattr(args,'abandon_running_step',None) is not None:
+            elif getattr(args,'abandon_running_step',None) is not None:
                 raise OperatorError('Нет сохранённого шага для этого операторского действия')
         task_runtime.save_mode(db,args.task_id,mode)
         target = configure(db, args.task_id, args)
@@ -2467,6 +2472,29 @@ def op_status(args):
             line('  Имена хоста: ' + ', '.join(json.loads(aliases[0])))
 
 
+def op_questions(args):
+    from orchestrator import coordinated_attack, operator_questions, agent_actions
+    with coordinated_attack.task_lock(args.task_id), connect() as db:
+        task_target(db,args.task_id)
+        if getattr(args,'answer',None) is not None:
+            if not getattr(args,'decision',None):raise OperatorError('Для ответа нужен --decision')
+            text=getattr(args,'answer_text','')
+            if getattr(args,'note_file',None):text=Path(args.note_file).read_text(encoding='utf-8')
+            operator_questions.answer(db,args.task_id,args.answer,args.decision,text,
+                capability_log=agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl')
+        rows=operator_questions.listing(db,args.task_id)
+        if getattr(args,'json',False):line(json.dumps(rows,ensure_ascii=False,indent=2))
+        else:
+            for item in rows:
+                line(f"  Вопрос #{item['id']} [{item['status']}] {safe_display(item['kind'])} · {safe_display(item['branch_id'])}")
+                line('    '+safe_display(item['question'])+' · '+safe_display(item['reason']))
+                line('    Границы: '+safe_display(json.dumps(item['boundaries'],ensure_ascii=False)))
+                line('    Ссылки: '+', '.join(safe_display(ref) for ref in item['references']))
+            if not rows:line('  Ожидающих или сохранённых вопросов нет.')
+            line('  Ответ не расширяет scope и бюджеты. Продолжение — обычный resume.')
+        return rows
+
+
 def op_hosts(args):
     with connect() as db:
         target = configure(db, args.task_id, args)
@@ -2495,6 +2523,10 @@ def attack_task(args):
             or explicit & {'--coordinator-steps','--decision-retries'}):
         raise OperatorError('Параметры координатора требуют --coordinated')
     with connect() as db:
+        from orchestrator import task_runtime
+        paused=task_runtime.pause(db,args.task_id)
+        if not getattr(args,'coordinated',False) and paused and paused.get('coordinator_run_id'):
+            return render_coordinator_result(paused,args)
         save_flag_options(db, args.task_id, args)
         objective_state = save_objective_options(db, args.task_id, args)
 
@@ -2868,6 +2900,12 @@ def parser_main():
     resume = sub.add_parser('resume', help='Продолжить существующую задачу')
     resume.add_argument('task_id', type=int)
     resume.add_argument('--reprobe', help='Однократно перепроверить 1..32 порта после ремонта сети, напр. 22,80')
+    questions = sub.add_parser('questions', help='Очередь вопросов оператору; без API и сети')
+    questions.add_argument('task_id',type=int)
+    questions.add_argument('--answer',type=int,help='ID ожидающего вопроса')
+    questions.add_argument('--decision',choices=('approve','decline','information'))
+    questions.add_argument('--note-file',help='Файл пояснения UTF-8; ответ не передаётся модели до продолжения')
+    questions.add_argument('--json',action='store_true')
     status = sub.add_parser('status', help='Показать краткий отчёт')
     status.add_argument('task_id', type=int)
     close = sub.add_parser('close', help='Удалить NetGuard правила и namespace')
@@ -2891,7 +2929,6 @@ def parser_main():
     attack.add_argument('--coordinator-steps', type=int, default=8, help='Решений/шагов на ручной запуск (1..32)')
     attack.add_argument('--decision-retries', type=int, default=1, help='Исправлений ответа координатора (0..2)')
     attack.add_argument('--continue-coordinated', action='store_true', help='Продолжить после сохранённой паузы оператора')
-    attack.add_argument('--approve-step', type=int, help='Подтвердить конкретный сохранённый шаг ACCESS')
     attack.add_argument('--abandon-running-step', type=int, help='После проверки отметить running-шаг как имеющий неизвестный исход')
     attack.add_argument('--iterations', type=int, default=7)
     attack.add_argument('--roles', default='recon,vuln,access,verify')
@@ -2943,7 +2980,6 @@ def parser_main():
         cmd.add_argument('--step-limit',type=int,default=None,help='Инструментов на специалиста: 1..99, по умолчанию 15')
         cmd.add_argument('--max-tokens',type=int,default=None,help='Вывод специалиста: 1..64000, по умолчанию 24000')
         cmd.add_argument('--continue-coordinated',action='store_true',help='Явно продолжить сохранённую паузу')
-        cmd.add_argument('--approve-step',type=int,help='Одобрить конкретный шаг ACCESS')
         cmd.add_argument('--abandon-running-step',type=int,help='После ручной проверки оставить исход running-шага неизвестным')
         cmd.add_argument('--force-unreachable', action='store_true',
                          help='Продолжить после неудачной проверки доступности цели')
@@ -2999,12 +3035,11 @@ def interactive_mode():
 
 
 def interactive_continuation(args):
-    action=input('Пауза: Enter — показать/запустить; c — продолжить; a:ID — одобрить ACCESS; r:ID — разобранный running: ').strip()
+    action=input('Ожидание: Enter — показать/запустить; c — пересмотреть неполный отчёт; r:ID — разобранный running: ').strip()
     args.continue_coordinated=action=='c'
-    args.approve_step=int(action[2:]) if action.startswith('a:') else None
     args.abandon_running_step=int(action[2:]) if action.startswith('r:') else None
-    if action and action!='c' and not action.startswith(('a:','r:')):
-        raise OperatorError('Неизвестное действие продолжения')
+    if action and action!='c' and not action.startswith('r:'):
+        raise OperatorError('Неизвестное действие продолжения; ACCESS не требует одобрения')
 
 
 def interactive():
@@ -3019,6 +3054,7 @@ def interactive():
         ('6', 'СМЕНИТЬ IP', 'Новый адрес машины с сохранением истории'),
         ('7', 'АТАКА', 'Координатор или прежний ролевой цикл'),
         ('8', 'УБОРКА', 'Удалить сети закрытых и забытых задач'),
+        ('9', 'ВОПРОСЫ', 'Просмотреть очередь и сохранить ответ оператору'),
         ('0', 'ВЫХОД', 'Оставить сетевые правила без изменений'),
     )
     while True:
@@ -3032,8 +3068,8 @@ def interactive():
         if choice == '0':
             line('Завершено. Никаких фоновых задач не запущено.')
             return
-        if choice not in ('1', '2', '3', '4', '5', '6', '7', '8'):
-            line('  Выбери 0–8.')
+        if choice not in ('1', '2', '3', '4', '5', '6', '7', '8', '9'):
+            line('  Выбери 0–9.')
             continue
         args = argparse.Namespace(
             _session_key=session._session_key, _key_session=session, egress=None, max_jobs=8,
@@ -3110,6 +3146,16 @@ def interactive():
                 interactive_operation(op_change_ip,args)
             elif choice == '8':
                 interactive_operation(op_cleanup,args)
+            elif choice == '9':
+                args.task_id=int(input('Номер задачи: ').strip())
+                args.answer=None
+                interactive_operation(op_questions,args)
+                raw=input('ID вопроса для ответа (Enter — вернуться): ').strip()
+                if raw:
+                    args.answer=int(raw)
+                    args.decision=input('Ответ approve / decline / information: ').strip()
+                    args.answer_text=input('Пояснение: ').strip()
+                    interactive_operation(op_questions,args)
             else:
                 args.task_id = int(input('Номер задачи: ').strip())
                 patterns = input('Дополнительные шаблоны флагов (Enter — стандартные): ').strip()
@@ -3121,12 +3167,7 @@ def interactive():
                 if args.coordinated:
                     raw = input('Шагов координатора (Enter — 8): ').strip()
                     args.coordinator_steps = int(raw) if raw else 8
-                    action = input('Пауза: Enter — показать/запустить; c — продолжить; a:ID — одобрить ACCESS; r:ID — разобранный running: ').strip()
-                    args.continue_coordinated = action == 'c'
-                    args.approve_step = int(action[2:]) if action.startswith('a:') else None
-                    args.abandon_running_step = int(action[2:]) if action.startswith('r:') else None
-                    if action and action != 'c' and not action.startswith(('a:', 'r:')):
-                        raise OperatorError('Неизвестное действие продолжения')
+                    interactive_continuation(args)
                 if not args.coordinated:
                     raw = input('Итераций (Enter — 7): ').strip()
                     args.iterations = int(raw) if raw else 7
@@ -3178,6 +3219,7 @@ def main():
         elif args.command == 'intent': op_intent(args)
         elif args.command == 'resume': op_resume(args)
         elif args.command == 'status': op_status(args)
+        elif args.command == 'questions': op_questions(args)
         elif args.command == 'http-artifacts': op_http_artifacts(args)
         elif args.command == 'http-reparse': op_http_reparse(args)
         elif args.command == 'http-policy': op_http_policy(args)

@@ -1,4 +1,4 @@
-"""Evidence-based operator notifications, separate from research proof statuses."""
+"""Optional descriptive labels. This classifier has NO execution authority."""
 import hashlib
 import json
 import re
@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from orchestrator import flag_evidence, diagnostics, objectives
+
+BLOCKING = False
 
 
 def now():
@@ -103,7 +105,7 @@ def _item(category, location, subject, title, refs, reason, action):
             'evidence_refs':refs,'reason':reason,'operator_action':action}
 
 
-CONTINUE='Изучите сохранённое свидетельство и границы дальнейшей проверки; затем --continue-coordinated.'
+CONTINUE='Описательная метка; продолжение внутри задания не требует одобрения.'
 SECRET=re.compile(r'''(?im)^\s*["']?(?:[A-Z0-9_]*(?:PASSWORD|PASSWD|API_KEY|CLIENT_SECRET|ACCESS_TOKEN|SECRET_KEY))["']?\s*[:=]\s*["']?([^\s"'<>;]{8,})''')
 PLACEHOLDERS={'changeme','change_me','password','your_password','your_api_key','example','placeholder'}
 
@@ -151,7 +153,7 @@ def collect(db, task_id, before, after, *, references=None):
         items.append(_item('access_change',[after['task']['target']],(new['level'],new['signal']),
             f"Изменение доступа: {old['level']} → {new['level']}; сигнал {new['signal']}",refs,
             'Существенно изменилось сохранённое состояние доступа; требуется проверить свидетельство и границы следующего шага.',
-            'Проверьте результат и триаж; --continue-coordinated продолжит планирование. Каждый ACCESS требует отдельного --approve-step ID.'))
+            'Сохраните свидетельство и выполните триаж внутри задания; отдельное одобрение ACCESS не требуется.'))
     for value in sorted(set(after['confirmed_flags'])-set(before['confirmed_flags'])):
         row=db.execute('SELECT sources_json FROM pm_verified_flags WHERE task_id=? AND value=?',(task_id,value)).fetchone()
         sources=json.loads(row[0]) if row else {}

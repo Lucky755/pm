@@ -179,7 +179,9 @@ def open_approvals(db, task_id):
 
 
 def handle_open_approvals(db, task_id):
-    approvals = open_approvals(db, task_id)
+    # Old ACCESS privilege labels have no authority over continuation.
+    # Retain the original events/statuses; do not forge an operator approval.
+    approvals = [row for row in open_approvals(db, task_id) if row[2] != 'privilege_escalation']
     if any(row[1] == "denied" for row in approvals):
         set_task_status(db, task_id, "cancelled")
         print("[CANCELLED] Agent approval denied; no operation executed")
@@ -342,7 +344,6 @@ def run_task(db, task_id, api_key):
     if not handle_open_approvals(db, task_id):
         return
     set_task_status(db, task_id, "running")
-    checkpoint_demo = enabled(db, "scheduler_modes", "checkpoint_enabled", task_id)
     events_demo = enabled(db, "scheduler_event_modes", "enabled", task_id)
     try:
         with action_policy_patch() as policy, HarnessAdapter(mode='execute', patches=(policy,),
@@ -366,15 +367,6 @@ def run_task(db, task_id, api_key):
                 agent = step["agent"]
                 if agent not in ROLES:
                     raise ValueError(f"Unknown agent: {agent}")
-
-                if checkpoint_demo and agent == "access":
-                    gate_status, approval_id = legacy_gate(db, task_id, index)
-                    print("[CHECKPOINT]", gate_status, "|", approval_id)
-                    if gate_status != "approved":
-                        status = "waiting_approval" if gate_status == "pending" else "cancelled"
-                        set_task_status(db, task_id, status)
-                        print(f"[{status.upper()}] Task ID: {task_id}")
-                        return
 
                 session_id = new_session(db, task_id, index, agent)
                 print(f"\n[AGENT] {agent} | {session_id}", flush=True)
@@ -401,8 +393,6 @@ def run_task(db, task_id, api_key):
                 for receipt in receipts:
                     print("[AGENT EVENT]", json.dumps(receipt, ensure_ascii=False))
                 set_run(db, task_id, index, agent, "completed", report["summary"])
-                if checkpoint_demo and agent == "access":
-                    mark_legacy_gate_done(db, task_id, index)
                 print(report["summary"][:500])
                 print("[DONE]", agent, flush=True)
                 if not handle_open_approvals(db, task_id):
@@ -444,19 +434,6 @@ def main():
             return
         if not handle_open_approvals(db, task_id):
             return
-        if task[0] == "waiting_approval":
-            legacy = db.execute("""
-                SELECT e.id, e.status FROM scheduler_gates g
-                JOIN checkpoint_events e ON e.id=g.approval_id
-                WHERE g.task_id=? AND g.gate_status='waiting'
-            """, (task_id,)).fetchall()
-            if any(status == "denied" for _, status in legacy):
-                set_task_status(db, task_id, "cancelled")
-                print("[CANCELLED] Legacy checkpoint denied")
-                return
-            if any(status == "pending" for _, status in legacy):
-                print("[PAUSED] Legacy checkpoint waiting; no API used")
-                return
         # A final-step approval can be resolved without another model call.
         plan_row = db.execute(
             "SELECT plan_json FROM tasks WHERE id=?", (task_id,)

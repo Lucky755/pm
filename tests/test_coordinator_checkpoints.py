@@ -69,6 +69,11 @@ class CheckpointTests(unittest.TestCase):
         result=c.run(11,model=model,role_runner=self.role,expect_flags=1,**kwargs)
         return result,model
 
+    def labels(self,step_id=1):
+        with self.case.connect() as db:
+            state=c.snapshot(db,11,1)
+            return c.checkpoints.register(db,11,'10.0.0.1',step_id,c.checkpoints.collect(db,11,state,state))
+
     def test_routine_recon_vuln_verify_are_automatic_despite_high_confidence_and_impact(self):
         result,model=self.run_mode([decision('recon','links'),decision('vuln','404 response'),
                                    decision('verify','check links locally'),decision()])
@@ -77,64 +82,41 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(model.call_count,4)
         self.assertFalse(result['succeeded'])
 
-    def test_full_story_survives_restart_and_reviews_a_finding_once(self):
+    def test_full_story_is_automatic_and_survives_restart(self):
         with self.case.connect() as db:
             objectives.save_objectives(db,11,'Capture the flag',exclusive=True,expected_flags=1)
         result,model=self.run_mode([decision('recon','links'),decision('vuln','404 response'),
-                                   decision('verify','check links locally'),decision('recon','source capture')])
-        self.assertEqual(len(self.case.calls),4)
-        self.assertEqual(result['status'],'waiting_operator')
-        self.assertEqual(result['stop_reason'],'significant_finding')
-        point=result['checkpoints'][0]
-        self.assertEqual(point['category'],'source_disclosure')
-        self.assertTrue(point['evidence_refs']);self.assertTrue(point['reason']);self.assertTrue(point['operator_action'])
-        pm.render_coordinator_result(result,Namespace(json=False))
-        output=self.case.console.getvalue()
-        self.assertIn(point['title'],output)
-        self.assertIn(point['evidence_refs'][0],output)
-        self.assertIn(point['reason'],output)
-        self.assertIn('--continue-coordinated',output)
-        # A fresh process reads the saved pause without initializing runtime or using the model.
-        script=('import json,sqlite3,sys; from orchestrator.task_runtime import pause; '
-                'db=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True); '
-                'print(json.dumps(pause(db,11))); db.close()')
-        reply=subprocess.run([sys.executable,'-c',script,str(self.case.database)],cwd=ROOT,
-                             capture_output=True,text=True,check=True,timeout=10)
-        saved=json.loads(reply.stdout)
-        self.assertEqual(saved['checkpoints'][0]['id'],point['id'])
-        paused,no_model=self.run_mode([])
-        self.assertEqual(paused['status'],'waiting_operator');no_model.assert_not_called()
-        result,model=self.run_mode([decision('verify','repeat source capture with another result id'),
-                                   decision('vuln','flag capture')],continue_run=True)
+            decision('verify','check links locally'),decision('recon','source capture')],max_steps=4)
+        self.assertEqual(len(self.case.calls),4);self.assertEqual(result['stop_reason'],'coordinator_step_limit')
+        original=(a.REPORT_DIR/'task_11/recon-04.json').read_bytes()
+        with sqlite3.connect('file:'+str(self.case.database)+'?mode=ro',uri=True) as db:
+            self.assertIsNone(task_runtime.pause(db,11))
+        result,model=self.run_mode([decision('verify','repeat source capture with another result id'),decision('vuln','flag capture')])
         self.assertTrue(result['succeeded']);self.assertEqual(result['stop_reason'],'goal_confirmed')
-        self.assertEqual(model.call_count,2)
-        resumed_state=json.loads(model.call_args_list[0][0][0].rsplit('\n',1)[1])
-        self.assertEqual(resumed_state['operator_checkpoints']['entries'][0]['status'],'reviewed')
-        self.assertEqual([r[2] for r in self.case.calls],[1,2,3,4,5,6])
+        self.assertEqual(model.call_count,2);self.assertEqual([r[2] for r in self.case.calls],[1,2,3,4,5,6])
+        self.assertEqual((a.REPORT_DIR/'task_11/recon-04.json').read_bytes(),original)
         with self.case.connect() as db:
-            rows=db.execute('SELECT status FROM pm_coordinator_checkpoints WHERE task_id=11').fetchall()
-            self.assertEqual(rows,[('reviewed',)])
             self.assertEqual(objectives.objective_status(db,11)['expected_flags'],1)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_coordinator_checkpoints').fetchone()[0],0)
             verify=json.loads(db.execute('SELECT report_json FROM pm_agent_action_reports WHERE iteration=5').fetchone()[0])
             self.assertFalse(verify.get('report_incomplete'))
 
-    def test_legacy_pause_displays_the_actual_finding_and_can_be_reviewed(self):
-        first,_=self.run_mode([decision('recon','source capture')])
+    def test_legacy_significant_pause_is_retired_without_rewriting_evidence(self):
+        first,_=self.run_mode([decision('recon','source capture')],max_steps=1)
         with self.case.connect() as db:
-            # Simulate a pause saved by the published version, with its original
-            # report/capture intact but no operator review metadata yet.
+            db.execute("UPDATE pm_coordinator_runs SET status='waiting_operator',stop_reason='significant_finding',pause_step_id=1")
             db.execute('DROP TABLE pm_coordinator_checkpoints')
-        with sqlite3.connect('file:'+str(self.case.database)+'?mode=ro',uri=True) as db:
-            paused=task_runtime.pause(db,11)
-        point=paused['checkpoints'][0]
-        self.assertIn('/internal.py',point['title']);self.assertTrue(point['evidence_refs'])
-        resumed,model=self.run_mode([decision('verify','repeat source capture'),decision()],continue_run=True)
-        self.assertEqual(resumed['stop_reason'],'model_stopped_incomplete')
+        with sqlite3.connect('file:'+str(self.case.database)+'?mode=ro',uri=True) as db:self.assertIsNone(task_runtime.pause(db,11))
+        log=(a.CAPABILITY_LOG/'task_11.jsonl').read_bytes()
+        resumed,model=self.run_mode([decision()])
+        self.assertEqual(resumed['stop_reason'],'model_stopped_incomplete');self.assertEqual(model.call_count,1)
+        self.assertEqual((a.CAPABILITY_LOG/'task_11.jsonl').read_bytes(),log)
         with self.case.connect() as db:
-            self.assertEqual(db.execute('SELECT status FROM pm_coordinator_checkpoints').fetchall(),[('reviewed',)])
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_operator_policy_events').fetchone()[0],1)
+            self.assertEqual(c.steps(db,11)[0]['status'],'completed')
 
     def test_review_does_not_promote_hypotheses_or_change_evidence(self):
-        first,_=self.run_mode([decision('recon','source capture')])
+        first,_=self.run_mode([decision('recon','source capture')],max_steps=1)
         with self.case.connect() as db:
             before=db.execute('SELECT * FROM pm_hypotheses ORDER BY claim_key').fetchall()
             flags=db.execute('SELECT * FROM pm_verified_flags ORDER BY value').fetchall()
@@ -147,28 +129,31 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(c.snapshot(db,11,1)['knowledge_sha256'],state['knowledge_sha256'])
         self.assertEqual(a.CAPABILITY_LOG.joinpath('task_11.jsonl').read_bytes(),log)
 
-    def test_new_substantial_bytes_create_a_new_checkpoint_after_review(self):
-        first,_=self.run_mode([decision('recon','source capture')])
+    def test_new_secret_can_have_a_descriptive_label_without_pause(self):
+        self.run_mode([decision('recon','source capture')],max_steps=1)
+        first=self.labels()
         self.source_body+=b'DB_PASSWORD="new-repository-secret-456"\n'
-        second,_=self.run_mode([decision('vuln','new source bytes')],continue_run=True)
-        self.assertEqual(second['status'],'waiting_operator')
-        self.assertEqual(second['checkpoints'][0]['category'],'secret_disclosure')
-        self.assertNotEqual(first['checkpoints'][0]['id'],second['checkpoints'][0]['id'])
-
-    def test_more_files_in_a_reviewed_repository_are_the_same_disclosure(self):
-        first,_=self.run_mode([decision('recon','source capture')])
-        self.source_body+=b'def additional_internal_route(): return 9\n'
-        second,_=self.run_mode([decision('vuln','more source bytes'),decision()],continue_run=True)
+        second,_=self.run_mode([decision('vuln','new source bytes'),decision()])
+        labels=self.labels()
         self.assertEqual(second['stop_reason'],'model_stopped_incomplete')
-        with self.case.connect() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_coordinator_checkpoints').fetchone()[0],1)
+        self.assertGreater(len(labels),len(first))
+        self.assertTrue(any(label['category']=='secret_disclosure' for label in labels))
+        self.assertFalse(c.checkpoints.BLOCKING)
 
-    def test_secret_checkpoint_has_no_plaintext_secret_in_console_or_checkpoint(self):
-        result,_=self.run_mode([decision('recon','secret capture')])
-        point=result['checkpoints'][0]
-        self.assertEqual(point['category'],'secret_disclosure')
+    def test_more_files_share_a_descriptive_disclosure_label(self):
+        self.run_mode([decision('recon','source capture')],max_steps=1);self.labels()
+        self.source_body+=b'def additional_internal_route(): return 9\n'
+        second,_=self.run_mode([decision('vuln','more source bytes'),decision()])
+        self.assertEqual(second['stop_reason'],'model_stopped_incomplete')
+        self.assertEqual(len(self.labels()),1)
+        with self.case.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_coordinator_checkpoints').fetchone()[0],1)
+
+    def test_secret_label_has_no_plaintext_secret_and_cannot_pause(self):
+        result,_=self.run_mode([decision('recon','secret capture'),decision()])
+        points=self.labels();self.assertEqual(points[0]['category'],'secret_disclosure')
         pm.render_coordinator_result(result,Namespace(json=False))
-        self.assertNotIn('private-secret-123',json.dumps(result['checkpoints'])+self.case.console.getvalue())
+        self.assertNotIn('private-secret-123',json.dumps(points)+self.case.console.getvalue())
+        self.assertEqual(result['stop_reason'],'model_stopped_incomplete')
 
     def test_unbacked_category_is_not_a_checkpoint(self):
         def unbacked(*args,**kwargs):
@@ -180,36 +165,28 @@ class CheckpointTests(unittest.TestCase):
                      role_runner=unbacked,expect_flags=1)
         self.assertEqual(result['stop_reason'],'model_stopped_incomplete')
 
-    def test_access_still_requires_explicit_step_approval(self):
-        first,model=self.run_mode([decision('access','Check authorized access?')])
-        self.assertEqual(first['stop_reason'],'role_approval_required');self.assertEqual(self.case.calls,[])
-        step=first['steps'][0]['id']
-        paused,no_model=self.run_mode([])
-        no_model.assert_not_called();self.assertEqual(self.case.calls,[])
-        result,model=self.run_mode([decision()],approve_step=step)
+    def test_access_runs_without_step_approval(self):
+        result,model=self.run_mode([decision('access','Check authorized access?'),decision()])
         self.assertEqual([r[0] for r in self.case.calls],['access'])
+        self.assertIsNone(result['steps'][0]['approved_at'])
         self.assertEqual(result['stop_reason'],'model_stopped_incomplete')
 
-    def test_reviewed_disclosure_does_not_approve_an_access_step(self):
-        first,_=self.run_mode([decision('recon','source capture')])
-        paused,_=self.run_mode([decision('access','Test explicitly authorized access?')],continue_run=True)
-        self.assertEqual(paused['stop_reason'],'role_approval_required')
+    def test_disclosure_does_not_expand_scope_for_access(self):
+        self.run_mode([decision('recon','source capture')],max_steps=1);self.labels()
+        with self.case.connect() as db:db.execute('DELETE FROM pm_operator_approvals')
+        result,model=self.run_mode([decision('access','Test access?')])
+        self.assertEqual(result['stop_reason'],'scope_approval_required');model.assert_not_called()
         self.assertEqual([r[0] for r in self.case.calls],['recon'])
-        step=paused['steps'][-1]['id']
-        result,_=self.run_mode([decision()],approve_step=step)
-        self.assertEqual([r[0] for r in self.case.calls],['recon','access'])
-        self.assertEqual(result['stop_reason'],'model_stopped_incomplete')
 
-    def test_pending_checkpoint_survives_a_crash_before_run_pause_is_saved(self):
-        first,_=self.run_mode([decision('recon','source capture')])
+    def test_pending_classifier_label_cannot_block_after_restart(self):
+        self.run_mode([decision('recon','source capture')],max_steps=1)
+        first=self.labels()
+        with self.case.connect() as db:db.execute("UPDATE pm_coordinator_runs SET status='running',pause_step_id=NULL")
+        result,model=self.run_mode([decision()])
+        self.assertEqual(result['stop_reason'],'model_stopped_incomplete');self.assertEqual(model.call_count,1)
         with self.case.connect() as db:
-            db.execute("UPDATE pm_coordinator_runs SET status='running',pause_step_id=NULL")
-        result,model=self.run_mode([])
-        model.assert_not_called()
-        self.assertEqual(result['status'],'waiting_operator')
-        self.assertEqual(result['checkpoints'][0]['id'],first['checkpoints'][0]['id'])
-        resumed,_=self.run_mode([decision()],continue_run=True)
-        self.assertEqual(resumed['stop_reason'],'model_stopped_incomplete')
+            saved=c.checkpoints.pending(db,11)
+            self.assertEqual(saved[0]['id'],first[0]['id']);self.assertEqual(saved[0]['status'],'pending')
 
     def test_git_metadata_and_invalid_objects_are_routine_not_disclosed_source(self):
         self.evidence.capture(b'ref: refs/heads/main\n','/.git/HEAD')

@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'executor'))
 import network_executor_v2 as existing
+from netguard_root import reject_password_change
 
 BROKER = '/usr/local/sbin/pm-netguard'
 
@@ -55,6 +56,7 @@ def parse_argv(raw):
         raise ValueError('argv is too large for the broker')
     if not value[0].startswith('/'):
         raise ValueError('argv[0] must be an absolute binary path')
+    reject_password_change(value)
     return value
 
 
@@ -110,6 +112,7 @@ def parse_session_argv(raw):
         raise ValueError('session argv is too large')
     if value and not value[0].startswith('/'):
         raise ValueError('argv[0] must be an absolute binary path')
+    reject_password_change(value)
     return value
 
 
@@ -128,6 +131,7 @@ def session_command(args):
             raise ValueError('--session-id is required for this action')
         command += ['--session-id', args.session_id]
     if args.action == 'send':
+        reject_password_change(text=args.data or '')
         command += ['--data', args.data or '']
     if args.action in ('send', 'read', 'interrupt') and args.wait is not None:
         command += ['--wait', str(args.wait)]

@@ -138,7 +138,7 @@ class AdapterRuntimeTests(unittest.TestCase):
         with d.run('adapter recovery smoke',11), d.process_environment():
             result=c.run(11,api_key='local-test-only',max_steps=3,decision_retries=1,max_tokens=1000)
             events=d.read_events();run_id=d.context()['run_id']
-        self.assertEqual(result['stop_reason'],'model_waiting_operator',self.case.console.getvalue())
+        self.assertEqual(result['stop_reason'],'operator_questions_pending',self.case.console.getvalue())
         self.assertEqual([s['status'] for s in result['steps']],['completed','waiting_operator'])
         self.assertEqual(number,6)
         self.assertEqual(len([e for e in events if e['kind']=='tool.end']),1)
@@ -196,7 +196,7 @@ class AdapterRuntimeTests(unittest.TestCase):
         with d.run('real task memory',11),d.process_environment():
             result=c.run(11,api_key='local-test-only',max_tokens=1000)
             events=d.read_events()
-        self.assertEqual(result['stop_reason'],'model_waiting_operator',self.case.console.getvalue())
+        self.assertEqual(result['stop_reason'],'operator_questions_pending',self.case.console.getvalue())
         self.assertEqual(len(api.requests),4)
         records=self.audits();self.assertTrue(any(r.get('prefix_cache')=='hit_observed' for r in records),records)
         self.assertTrue(all(r['statistics']['output_tokens'] is not None for r in records))
@@ -235,7 +235,7 @@ class AdapterRuntimeTests(unittest.TestCase):
         with d.run('specialist policy smoke',11),d.process_environment():
             result=c.run(11,api_key='local-test-only',max_tokens=1000)
             events=d.read_events()
-        self.assertEqual(result['stop_reason'],'model_waiting_operator',self.case.console.getvalue())
+        self.assertEqual(result['stop_reason'],'operator_questions_pending',self.case.console.getvalue())
         self.assertEqual(len(api.requests),4)
         self.assertFalse([e for e in events if e['kind']=='tool.start' and e.get('source')=='mcp'])
         self.assert_preserved()

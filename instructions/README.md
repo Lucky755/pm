@@ -77,8 +77,8 @@ Task scope, NetGuard, проверки конкретной операции, т
 [test_instruction_system.py](../tests/test_instruction_system.py) проверяет
 собираемые промпты, общий блок для всех ролей и форм контекста, исходное задание,
 конкретное поручение, выбор только нужной процедуры, настоящий run_role с
-подменённой границей модели, уменьшение бюджетов, сохранение ACCESS approval
-и triage gate. Сверяет описанные инструменты с зарегистрированными в MCP.
+подменённой границей модели, уменьшение бюджетов, автоматический ACCESS
+и сохранение triage gate. Сверяет описанные инструменты с зарегистрированными в MCP.
 
 [test_model_adapter_runtime.py](../tests/test_model_adapter_runtime.py) использует
 настоящий SDK/MCP с loopback fake API: при `http-surface` схемы pm_session и

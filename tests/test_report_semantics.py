@@ -83,7 +83,7 @@ class ReportSemanticsTests(unittest.TestCase):
                                         'access_signal':'none','findings':[],'hypotheses':[]})
         with a.diagnostics.run('contradictory report',11):
             result,model=self.fx.approved_run()
-        self.assertEqual(result['status'],'waiting_operator');model.assert_not_called()
+        self.assertEqual(result['status'],'waiting_operator');self.assertEqual(model.call_count,1)
         self.assertEqual(result['steps'][0]['execution_outcome']['status'],'nonzero_exit')
         self.assertFalse(result['steps'][0]['outcome_uncertain'])
         events=[json.loads(line) for path in a.diagnostics.EVENT_DIR.glob('*.jsonl') for line in path.read_text().splitlines()]
@@ -93,7 +93,13 @@ class ReportSemanticsTests(unittest.TestCase):
         self.assertIn('summary_access_disagrees',self.case.console.getvalue())
 
     def test_reserved_report_is_not_presented_as_saved(self):
-        result=c.run(11,api_key='fake-only',model=Mock(return_value=fixtures.decision('access','One attempt')))
+        with self.case.connect() as db:
+            c.ensure_schema(db);state=c.snapshot(db,11,2)
+            run=db.execute("INSERT INTO pm_coordinator_runs(task_id,target,status,created_at,updated_at) VALUES(11,'10.0.0.1','planned',?,?)",(c.now(),c.now())).lastrowid
+            c.insert_step(db,run,11,fixtures.decision('access','One attempt'),state,
+                {'poc_budget':7,'step_limit':15,'max_tokens':24000})
+            result={'status':'planned','stop_reason':'intent_saved_before_dispatch','succeeded':False,
+                    'steps':[c.step_view(row) for row in c.steps(db,11)]}
         step=result['steps'][0]
         self.assertEqual(step['report_state'],'reserved');self.assertIsNone(step['report_path'])
         pm.render_coordinator_result(result,SimpleNamespace(json=False))

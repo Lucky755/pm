@@ -132,11 +132,12 @@ class SpecialistExecutionTests(unittest.TestCase):
         self.assertEqual(assignment['inherited_limits'],{'step_limit':6,'poc_budget':1,'max_tokens':8192})
         self.assertEqual(result['steps'][0]['status'],'completed');self.assertFalse(result['succeeded'])
 
-    def test_specialization_does_not_bypass_access_approval_or_triage(self):
+    def test_specialization_keeps_triage_without_access_approval(self):
         choice=coordinator_fixture.decision('access','ТРИАЖ: определить пользователя')
         choice['profile']='access-triage'
-        result=self.case.run_mode([choice])
-        self.assertEqual(result['stop_reason'],'role_approval_required');self.assertFalse(self.case.calls)
+        result=self.case.run_mode([choice],max_steps=1)
+        self.assertEqual(result['stop_reason'],'coordinator_step_limit');self.assertEqual(len(self.case.calls),1)
+        self.assertIsNone(result['steps'][0]['approved_at'])
         with self.case.connect() as db:
             a.fact_state.save_access_report(db,11,{'access_level':'user','access_signal':'shell','access_probe_result_id':'source'})
             state=c.snapshot(db,11,2)

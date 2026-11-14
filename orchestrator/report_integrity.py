@@ -100,9 +100,13 @@ def check_consistency(report, assertions):
     negative=any(re.match(r'\s*(?:no (?:access|shell) (?:was )?obtained|доступ не получен)\s*$',clause,re.I)
                  for clause in clauses)
     signal=report.get('access_signal','none')
-    if (positive and signal in ('','none')) or (negative and signal not in ('','none')):
+    actual_access=signal in ('execution','shell') and report.get('access_level','none')!='none'
+    if (positive and not actual_access) or (negative and actual_access):
         issues.append({'code':'summary_access_disagrees','fields':['summary','access_signal','access_level']})
-    if assertions.get('access_signal') not in (None,'','none') and signal in ('','none'):
+    if assertions.get('access_signal')=='credential' and signal in ('','none'):
+        report['credential_assessment']={'status':'unverified','reason':'server_acceptance_not_supported',
+            'result_id':assertions.get('access_probe_result_id'),'quote':assertions.get('access_quote')}
+    elif assertions.get('access_signal') not in (None,'','none') and signal in ('','none'):
         issues.append({'code':'access_assertion_not_supported','fields':['access_signal','access_quote','access_probe_result_id']})
     if issues:
         report['report_consistency']={'blocking':True,'issues':issues}
@@ -120,7 +124,8 @@ def step_execution(row):
         return {'status':'unknown','results':[]}
     if not row.get('report_path') and row.get('error') in (
             'operator_requested_replan','role_approval_required','planned_transition_no_longer_allowed',
-            'assignment_state_changed'):
+            'assignment_state_changed','legacy_access_gate_retired_not_started',
+            'operator_question_answered_no_action','operator_question_pending','operator_question_already_answered'):
         return {'status':'not_started','results':[]}
     if row['status'] in ('planned','waiting_operator') and not row.get('report_path'):
         return {'status':'not_started','results':[]}

@@ -18,13 +18,15 @@ from orchestrator import coordinated_attack as c, agent_actions as a, objectives
 
 
 def decision(role=None, question='Inspect the current evidence?', action=None, references=None, stop_kind=None):
-    return {'action':action or ('run_role' if role else 'stop'),'role':role,'question':question,
+    value={'action':action or ('run_role' if role else 'stop'),'role':role,'question':question,
             'profile':role if (action or 'run_role')=='run_role' and role else None,
             'boundaries':{'task_id':11,'target':'10.0.0.1','intent_ref':'intent','resource_refs':['scope:10.0.0.1']},
             'inputs':[{'reference':ref} for ref in (references or ['intent'])],
             'reason':'Use the saved service and evidence records.', 'references':references or ['intent'],
             'expected_result':'An evidence-linked observation or an explicit unverified result.',
             'stop_kind':stop_kind if stop_kind else ('incomplete' if not role and action!='wait_operator' else None)}
+    if action=='wait_operator':value['operator_question']={'kind':'budget'}
+    return value
 
 
 class CoordinatorTests(unittest.TestCase):
@@ -87,6 +89,12 @@ class CoordinatorTests(unittest.TestCase):
 
     def run_mode(self,replies=None,**kwargs):
         return c.run(11,api_key='fake-only',model=self.model(replies or [decision()]),role_runner=self.role,**kwargs)
+
+    def answer_pending(self):
+        from orchestrator import operator_questions
+        with self.connect() as db:
+            for question in operator_questions.listing(db,11,pending=True):
+                operator_questions.answer(db,11,question['id'],'information','Operator supplied the requested information')
 
     def rows(self):
         with self.connect() as db:return c.steps(db,11)
@@ -379,9 +387,11 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result['status'],'waiting_operator')
         self.run_mode([])
         self.assertEqual(len(self.calls),1)
+        self.answer_pending()
         result=self.run_mode([decision('verify','Verify the service evidence?'),decision()],continue_run=True)
         self.assertEqual([v[0] for v in self.calls],['vuln','verify'])
-        self.assertTrue(all(row['status']=='completed' for row in self.rows()))
+        self.assertEqual([row['status'] for row in self.rows()],['completed','failed','completed','completed'])
+        self.assertEqual(self.rows()[1]['error'],'operator_question_answered_no_action')
 
     def test_step_budget_resume_and_repeat_role_report_numbers(self):
         self.run_mode([decision('vuln','Check port 80?')],max_steps=1)
@@ -393,18 +403,14 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue((a.REPORT_DIR/'task_11'/'vuln-02.json').is_file())
         with self.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_agent_action_reports').fetchone()[0],2)
 
-    def test_access_is_reviewed_and_significant_state_change_pauses(self):
-        result=self.run_mode([decision('access','Prove the authorized low-privilege access?')])
-        step=result['steps'][0]['id']
-        self.assertEqual(self.calls,[])
-        self.run_mode([])
-        self.assertEqual(self.calls,[])
+    def test_access_runs_and_state_changes_do_not_pause(self):
         self.report_extra={'access_level':'user','access_signal':'shell','access_probe_result_id':'0'*23+'1'}
-        result=self.run_mode([],approve_step=step,max_steps=1)
-        self.assertEqual(result['stop_reason'],'access_state_changed')
+        result=self.run_mode([decision('access','Prove the authorized low-privilege access?')],max_steps=1)
+        self.assertEqual(result['stop_reason'],'coordinator_step_limit')
         self.assertEqual(result['steps'][0]['status'],'completed')
-        self.run_mode([])
+        self.assertIsNone(result['steps'][0]['approved_at'])
         self.assertEqual(len(self.calls),1)
+        self.assertEqual(result['checkpoint_classifier_blocking'],False)
 
     def test_running_checkpoint_is_never_replayed_even_with_continue(self):
         def interrupt(*args,**kwargs):raise KeyboardInterrupt()
@@ -445,9 +451,11 @@ class CoordinatorTests(unittest.TestCase):
     def test_pending_triage_rejects_other_roles_before_execution(self):
         with self.connect() as db:
             a.fact_state.save_access_report(db,11,{'access_level':'user','access_signal':'shell','access_probe_result_id':'source'})
-        result=self.run_mode([decision('vuln'),decision('access','ТРИАЖ: кто я и где нахожусь?')])
-        self.assertEqual(result['stop_reason'],'role_approval_required')
-        self.assertEqual(self.calls,[])
+        result=self.run_mode([decision('vuln'),decision('access','ТРИАЖ: кто я и где нахожусь?')],max_steps=1)
+        self.assertEqual(result['stop_reason'],'coordinator_step_limit')
+        self.assertEqual([call[0] for call in self.calls],['access'])
+        with self.connect() as db:
+            self.assertEqual(db.execute('SELECT reason_code FROM pm_coordinator_decision_attempts').fetchone()[0],'access_triage_required')
 
     def test_existing_report_slot_is_guarded_before_api_import(self):
         self.role(11,'vuln','seed',7,7,15)
@@ -503,15 +511,10 @@ class CoordinatorTests(unittest.TestCase):
             pm.op_attack(legacy)
             self.assertEqual(old.call_count,1)
 
-    def test_stale_access_approval_requires_replan(self):
-        result=self.run_mode([decision('access','Check authorized access?')])
-        step=result['steps'][0]['id']
-        with self.connect() as db:db.execute("UPDATE pm_task_intents SET intent='Changed restriction' WHERE task_id=11")
-        result=self.run_mode([],approve_step=step)
-        self.assertEqual(result['stop_reason'],'approval_state_changed_use_continue_to_replan')
-        self.assertEqual(self.calls,[])
-        self.run_mode([decision()],continue_run=True)
-        self.assertEqual(self.rows()[0]['status'],'failed')
+    def test_obsolete_approval_option_is_rejected_without_execution(self):
+        with self.assertRaisesRegex(ValueError,'approval has been removed'):
+            self.run_mode([decision('access')],approve_step=1)
+        self.assertEqual(self.calls,[]);self.assertEqual(self.prompts,[])
 
     def test_failed_role_requires_review_and_is_not_retried(self):
         runner=Mock(side_effect=RuntimeError('failed after possible work'))
@@ -526,8 +529,7 @@ class CoordinatorTests(unittest.TestCase):
     def test_budget_and_operator_action_validation(self):
         for kwargs in ({'max_steps':0},{'decision_retries':3},{'continue_run':True,'approve_step':1}):
             with self.subTest(kwargs=kwargs),self.assertRaises(ValueError):self.run_mode([],**kwargs)
-        with patch.object(sys,'argv',['pm','attack','11','--approve-step','1']):_,args=pm.parser_main()
-        with self.assertRaisesRegex(pm.OperatorError,'--coordinated'):pm.op_attack(args)
+        with patch.object(sys,'argv',['pm','attack','11','--approve-step','1']),self.assertRaises(SystemExit):pm.parser_main()
 
     def test_cli_explains_incomplete_report_pause(self):
         with patch.object(sys,'argv',['pm','attack','11','--coordinated']):_,args=pm.parser_main()

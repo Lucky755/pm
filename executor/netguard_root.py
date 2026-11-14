@@ -551,6 +551,34 @@ def safe_research_path(path):
     return path
 
 
+def reject_password_change(argv=(), text=''):
+    """Deny supported credential mutations, not verify arbitrary code.
+
+    This standalone broker imports no project code in its installed copy.
+    MCP and the unprivileged wrapper reuse the same source.
+    """
+    tokens=[str(item) for item in argv]
+    binary=Path(tokens[0]).name if tokens else ''
+    if binary in ('passwd','chpasswd','smbpasswd','kpasswd','chntpw'):
+        raise ValueError('Room rule: password changes are prohibited')
+    if binary in ('usermod','useradd') and any(
+            t=='-p' or t.startswith('-p') or t=='--password' or t.startswith('--password=') for t in tokens[1:]):
+        raise ValueError('Room rule: password changes are prohibited')
+    # A file argument such as cat /etc/passwd is not a command. Remote/shell
+    # command strings containing whitespace are inspected separately.
+    source=' '.join(tokens)+'\n'+'\n'.join(t for t in tokens[1:] if re.search(r'\s',t))+'\n'+str(text)
+    patterns=(r'(?im)(?:^|[;&|\n])\s*(?:sudo\s+)?(?:/\S*/)?(?:passwd|chpasswd|smbpasswd|kpasswd|chntpw)\b',
+        r'(?im)\bssh\s+[^\n;]*\s(?:/(?:usr/)?s?bin/)?(?:passwd|chpasswd|smbpasswd|kpasswd)\b',
+        r'(?im)\b(?:usermod|useradd)\s+[^\n;]*?(?:--password(?:=|\s)|\s-p)',
+        r'(?i)\bnet\s+(?:rpc\s+password|user\s+\S+\s+\S+)',
+        r'(?i)\bsamba-tool\s+user\s+(?:setpassword|password)\b',
+        r'(?i)\b(?:Set-ADAccountPassword|Set-LocalUser\s+[^\n;]*-Password)\b',
+        r'(?i)\b(?:ALTER\s+USER\b[^;\n]*IDENTIFIED\s+BY|SET\s+PASSWORD\b)',
+        r'(?im)(?:>|\btee\s+)(?:\s*)(?:/etc/(?:shadow|passwd))\b')
+    if any(re.search(pattern,source) for pattern in patterns):
+        raise ValueError('Room rule: password changes are prohibited')
+
+
 def safe_exec_argv(argv):
     """Free-form argv for the isolated namespace. Never shell-interpreted."""
     if isinstance(argv, str) or not isinstance(argv, (list, tuple)) or not argv:
@@ -567,6 +595,7 @@ def safe_exec_argv(argv):
         raise ValueError('exec argv exceeds the total size limit')
     if not tokens[0].startswith('/'):
         raise ValueError('argv[0] must be an absolute binary path')
+    reject_password_change(tokens)
     return tokens
 
 
@@ -685,6 +714,7 @@ def poc_file_metadata(path, uid):
             os.close(fd)
     finally:
         os.close(directory_fd)
+    reject_password_change(text=data.decode('utf-8', errors='replace'))
     literals = sorted(set(re.findall(
         r'\b[A-Z][A-Z0-9_]{1,19}\{[A-Za-z0-9_!@#$%^&*+.:-]{3,120}\}',
         data.decode('utf-8', errors='replace'))))[:20]
@@ -1508,6 +1538,7 @@ def session_open(task, argv, idle):
     if live >= SESSION_MAX:
         raise ValueError(f'Too many open sessions (max {SESSION_MAX}); close one first')
     shell = [str(item) for item in (argv or ['/bin/bash', '--noprofile', '--norc', '-i'])]
+    reject_password_change(shell)
     if len(shell) > EXEC_ARGS_MAX:
         raise ValueError('Session argv is too long')
     if any(len(item) > EXEC_ARG_LEN_MAX for item in shell):
@@ -1740,6 +1771,7 @@ def session_worker(task, session_id):
 
 
 def session_send(task, session_id, data, wait):
+    reject_password_change(text=data)
     ensure_root()
     owned_config(task)
     if len(str(data).encode('utf-8')) > SESSION_DATA_MAX:

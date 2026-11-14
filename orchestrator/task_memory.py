@@ -175,6 +175,11 @@ def source_state(db,task_id,capability_log):
     for approval in rows(db,'pm_operator_approvals',task_id,target=target):
         put('constraints','operator_approval',{k:v for k,v in approval.items() if k not in ('approved_at',)})
     for goal in rows(db,'pm_objectives',task_id):put('goals','objective:'+goal['key'],goal)
+    from orchestrator import operator_questions
+    for question in operator_questions.listing(db,task_id):
+        put('questions','operator_question:'+str(question['id']),question)
+    for event in rows(db,'pm_operator_policy_events',task_id):
+        put('corrections','retired_policy:'+str(event['id']),{**event,'supersedes':event['object_ref']})
     from orchestrator import service_inventory
     inventory=service_inventory.collect_full(db,task_id)
     for service in inventory['entries']:
@@ -188,6 +193,8 @@ def source_state(db,task_id,capability_log):
         if asset.get('last_probe_result_id'):
             put('relations','evidence:'+key,{'from':key,'to':'result:'+asset['last_probe_result_id'],'kind':'cites'})
     for access in rows(db,'pm_access_state',task_id):put('access','access',access)
+    for question in rows(db,'pm_credential_acceptance',task_id,target=target):
+        put('credentials','accepted:'+str(question['id']),{**question,'trust':'server_accepted','access_implied':False})
     for triage in rows(db,'pm_access_triage',task_id):put('access','triage:'+triage['level']+':'+triage['category'],triage)
     for hypothesis in rows(db,'pm_hypotheses',task_id):
         section=('refutations' if hypothesis['status']=='refuted' else 'questions' if hypothesis['status']=='untested'
@@ -197,6 +204,8 @@ def source_state(db,task_id,capability_log):
         ref=f"report:{report['role']}:{report['iteration']}";raw=report['report_json'].encode()
         from orchestrator import report_integrity
         parsed=report_integrity.decode_saved(report['report_json'],task_id,report['role'],report['iteration'])
+        if parsed.get('credential_assessment'):
+            put('questions','credential_assessment:'+ref,{**parsed['credential_assessment'],'source_ref':ref})
         put('materials',ref,{'kind':'report','role':report['role'],'iteration':report['iteration'],
             'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw),
             'quality':parsed.get('report_quality'),'summary':parsed.get('summary',''),

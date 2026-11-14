@@ -68,9 +68,9 @@ class ReportIntegrityTests(unittest.TestCase):
         return a.run_role(11,'access','One authorized check only; no brute force',1,api_key='fake-only')
 
     def approved_run(self):
-        first=c.run(11,api_key='fake-only',model=Mock(return_value=decision('access','One authorized check only')))
-        step=first['steps'][0]['id'];model=Mock(return_value=decision())
-        result=c.run(11,api_key='fake-only',model=model,approve_step=step)
+        # Historical helper name; production ACCESS now runs without an approval.
+        model=Mock(side_effect=[decision('access','One authorized check only'),decision()])
+        result=c.run(11,api_key='fake-only',model=model)
         return result,model
 
     def test_damaged_access_report_is_saved_as_damaged_not_completed(self):
@@ -149,7 +149,7 @@ class ReportIntegrityTests(unittest.TestCase):
         self.assertEqual(result['status'],'waiting_operator')
         self.assertEqual(result['steps'][0]['status'],'failed')
         self.assertEqual(result['steps'][0]['error'],'report_damaged')
-        model.assert_not_called()
+        self.assertEqual(model.call_count,1)  # initial selection; no next planning
         again=Mock(side_effect=AssertionError('Planning forbidden'))
         paused=c.run(11,api_key='fake-only',model=again)
         again.assert_not_called();self.assertEqual(paused['stop_reason'],result['stop_reason'])
@@ -161,7 +161,7 @@ class ReportIntegrityTests(unittest.TestCase):
         result,model=self.approved_run()
         self.assertEqual(result['steps'][0]['status'],'completed')
         self.assertEqual(result['stop_reason'],'model_stopped_incomplete')
-        self.assertEqual(model.call_count,1);self.assertEqual(self.executions,1)
+        self.assertEqual(model.call_count,2);self.assertEqual(self.executions,1)
 
     def test_unsolicited_tools_in_format_response_are_rejected(self):
         self.repair_response=self.structured()
@@ -195,14 +195,16 @@ class ReportIntegrityTests(unittest.TestCase):
         self.assertIn('repeated_question_without_new_evidence',result['stop_reason'])
         self.assertEqual(self.executions,1)
 
-    def test_cancelling_before_execution_does_allow_a_new_explicit_approval_request(self):
-        choice=decision('access','One authorized check only')
-        first=c.run(11,api_key='fake-only',model=Mock(return_value=choice))
-        result=c.run(11,api_key='fake-only',continue_run=True,model=Mock(return_value=choice))
-        self.assertEqual(result['stop_reason'],'role_approval_required')
-        self.assertEqual(result['steps'][0]['execution_outcome']['status'],'not_started')
-        self.assertIsNone(result['steps'][-1]['approved_at'])
-        self.assertEqual(self.executions,0)
+    def test_cancelled_before_execution_is_not_a_failed_operation(self):
+        with self.case.connect() as db:
+            c.ensure_schema(db);state=c.snapshot(db,11,2)
+            run=db.execute("INSERT INTO pm_coordinator_runs(task_id,target,status,created_at,updated_at) VALUES(11,'10.0.0.1','planned',?,?)",(c.now(),c.now())).lastrowid
+            step=c.insert_step(db,run,11,decision('access','Cancelled before execution'),state,
+                {'poc_budget':7,'step_limit':15,'max_tokens':24000},'failed','operator_requested_replan')
+        result=c.run(11,api_key='fake-only',model=Mock(return_value=decision()))
+        row=next(r for r in result['steps'] if r['id']==step)
+        self.assertEqual(row['execution_outcome']['status'],'not_started')
+        self.assertIsNone(row['approved_at']);self.assertEqual(self.executions,0)
 
     def test_legacy_completed_damage_is_visible_without_rewriting_history(self):
         self.repair_response=self.structured()
@@ -249,7 +251,11 @@ class ReportIntegrityTests(unittest.TestCase):
         self.assertIn('Действие получило отказ до исполнения',output)
 
     def test_cancelled_unapproved_step_is_not_an_executed_failure(self):
-        first=c.run(11,api_key='fake-only',model=Mock(return_value=decision('access','A single scoped attempt?')))
+        with self.case.connect() as db:
+            c.ensure_schema(db);state=c.snapshot(db,11,2)
+            run=db.execute("INSERT INTO pm_coordinator_runs(task_id,target,status,created_at,updated_at) VALUES(11,'10.0.0.1','planned',?,?)",(c.now(),c.now())).lastrowid
+            c.insert_step(db,run,11,decision('access','A single scoped attempt?'),state,
+                {'poc_budget':7,'step_limit':15,'max_tokens':24000},'failed','operator_requested_replan')
         result=c.run(11,api_key='fake-only',continue_run=True,model=Mock(return_value=decision()))
         row=result['steps'][0]
         self.assertEqual(row['error'],'operator_requested_replan')
