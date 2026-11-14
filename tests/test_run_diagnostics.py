@@ -221,9 +221,9 @@ for line in sys.stdin:
 
     def test_mcp_fixture_runs_in_relocated_checkout_without_external_pythonpath(self):
         checkout = self.root / 'relocated-checkout'
-        for directory in ('orchestrator', 'executor', 'mcp'):
+        for directory in ('orchestrator', 'executor', 'mcp', 'instructions'):
             for source in (ROOT / directory).rglob('*'):
-                if source.suffix not in ('.py', '.mjs') or '__pycache__' in source.parts:
+                if source.suffix not in ('.py', '.mjs', '.md', '.json') or '__pycache__' in source.parts:
                     continue
                 destination = checkout / source.relative_to(ROOT)
                 destination.parent.mkdir(parents=True, exist_ok=True)

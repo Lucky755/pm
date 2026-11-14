@@ -20,12 +20,10 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-from checkpoints import (
-    DATABASE,
-    APPROVAL_OPERATIONS,
-    NOTIFICATIONS,
-    initialize,
-)
+try:
+    from orchestrator.checkpoints import DATABASE, APPROVAL_OPERATIONS, NOTIFICATIONS, initialize
+except ModuleNotFoundError: # legacy direct script entry, with orchestrator/ on sys.path
+    from checkpoints import DATABASE, APPROVAL_OPERATIONS, NOTIFICATIONS, initialize
 
 ALLOWED_EVENTS = NOTIFICATIONS | {"approval_request"}
 MAX_EVENTS = 10

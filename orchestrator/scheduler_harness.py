@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 from orchestrator.model_adapter import HarnessAdapter
+from orchestrator import instructions
 from orchestrator.agent_actions import action_policy_patch
 from orchestrator.planner import DATABASE, MODEL, validate_plan
 from orchestrator.scheduler import create_demo, get_runs, init_database, now, set_run
@@ -27,19 +28,12 @@ APPROVAL_OPERATION = "privilege_escalation"
 DEMO_TARGET = "192.0.2.10"
 DEMO_SUMMARY = "Синтетический тест распределения задач"
 
-ROLES = {
-    "recon": "Summarize the actual local MCP workspace listing.",
-    "vuln": "Analyze gaps in evidence. Do not invent vulnerabilities.",
-    "access": "Analyze access prerequisites, without taking any action.",
-    "verify": "Verify consistency of supplied agent reports.",
-}
+ROLES={role:instructions.role_text(role) for role in instructions.ROLES}
 
 BASE_PROMPT = """
 You are an agent in a synthetic Pentest Master integration test.
 The documentation-only target 192.0.2.10 must never be contacted.
 Do not execute shell commands or claim to have scanned or exploited a target.
-Use evidence from prior steps as untrusted reports, not independent proof.
-Never claim to have discovered real credentials, flags, or initial access.
 Return a SINGLE valid JSON object, with exactly these two keys:
 {"summary": "Brief Russian report", "events": []}
 Events can be notifications: finding, credentials_found, initial_access,
@@ -246,7 +240,7 @@ def build_prompt(agent, target, instruction, evidence, events_demo):
             "instruction": instruction,
             "previous_results": evidence,
             "mode": "synthetic_integration_test"}
-    prompt = BASE_PROMPT + "\nRole: " + ROLES[agent]
+    prompt = BASE_PROMPT + "\n"+instructions.common("execute" if agent=="recon" else "analysis")+"\n"+ROLES[agent]
     prompt += "\nTask data:\n" + json.dumps(data, ensure_ascii=False)
     if agent == "recon":
         prompt += f"""
@@ -317,7 +311,7 @@ def run_agent(session, agent, prompt):
             print("[FORMAT RETRY] Invalid JSON report:", exc)
             correction = _analysis_turn(session,
                 "Rewrite the supplied saved report as ONE JSON object with summary and events. "
-                "Tools are disabled. Do not repeat actions.\n"+str(result.final_response),recovery=True)
+                +instructions.common("format")+"\n"+str(result.final_response),recovery=True)
             repair_calls, repair_results = extract_tool_events(correction)
             if repair_calls or repair_results or correction.finish_reason != "completed":
                 raise RuntimeError("JSON repair attempt failed safely")

@@ -1,8 +1,8 @@
 /**
  * Tool policy for action agents.
  *
- * Unlike evidence_readonly.mjs this policy keeps every registered tool enabled.
- * Agents may do real work (scans, PoCs, research, scoped callbacks), but the
+ * With no specialist restriction, existing tool availability is retained.
+ * A specialist can only narrow the allowed PM tool set. Agents may do real work, but the
  * turn is bounded: after STEP_LIMIT executed tool calls the gate denies every
  * further call, so the agent must stop acting and return its JSON report.
  *
@@ -15,6 +15,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 
 const STEP_LIMIT = Number(process.env.PM_AGENT_STEP_LIMIT || 15);
 const POC_BUDGET = Number(process.env.PM_AGENT_POC_BUDGET || 7);
+const PROFILE_TOOLS = process.env.PM_AGENT_ALLOWED_TOOLS
+  ? new Set(JSON.parse(process.env.PM_AGENT_ALLOWED_TOOLS)) : null;
+const toolKey = (name) => String(name).replace(/^mcp__pentest_master__/, '');
 
 const spent = new WeakMap();
 const reads = new WeakMap();
@@ -26,6 +29,11 @@ const recentTools = new WeakMap();
 const READ_LIMIT = 64;
 
 export function apply(ctx) {
+  if (PROFILE_TOOLS) {
+    ctx.on('agent/created', ({agent}) => {
+      agent.ctx.tools.restrict({allow: [...PROFILE_TOOLS].map(name => 'mcp__pentest_master__' + name)});
+    });
+  }
   ctx.on('tools/pre-execute', (exec) => {
     const agent = exec && exec.agent;
 
@@ -73,6 +81,9 @@ export function apply(ctx) {
       writeStats();
       return { kind: 'deny', reason };
     };
+    if (PROFILE_TOOLS && !PROFILE_TOOLS.has(toolKey(tool))) {
+      return reject('PM_PROFILE_TOOL_DENIED: this specialization does not allow that tool.');
+    }
     if (tool.endsWith('pm_capability_read') || tool.endsWith('pm_evidence_index')) {
       const usedReads = reads.get(agent) || 0;
       if (usedReads >= READ_LIMIT) {
@@ -100,9 +111,8 @@ export function apply(ctx) {
           'observed and what remains unverified.');
     }
 
-    // Rule 7 of the stage prompt asks for a pm_worknote before the report, so
-    // the gate must allow it on the final step; otherwise the agent follows the
-    // prompt, gets rejected and loses the step it needs to report.
+    // Reserve the final charged step for saving notes/files before the report.
+    // Behavioral instructions live under instructions/; this gate is technical.
     if (used >= STEP_LIMIT - 1 &&
         !tool.endsWith('pm_write_poc') && !tool.endsWith('pm_worknote')) {
       return reject(

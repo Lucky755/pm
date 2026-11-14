@@ -30,6 +30,11 @@ def check():
     for file in ('orchestrator/evidence_readonly.mjs','orchestrator/agent_actions.mjs',
                  'runtime/harness-home/profiles/sdk-minimal/package.json'):
         if not (root/file).is_file():errors.append('missing_file:'+file)
+    try:
+        from orchestrator import instructions
+        instructions.catalog();instructions.common()
+        for role in instructions.ROLES:instructions.role_text(role)
+    except (OSError,ValueError,TypeError,KeyError):errors.append('instruction_catalog_invalid')
     return {'compatible':not errors,'versions':versions,'errors':errors,
             'session_cancel_api':False,'native_workflow_python_api':False}
 

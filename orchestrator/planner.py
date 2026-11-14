@@ -16,7 +16,7 @@ DATABASE = ROOT / "storage" / "tasks.db"
 MODEL = "glm-5.3-uncensored"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from orchestrator import diagnostics, planner_protocol
+from orchestrator import diagnostics, planner_protocol, instructions
 # A trailing sentence period is not part of the address: "10.1.1.1." must
 # still be seen, otherwise a stale address survives in the plan text.
 IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)")
@@ -35,14 +35,11 @@ def version_label(value, index):
     prefix = value[max(0, index - 20):index]
     return re.search(r'(?:version|версия)\s*[:=]?\s*\Z', prefix, re.I) is not None
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = instructions.common("analysis") + """
 You are a planning component for an authorized cybersecurity lab.
 
 Convert the operator's natural-language task into a structured plan.
 Only the explicitly supplied target is authorized.
-
-Do not execute commands or claim that tests have been performed.
-Do not expand the target scope based on the operator's description.
 
 Return a JSON object with:
 - summary: string

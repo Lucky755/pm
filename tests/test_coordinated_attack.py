@@ -199,6 +199,9 @@ class CoordinatorTests(unittest.TestCase):
         seen=[]
         a.CAPABILITY_LOG.mkdir()
         record={'id':'f'*24,'task_id':11,'tool':'net_exec','provenance':'network',
+                # Actual history needs a reason to compact after common rules
+                # become identical. Compact history omits these long arguments.
+                'argv':['/usr/bin/tool']+['captured-argument']*120,
                 'result':{'status':'completed','exit_code':0,'stdout':'Saved reference response'}}
         (a.CAPABILITY_LOG/'task_11.jsonl').write_text(json.dumps(record)+'\n')
         class Harness:

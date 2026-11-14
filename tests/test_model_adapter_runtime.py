@@ -163,6 +163,41 @@ class AdapterRuntimeTests(unittest.TestCase):
             self.assertEqual(record['rejection_reason'],'invalid_json')
         self.assert_preserved()
 
+    def test_specialist_profile_hides_unrelated_tools_and_denies_unsolicited_call(self):
+        number=0;choice=fixture.decision('vuln',references=['result:'+self.rid])
+        choice['profile']='http-surface'
+        def respond(body):
+            nonlocal number
+            number+=1
+            content='\n'.join(strings(body.get('messages',[])))
+            if number==1:
+                self.assertIn('http-surface',content)
+                return {'text':json.dumps(choice)}
+            if number==2:
+                self.assertIn('<pm_common_rules>',content)
+                self.assertIn('<procedure id="http-capture">',content)
+                self.assertNotIn('<procedure id="capture-audit">',content)
+                names=[t['function']['name'] for t in body['tools']]
+                self.assertTrue(any(n.endswith('pm_http_capture') for n in names))
+                self.assertTrue(any(n.endswith('pm_capability_read') for n in names))
+                self.assertFalse(any(n.endswith('pm_session') or n.endswith('pm_net_exec') for n in names),names)
+                return {'tool_name':'mcp__pentest_master__pm_session',
+                        'arguments':{'task_id':11,'action':'open','argv_json':'["/usr/bin/ssh"]'}}
+            if number==3:
+                self.assertIn('PM_PROFILE_TOOL_DENIED',content)
+                return {'text':json.dumps({'summary':'Unrequested operation was denied; no access claimed.',
+                    'findings':[],'flags':[],'verified':[],'uncertainties':[],'proposed_actions':[]})}
+            self.assertEqual(number,4)
+            return {'text':json.dumps(fixture.decision(action='wait_operator'))}
+        api=self.setup_api(respond)
+        with d.run('specialist policy smoke',11),d.process_environment():
+            result=c.run(11,api_key='local-test-only',max_tokens=1000)
+            events=d.read_events()
+        self.assertEqual(result['stop_reason'],'model_waiting_operator',self.case.console.getvalue())
+        self.assertEqual(len(api.requests),4)
+        self.assertFalse([e for e in events if e['kind']=='tool.start' and e.get('source')=='mcp'])
+        self.assert_preserved()
+
     def test_unsolicited_mcp_call_in_format_recovery_is_denied_without_replay(self):
         number=0;tool=None
         def respond(body):

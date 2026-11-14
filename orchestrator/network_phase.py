@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from orchestrator.model_adapter import HarnessAdapter
+from orchestrator import instructions
 from orchestrator.agent_actions import action_policy_patch
 
 
@@ -479,6 +480,8 @@ def run_agent(task_id, goal, force=False):
 
         prompt = f"""
 You are the Recon agent in Pentest Master.
+{instructions.common()}
+{instructions.role_text("recon")}
 
 Task ID: {task_id}
 Authorized target: {target}
@@ -500,8 +503,6 @@ MANDATORY:
 - Set execute=false for EVERY network tool call.
 - Do not perform live scans.
 - Use only the two MCP tools listed above.
-- Do not invent open ports or discovered services.
-- A planned command is NOT a completed scan.
 - Keep the selection modest and relevant.
 - Summarize your planned approach in Russian.
 """
