@@ -16,6 +16,7 @@ Security model that still holds:
 """
 
 import argparse
+import copy
 import fcntl
 from functools import wraps
 import inspect
@@ -392,6 +393,7 @@ def stage_results(task_id, log_path=None, include_metadata=False):
                     'status': result.get('status'),
                     'text': '\n'.join(str(result.get(key) or '') for key in
                                       ('stdout', 'stderr', 'response', 'output')),
+                    'outputs':{key:result[key] for key in ('stdout','stderr') if isinstance(result.get(key),str)},
                 })
                 if include_metadata:
                     records[-1].update(provenance=record.get('provenance'),
@@ -1777,6 +1779,10 @@ def normalize_report(raw):
     for key in ('findings', 'flags', 'verified', 'uncertainties', 'proposed_actions',
                 'hypotheses'):
         value = raw.get(key, [])
+        if not isinstance(value,list):
+            raise ValueError('Invalid report list field: '+key)
+        if key in ('findings','hypotheses','flags') and any(not isinstance(item,dict) for item in value):
+            raise ValueError('Invalid structured report entry: '+key)
         report[key] = value if isinstance(value, list) else []
     report['findings'] = [item for item in report['findings'] if isinstance(item, dict)][:40]
     report['hypotheses'] = [item for item in report['hypotheses'] if isinstance(item, dict)][:40]
@@ -1822,9 +1828,8 @@ def fallback_report(role, text):
     }
 
 
-CLAIM_ARTIFACT = re.compile(
-    r'(?<![\w.])(?:/[A-Za-z0-9_./%-]{2,}|0x[0-9a-fA-F]{3,}|'
-    r'\d{1,5}/(?:tcp|udp)|(?:порт|port)\s*[:#]?\s*\d{1,5})', re.I)
+from orchestrator.evidence_claims import CLAIM_ARTIFACT, artifacts_in_claim
+from orchestrator.evidence_claims import contains as artifact_in_output
 LOCAL_READ_TOOLS = frozenset(('capability_read','read_file','grep','unpack'))
 
 
@@ -1857,7 +1862,7 @@ def report_probe_records(task_id):
                     'capture_record': {**{key:record.get(key) for key in
                                          ('id','task_id','tool','provenance')},
                                        'result':{key:result[key] for key in
-                                                 ('task_id','target','status','exit_code','artifact_id')
+                                                 ('task_id','target','status','exit_code','artifact_id','error_type','server_outcome','status_code')
                                                  if key in result}},
                 }
     except FileNotFoundError:
@@ -1865,33 +1870,8 @@ def report_probe_records(task_id):
     return records
 
 
-def artifact_in_output(artifact, output):
-    if artifact.isdecimal() or artifact.lower().startswith('0x'):
-        return re.search(r'(?<![0-9a-fA-F])' + re.escape(artifact) +
-                         r'(?![0-9a-fA-F])', output, re.I) is not None
-    return artifact.lower() in output.lower()
-
-
-PROBE_DENIAL = re.compile(
-    r'no such file|not found|cannot access|permission denied|\bENOENT\b|'
-    r'ошибк\w*|отказ\w*|нет такого файла|не найден\w*', re.I)
-NEGATIVE_CLAIM = re.compile(
-    r'отсутств\w*|\bнет\b|\bне\s+(?:существ\w*|доступ\w*|найден\w*|открыт\w*)|'
-    r'\b(?:not\s+(?:found|present|available|accessible|open)|missing|absent|'
-    r'does\s+not\s+exist|cannot\s+access|no\s+such)\b', re.I)
-POSITIVE_CLAIM = re.compile(
-    r'существ\w*|\bесть\b|доступ\w*|найден\w*|открыт\w*|содерж\w*|'
-    r'\b(?:exists?|available|accessible|found|contains?|present|open)\b', re.I)
-
-
-def probe_polarity(claim, output):
-    """Heuristic polarity check, not proof of truth; operator has the final say."""
-    denied = PROBE_DENIAL.search(output) is not None
-    if NEGATIVE_CLAIM.search(claim):
-        return (denied, '' if denied else 'зонд не показал отсутствие')
-    if POSITIVE_CLAIM.search(claim) and denied:
-        return False, 'зонд показал отказ'
-    return True, ''
+from orchestrator.evidence_claims import PROBE_DENIAL, NEGATIVE_CLAIM, POSITIVE_CLAIM
+from orchestrator.evidence_claims import polarity as probe_polarity
 
 
 def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *, db=None):
@@ -1932,16 +1912,9 @@ def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *,
                                'verification_reason':'readback_is_not_original_capture_evidence'})
             continue
         claim = ' '.join(str(finding.get(key) or '') for key in ('title', 'claim'))
-        artifacts = []
-        for match in CLAIM_ARTIFACT.finditer(claim):
-            artifact = match.group()
-            if re.match(r'(?:порт|port)\s*[:#]?\s*\d+', artifact, re.I):
-                artifact = re.search(r'\d+', artifact).group()
-            elif re.fullmatch(r'\d{1,5}/(?:tcp|udp)', artifact, re.I):
-                artifact = artifact.split('/')[0]
-            artifacts.append(artifact)
+        artifacts = artifacts_in_claim(claim)
         output = record['text'] if record else ''
-        polarity_ok, polarity_reason = probe_polarity(claim, output)
+        polarity_ok, polarity_reason = probe_polarity(claim, output, finding.get('quote'))
         traceable = bool(record and record['status'] in ('completed', 'ok') and artifacts
                          and any(artifact_in_output(artifact, output)
                                  for artifact in artifacts))
@@ -2048,7 +2021,8 @@ def save_report(db, context, role, iteration, report, steps_used, raw_response=N
         with db:
             if report['report_quality']['status']!='damaged':
                 fact_state.save_hypotheses(db, context['task_id'], f'{role}-{iteration}', report)
-                fact_state.save_access_report(db, context['task_id'], report)
+                if not (report.get('report_consistency') or {}).get('blocking'):
+                    fact_state.save_access_report(db, context['task_id'], report)
             db.execute(
                 'INSERT INTO pm_agent_action_reports '
                 '(task_id, role, iteration, target, report_json, steps_used, created_at) '
@@ -2467,6 +2441,8 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                     degraded=False
                 else:
                     report['report_quality'].update(status='damaged',reason=error,format_attempts=1)
+            assertions=copy.deepcopy({key:report.get(key) for key in
+                ('summary','findings','hypotheses','access_level','access_signal','access_probe_result_id','access_quote')})
             probe_records=report_probe_records(task_id)
             report = validate_report_probes(report, task_id, role, records=probe_records,
                                              prior_ids=prior_probe_ids, db=db)
@@ -2478,6 +2454,9 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                 report, probe_records, closure_prior_ids)
             report = fact_state.validate_access_report(
                 report, probe_records, closure_prior_ids)
+            report=report_integrity.check_consistency(report,assertions)
+            if (report.get('report_consistency') or {}).get('blocking') and raw_response is None:
+                raw_response=str(getattr(result,'final_response','') or '').replace(key,'[СКРЫТО]')
             stats_unknown = tool_calls['calls'] is None
             steps_used = tool_calls['calls'] or 0
             session_share = round(tool_calls['sessions'] / steps_used, 3) if steps_used else 0.0

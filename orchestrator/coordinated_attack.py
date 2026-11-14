@@ -454,9 +454,12 @@ def changed_records(before, after):
 
 def step_view(row):
     return {**{key:row[key] for key in ('id','step_no','status','report_iteration','report_path','error','outcome_uncertain')},
+            'report_state':('saved' if row.get('report_path') and os.path.isfile(row['report_path']) else
+                            'missing' if row.get('report_path') else 'reserved' if row.get('report_iteration') else 'none'),
             'approved_at':row.get('approved_at'),'report_quality':row.get('report_quality'),
             'report_reviewed_at':row.get('report_reviewed_at'),'raw_report_path':row.get('raw_report_path'),
             'execution_outcome':report_integrity.step_execution(row),
+            'report_consistency':row.get('report_consistency'),
             'decision':json.loads(row['decision_json'])}
 
 
@@ -506,9 +509,9 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
         try:
             ensure_schema(db)
             registry = flag_verify.scan(task_id, db=db)
-            for (raw,) in db.execute('SELECT report_json FROM pm_agent_action_reports WHERE task_id=? ORDER BY iteration',
+            for raw,saved_role,saved_iteration in db.execute('SELECT report_json,role,iteration FROM pm_agent_action_reports WHERE task_id=? ORDER BY iteration',
                                      (task_id,)).fetchall():
-                saved_report = json.loads(raw)
+                saved_report = report_integrity.decode_saved(raw,task_id,saved_role,saved_iteration)
                 if (report_integrity.quality(saved_report)['status']!='damaged'
                         and not saved_report.get('stage_aborted') and not saved_report.get('report_incomplete')):
                     objectives.process_report(db,task_id,saved_report,registry)
@@ -684,14 +687,15 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                         raise RuntimeError('Role saved only an aborted report')
                     if report.get('report_incomplete'):
                         state=snapshot(db,task_id,expect_flags)
+                        unknown=(report.get('execution_outcome') or {}).get('status','unknown')=='unknown'
                         update_step(db,step_id,'failed',report_path=report.get('report_path'),
-                                    error='report_incomplete',outcome_uncertain=1,
+                                    error='report_incomplete',outcome_uncertain=int(unknown),
                                     knowledge_after_sha256=state['knowledge_sha256'])
                         with db:
                             db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
                         diagnostics.emit('coordinator.pause',step_id=step_id,coordinator_run_id=run_id,
-                                         reason='report_incomplete',report_path=report.get('report_path'),outcome_uncertain=True,
-                                         reason_summary='Отчёт неполон; результаты сохранены. Исход действий требует проверки оператором.')
+                                         reason='report_incomplete',report_path=report.get('report_path'),outcome_uncertain=unknown,
+                                         reason_summary='Отчёт неполон или противоречив; требуется проверка оператором. Исход исполнения сохранён отдельно.')
                         return finish('role_report_incomplete_requires_review','waiting_operator')
                     registry=flag_verify.scan(task_id,db=db)
                     objectives.process_report(db,task_id,report,registry)

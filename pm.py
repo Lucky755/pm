@@ -1315,7 +1315,7 @@ def render_coordinator_result(result, args):
              'Новые действия и планирование приостановлены. Изучите исходный ответ и доказательства; '
              '--continue-coordinated явно признает отчёт неполным и разрешит перепланирование, без повтора шага.')
     if result['stop_reason']=='role_report_incomplete_requires_review':
-        line('  Отчёт неполон; результаты сохранены. Исход действий требует проверки оператором. '
+        line('  Отчёт неполон или противоречив; требует проверки оператором. Исход исполнения приведён отдельно. '
              'Автоматический повтор роли заблокирован.')
     line(f"  Исследовательская цель подтверждена: {result['succeeded']}")
     for point in result.get('checkpoints',[]):
@@ -1325,10 +1325,16 @@ def render_coordinator_result(result, args):
         line('    Действие оператора: '+safe_display(point['operator_action']))
     for step in result['steps']:
         decision=step['decision']
-        line(f"  Шаг #{step['id']} {step['status']} · {decision.get('role') or decision.get('action','invalid')} · отчёт {step['report_iteration']}")
-        if step.get('report_path'):
+        report_label={'reserved':'зарезервирован номер отчёта','saved':'сохранён отчёт',
+                      'missing':'файл отчёта отсутствует','none':'без отчёта'}.get(step.get('report_state'),'номер отчёта')
+        line(f"  Шаг #{step['id']} {step['status']} · {decision.get('role') or decision.get('action','invalid')} · {report_label} {step['report_iteration']}")
+        if step.get('report_path') and step.get('report_state')!='missing':
             line('    Сохранённый отчёт: ' + safe_display(step['report_path']))
         quality=step.get('report_quality') or {}
+        if quality.get('status')=='incomplete':
+            line('    Причина неполноты отчёта: '+safe_display(quality.get('reason','unknown')))
+        for issue in (step.get('report_consistency') or {}).get('issues',[]):
+            line('    Конфликт утверждений: '+safe_display(issue['code']))
         if quality.get('status')=='damaged':
             line('    Отчёт повреждён: '+safe_display(quality.get('reason','unknown')))
             if step.get('raw_report_path'):
@@ -1336,7 +1342,8 @@ def render_coordinator_result(result, args):
         execution=(step.get('execution_outcome') or {}).get('status')
         labels={'not_started':'Действие не запускалось', 'executed':'Вызов исполнен; достижение цели этим не подтверждено',
                 'nonzero_exit':'Вызов исполнен с ненулевым exit_code', 'refused':'Действие получило отказ до исполнения',
-                'unknown':'Исход операции неизвестен', 'mixed':'Исходы операций различаются; см. result_id'}
+                'unknown':'Исход операции неизвестен', 'executor_error':'Ошибка исполнителя до подтверждённого результата',
+                'mixed':'Исходы операций различаются; см. result_id'}
         if execution in labels:
             line('    '+labels[execution])
         if step.get('error'):
@@ -1344,6 +1351,8 @@ def render_coordinator_result(result, args):
         for record in (step.get('execution_outcome') or {}).get('results',[]):
             line(f"    result_id={safe_display(record['result_id'])} · {safe_display(record['tool'])} · "
                  f"{safe_display(record.get('provenance') or 'unknown')} · {safe_display(record['status'])} · exit_code={record.get('exit_code')}")
+            if record.get('server_outcome')=='refused':
+                line('    Сервер отказал в операции; исполнение вызова и подтверждение цели учитываются отдельно.')
         if decision:
             line('    Вопрос: ' + safe_display(decision['question']))
             line('    Основание: ' + safe_display(decision['reason']))

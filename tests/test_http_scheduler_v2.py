@@ -3,7 +3,10 @@ import sys
 import types
 import unittest
 from unittest.mock import Mock, patch
-from test_auto_scheduler import AutoTests, s
+if __package__:
+    from .test_auto_scheduler import AutoTests, s
+else:
+    from test_auto_scheduler import AutoTests, s
 
 
 class WebAutoTests(AutoTests):

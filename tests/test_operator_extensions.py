@@ -52,9 +52,9 @@ class OperatorExtensionsTests(unittest.TestCase):
         def broker(command, **kwargs):
             self.assertEqual(command[:5], ['run', '--task-id', '1', '--profile', 'exec'])
             argv = [item[7:] for item in command if item.startswith('--argv=')]
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=12)
-            return {'status': 'completed', 'exit_code': result.returncode,
-                    'stdout': result.stdout, 'stderr': result.stderr}, 0
+            self.assertTrue(argv) # executor boundary; do not depend on the host's loopback port 1
+            return {'status':'completed','exit_code':0,'stdout':json.dumps({
+                'reachable':[],'unreachable':[1],'unchecked':[]}), 'stderr':''},0
         with patch.object(pm, 'sudo_checked', broker):
             result = pm.preflight_target(db, 1, '127.0.0.1', [1], timeout=0.1)
         self.assertEqual(result['reachable'], [])

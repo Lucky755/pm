@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'orchestrator/evidence_pipeline.py'
 
 # Stub the network and Burp sources with known provenance data.
+from orchestrator import diagnostics
 network_module = types.ModuleType('orchestrator.network_workflow')
 network_items = [{
     'observation_id': 7, 'run_id': 3, 'target': '127.0.0.1',
@@ -20,6 +21,8 @@ network_module.build_evidence_bundle = lambda db, task_id: {
     'authorized_target': '127.0.0.1', 'observations': list(network_items)
 }
 sys.modules['orchestrator'] = types.ModuleType('orchestrator')
+sys.modules['orchestrator'].__path__ = [str(ROOT/'orchestrator')]
+sys.modules['orchestrator'].diagnostics = diagnostics
 sys.modules['orchestrator.network_workflow'] = network_module
 
 spec = importlib.util.spec_from_file_location('evidence_pipeline_test', SRC)

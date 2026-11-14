@@ -941,6 +941,7 @@ def run_capability(command, timeout, tool="capability", task_id=None):
         payload = {
             "status": "error",
             "kind": "broker",
+            "error_type": "executor_unavailable" if isinstance(exc,FileNotFoundError) else "launch_error",
             "error": str(exc),
         }
         log_capability(tool, task_id, payload, time.monotonic() - started, command)

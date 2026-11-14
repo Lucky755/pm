@@ -26,6 +26,7 @@ class Tests(unittest.TestCase):
 
     def test_tty_gets_ansi_but_captured_output_not(self):
         with patch.dict(os.environ, {'TERM': 'xterm-256color'}, clear=False):
+            os.environ.pop('NO_COLOR',None) # exercise TTY support independently of the calling terminal
             with redirect_stdout(io.StringIO()) as captured:
                 self.assertNotIn('\x1b[', pm.tint('START'))
                 pm.line(pm.tint('START'))

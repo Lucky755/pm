@@ -6,6 +6,10 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
+try:
+    from orchestrator import evidence_claims
+except ImportError:  # direct execution of orchestrator/agent_actions.py
+    import evidence_claims
 
 CLAIM_KINDS = frozenset({'observation', 'inference', 'hypothesis'})
 HYPOTHESIS_STATES = frozenset({'untested', 'confirmed', 'refuted', 'dropped'})
@@ -322,9 +326,9 @@ def validate_access_report(report, records, prior_ids=()):
     result_id = str(report.get('access_probe_result_id') or '')
     quote = str(report.get('access_quote') or '').strip()[:400]
     record = records.get(result_id) if result_id not in prior_ids else None
-    if signal != 'none' and (not record or not quote or
+    if signal != 'none' and (not record or record.get('status') not in ('completed','ok') or not quote or
                              quote not in str(record.get('text') or '') or
-                             (signal != 'credential' and level == 'none')):
+                             (signal != 'credential' and (level == 'none' or evidence_claims.PROBE_DENIAL.search(quote)))):
         report['access_warning'] = 'Заявление о доступе без нового вывода и точной цитаты'
         signal, level, result_id, quote = 'none', 'none', '', ''
     report.update(access_level=level, access_signal=signal,
@@ -426,12 +430,23 @@ def validate_hypotheses(report, records, prior_ids=()):
         quote = str(item.get('quote') or '').strip()[:400]
         reason = str(item.get('reason') or '').strip()[:400]
         if status in ('confirmed', 'refuted'):
+            item['reported_result']=status
             record = records.get(result_id) if result_id not in prior_ids else None
             output = str((record or {}).get('text') or '')
             if (not record or record.get('status') not in ('completed', 'ok')
                     or not quote or quote not in output):
                 status = 'untested'
                 item['validation_warning'] = 'Закрытие требует нового result_id и точной цитаты вывода'
+            else:
+                agrees,detail=evidence_claims.polarity(claim,output,quote)
+                unrelated=detail.startswith('цитата')
+                if unrelated or status=='confirmed' and not agrees:
+                    status='untested'
+                    item['validation_warning']='Цитата не подтверждает это утверждение'
+                elif status=='refuted' and ((evidence_claims.POSITIVE_CLAIM.search(claim) and agrees)
+                        or (evidence_claims.NEGATIVE_CLAIM.search(claim) and agrees)):
+                    status='untested'
+                    item['validation_warning']='Цитата не опровергает это утверждение'
         elif status == 'dropped' and not reason:
             status = 'untested'
             item['validation_warning'] = 'Снятие гипотезы требует причины'
@@ -476,6 +491,9 @@ def save_hypotheses(db, task_id, stage, report):
         if kind not in CLAIM_KINDS:
             kind = 'hypothesis'
         status = item.get('result', 'untested')
+        if (report.get('report_consistency') or {}).get('blocking'):
+            status='untested'
+            item={**item,'probe_result_id':'','quote':''}
         if status not in HYPOTHESIS_STATES:
             status = 'untested'
         previous = db.execute('SELECT status FROM pm_hypotheses WHERE task_id=? AND claim_key=?',
