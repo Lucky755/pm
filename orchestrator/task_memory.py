@@ -291,7 +291,7 @@ def sync(db,task_id,capability_log,*,reason,expected_version=None):
                         payload.get('status') not in ('completed','ok') or not record.get('argv')):continue
                 try:description=canonical_operation(record['tool'],record['argv'],target,record.get('provenance'))
                 except (ValueError,IndexError,TypeError):continue
-                if description['local']:continue
+                if description['repeatable_read']:continue
                 signature=description['signature']
                 if record.get('argv_truncated'):
                     if not re.fullmatch(r'[a-f0-9]{64}',str(record.get('argv_sha256',''))):continue
@@ -527,9 +527,14 @@ def canonical_operation(tool,command,target,provenance='network'):
     # Scope/port/path identify the resource; significant payload stays in params.
     resource=encoded({'target':params.get('--target',target),'ports':sorted(set(ports)),'protocol':protocol,'path':path,
                       'session_id':params.get('--session-id')})
-    local=provenance=='local' or tool in ('capability_read','evidence_index','observations','worknote')
-    if tool=='session' and params.get('--action') in ('read','list'):local=True
+    # Origin is evidence metadata, not permission to replay arbitrary local code.
+    # Only known buffer/index readers bypass execution deduplication.
+    repeatable_read=(tool in ('capability_read','evidence_index','observations') or
+        tool=='session' and params.get('--action') in ('read','list') or
+        tool=='callback' and params.get('--action')=='read')
+    local=provenance=='local' or repeatable_read or tool=='worknote'
     return {'resource':resource,'operation':tool,'parameters':params,'local':local,
+            'repeatable_read':repeatable_read,
             'ports':sorted(set(ports)),
             'raw_signature':'raw:'+hashlib.sha256(json.dumps(argv,ensure_ascii=False,separators=(',',':')).encode()).hexdigest(),
             'signature':digest([resource,tool,params])}
@@ -549,7 +554,7 @@ def begin_operation(db,task_id,description,*,conditions=None,require_fresh=False
                        'WHERE task_id=? AND signature IN (?,?) ORDER BY rowid DESC LIMIT 1',
                        (task_id,description['signature'],description.get('raw_signature',''))).fetchone()
         condition_hash=digest(conditions or {})
-        if old and not description['local']:
+        if old and not description.get('repeatable_read',False):
             if old[1] in ('dispatching','started','unknown') and not (allow_unknown and reason.strip()):
                 return {'allowed':False,'reason':'previous_outcome_unknown','previous_operation':old[0]}
             if old[1]=='finished' and old[2] in (condition_hash,'legacy_conditions_unknown') and not (require_fresh and reason.strip()):

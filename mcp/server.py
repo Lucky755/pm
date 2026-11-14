@@ -731,8 +731,10 @@ def capability_provenance(tool, payload, command):
     """Classify the source when writing the record, before argv is truncated."""
     if payload.get('cached') is True:return 'local'
     if tool == 'poc_run':
-        return ('network' if payload.get('network_isolated') and
-                payload.get('network_contact') else 'local')
+        if payload.get('network_isolated') is True:
+            if payload.get('network_contact') is True:return 'network'
+            if payload.get('network_contact') is False:return 'local'
+        return 'unknown'
     if tool == 'net_exec':
         argv = list(command)
         if '--argv-json' in argv:
@@ -748,6 +750,9 @@ def capability_provenance(tool, payload, command):
     if tool=='session' and '--action' in command:
         action=list(command)[list(command).index('--action')+1]
         if action in ('read','list'):return 'local'
+    if tool=='callback' and '--action' in command:
+        action=list(command)[list(command).index('--action')+1]
+        if action=='read':return 'local'
     if tool in ('session', 'network_probe', 'http_get', 'http_headers',
                 'http_path', 'http_document', 'http_capture'):
         return 'network'
@@ -910,6 +915,42 @@ def parse_tool_response(value):
     return json.loads(value)
 
 
+def supports_automatic_refresh(tool, command, target):
+    """Positive grammar for the supported bounded TCP read check, not a grant.
+
+    Generic curl (including HEAD/GET) can load config, send data or upload files;
+    it receives no automatic TTL exception. Unknown nmap flags/scripts/paths
+    also need new conditions or explicit review, rather than a name heuristic.
+    Inspect the original argv, before canonicalization removes output options.
+    """
+    if tool != 'net_exec':return False
+    try:
+        argv = json.loads(command[list(command).index('--argv-json') + 1])
+    except (ValueError, IndexError, TypeError):
+        return False
+    if not isinstance(argv, list) or not argv or argv[0] != '/usr/bin/nmap':return False
+    if not all(isinstance(arg, str) for arg in argv) or argv[-1] != target:return False
+    ports = None
+    index = 1
+    while index < len(argv) - 1:
+        arg = argv[index]
+        if arg in ('-sT', '-Pn', '-n', '--open'):
+            index += 1
+            continue
+        if arg == '-p' and index + 1 < len(argv) - 1:
+            value = argv[index + 1]
+            index += 2
+        elif arg.startswith('-p') and len(arg) > 2:
+            value = arg[2:]
+            index += 1
+        else:return False
+        if ports is not None or not re.fullmatch(r'[0-9]+(?:,[0-9]+)*', value):return False
+        ports = [int(port) for port in value.split(',')]
+        if len(ports) > NETWORK_PROFILES['tcp_ports']['max_ports'] or any(not 1 <= port <= 65535 for port in ports):
+            return False
+    return ports is not None
+
+
 def track_memory_operation(function):
     @wraps(function)
     def tracked(command,timeout,tool='capability',task_id=None):
@@ -921,7 +962,8 @@ def track_memory_operation(function):
                 return function(command,timeout,tool,task_id)
             row=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()
             if not row:return function(command,timeout,tool,task_id)
-            description=task_memory.canonical_operation(tool,command,row[0],capability_provenance(tool,{},command))
+            # Provenance is known only after a result; it never grants a retry.
+            description=task_memory.canonical_operation(tool,command,row[0],provenance='unknown')
             task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='execution_reconcile')
             conditions={'target':row[0], 'access':[
                 [r.get('level'),r.get('signal')] for r in task_memory.rows(db,'pm_access_state',task_id)]}
@@ -945,12 +987,8 @@ def track_memory_operation(function):
                     from orchestrator import service_inventory
                     from datetime import datetime,timezone
                     stamp=service_inventory.timestamp(previous[0])
-                    fresh=bool(stamp and (datetime.now(timezone.utc)-stamp).total_seconds()>service_inventory.age_minutes()*60)
-                    if tool not in ('network_probe','http_get','http_headers','http_path','http_document'):
-                        inner=description['parameters'].get('argv') or []
-                        executable=Path(str(inner[0])).name if inner else ''
-                        fresh=fresh and executable in ('nmap','curl') and not any(
-                            str(arg) in ('-d','--data','--data-raw','--data-binary','-F','--form','-X','--request') for arg in inner)
+                    fresh=bool(stamp and supports_automatic_refresh(tool,command,row[0]) and
+                        (datetime.now(timezone.utc)-stamp).total_seconds()>service_inventory.age_minutes()*60)
             with task_memory.atomic(db):
                 intent=task_memory.begin_operation(db,task_id,description,conditions=conditions,
                     require_fresh=fresh,reason='saved freshness policy expired' if fresh else '')
