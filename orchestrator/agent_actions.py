@@ -146,8 +146,10 @@ Finish with ONE JSON object and no other text:
              "credentials": {"summary": "...", "result_id": "...", "quote": "..."},
              "next_level": {"summary": "...", "result_id": "...", "quote": "..."}}},
   "flags": [{"value": "string exactly as captured", "source": "how it was obtained",
+             "method": "actual acquisition method, or explicitly unknown",
+             "path": "source file/URL if known; user.txt/root.txt may be proposed in full",
              "objective_key": "goal|obj-1|... or null if unknown",
-             "goal_evidence": "http_artifact:ID or typed capture result_id proving this objective, or empty",
+             "goal_evidence": "existing result/material reference if available, or empty; never obtain another capture just for platform confirmation",
              "goal_confirmed": false}],
   "verified": ["statements backed by captured output"],
   "material_analysis": [{"reference":"material reference from task_memory",
@@ -1902,6 +1904,12 @@ def save_report(db, context, role, iteration, report, steps_used, raw_response=N
                     if any(r['kind']=='delivered' and r['start']==analyzed.get('offset') and r['end']==analyzed.get('end') for r in prior):
                         task_memory.record_coverage(db,context['task_id'],analyzed,kind='agent_reported_analysis',
                             report_ref=f'report:{role}:{iteration}')
+            from orchestrator import flag_review
+            current_target=db.execute('SELECT target FROM tasks WHERE id=?',(context['task_id'],)).fetchone()
+            if current_target and current_target[0]==context['target']:
+                flag_review.ingest_report(db,context['task_id'],report,f'report:{role}:{iteration}')
+            for proposal in flag_review.listing(db,context['task_id']):
+                if proposal['status']=='pending':flag_review.enqueue(db,proposal['id'])
             task_memory.sync(db,context['task_id'],CAPABILITY_LOG/f"task_{context['task_id']}.jsonl",
                              reason=f'report:{role}:{iteration}')
             for existing in (path, raw_path, format_path):

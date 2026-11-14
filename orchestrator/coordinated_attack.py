@@ -18,7 +18,7 @@ from orchestrator import model_adapter, instructions, task_memory
 from orchestrator import agent_actions as actions, attack_loop, diagnostics, flag_verify, objectives
 from orchestrator import evidence_pipeline as evidence
 from orchestrator import coordinator_checkpoints as checkpoints
-from orchestrator import report_integrity, operator_questions
+from orchestrator import report_integrity, operator_questions, flag_review
 from orchestrator.harness_env import harness_env
 
 LOCK_DIR = actions.ROOT / 'runtime/coordinator_locks'
@@ -82,6 +82,7 @@ def ensure_schema(db):
             db.execute(f'ALTER TABLE pm_coordinator_steps ADD COLUMN {column} TEXT')
     checkpoints.initialize(db)
     operator_questions.initialize(db)
+    flag_review.initialize(db)
     db.commit()
 
 
@@ -154,7 +155,10 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
                 for entry in actions.service_inventory.collect_full(db,task_id)['entries']]
     answers=[{'kind':q['kind'],'branch_id':q['branch_id'],'answer':q['answer']}
              for q in operator_questions.listing(db,task_id) if q['status']=='answered']
-    return {'version':2,**({'operator_answers':semantic_set(answers)} if answers else {}),'intent':context['intent'],'target':context['target'],
+    proposals=[{'objective_key':p['objective_key'],'value_sha256':p['value_sha256'],'status':p['status']}
+               for p in flag_review.listing(db,task_id)]
+    return {'version':2,**({'operator_answers':semantic_set(answers)} if answers else {}),
+            **({'flag_reviews':semantic_set(proposals)} if proposals else {}),'intent':context['intent'],'target':context['target'],
             'goals':[{k:g.get(k) for k in ('key','title','role','weight','status')} for g in goals['objectives']],
             'goal_policy':{k:goals.get(k) for k in ('mode','exclusive','expected_flags')},
             'access':access_knowledge(essential),'triage':triage,'services':semantic_set(services),
@@ -212,6 +216,7 @@ def snapshot(db, task_id, expect):
         refs['asset:' + digest([item['kind'], item['key']])] = item
     for item in reports:
         refs[f"report:{item['role']}:{item['iteration']}"] = item
+    for proposal in flag_review.listing(db,task_id):refs['flag_proposal:'+str(proposal['id'])]=proposal
     for question in operator_questions.listing(db,task_id):refs['operator_question:'+str(question['id'])]=question
     recent = results[-20:]
     for item in results:
@@ -238,7 +243,7 @@ def snapshot(db, task_id, expect):
             'state_sha256':digest(knowledge), 'confirmed_flags': confirmed,
             'operator_checkpoints':{**checkpoints.history(db,task_id,context['target']),'blocking':False},
             'operator_questions':operator_questions.listing(db,task_id),
-            'flag_candidates':flag_candidates,
+            'flag_candidates':flag_candidates, 'flag_proposals':flag_review.listing(db,task_id),
             'success_verified': success, 'verified_stop_reason': stop,
             'authorization_block': authorization(db, context, mapped)}
 
@@ -361,7 +366,10 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             "Never evade a blocked branch by using task-wide boundaries. Answers do not grant new scope or increase budgets. "
             "Omit operator_question for run_role and stop; it is required only for wait_operator. "
             "Use existing reference keys and a profile listed for that role in specialist_profiles. "
-            "flag_candidates lists concrete validation blockers; do not claim success unless success_verified is true. "
+            "flag_candidates lists technical provenance and blockers; flag_proposals contains goal-bound platform decisions. "
+            "PM automatically queues those proposals. Awaiting a platform answer needs no GET, capture or VERIFY; "
+            "work on other open goals when useful. Never reoffer a rejected value because of a new result ID or readback. "
+            "Do not claim success unless success_verified is true. "
             "When access.pending is true, choose ACCESS with a question starting 'ТРИАЖ:'; do not escalate. "
             "previous_steps separates report quality from execution_outcome. operator_requested_replan with "
             "not_started and no approval is a cancellation before execution, not an SSH failure. "
@@ -528,6 +536,7 @@ def step_view(row):
 
 
 def result_view(db, run_id, task_id, state, expect, reason, status):
+    if state['success_verified'] and status=='completed':flag_review.completed_result(db,task_id,expect)
     with db:
         db.execute('UPDATE pm_coordinator_runs SET status=?,stop_reason=?,updated_at=? WHERE id=?',
                    (status,reason,now(),run_id))
@@ -540,6 +549,7 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
             'objectives_matrix':attack_loop.objective_matrix(state['objectives']['objectives']),
             'checkpoints':[], 'checkpoint_classifier_blocking':False,
             'operator_questions':operator_questions.listing(db,task_id),
+            'flag_proposals':flag_review.listing(db,task_id),
             'steps':[step_view(row) for row in rows]}
 
 
@@ -576,13 +586,17 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
         try:
             ensure_schema(db)
             operator_questions.retire_legacy(db,task_id,steps(db,task_id))
+            flag_review.activate(db,task_id,expect_flags)
+            expect_flags=max(expect_flags,flag_review.policy(db,task_id)['expected_flags'] or 0)
             registry = flag_verify.scan(task_id, db=db)
-            for raw,saved_role,saved_iteration in db.execute('SELECT report_json,role,iteration FROM pm_agent_action_reports WHERE task_id=? ORDER BY iteration',
-                                     (task_id,)).fetchall():
+            for raw,saved_role,saved_iteration in db.execute('SELECT report_json,role,iteration FROM pm_agent_action_reports WHERE task_id=? '
+                                     'AND target=(SELECT target FROM tasks WHERE id=?) ORDER BY iteration',
+                                     (task_id,task_id)).fetchall():
                 saved_report = report_integrity.decode_saved(raw,task_id,saved_role,saved_iteration)
                 if (report_integrity.quality(saved_report)['status']!='damaged'
                         and not saved_report.get('stage_aborted') and not saved_report.get('report_incomplete')):
                     objectives.process_report(db,task_id,saved_report,registry)
+            flag_review.reconcile(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
             task_memory.sync(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='coordinator_resume_reconcile')
             state = snapshot(db,task_id,expect_flags)
             with db:
@@ -592,6 +606,8 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
             run_id,target,run_status,old_reason,pause_id = cursor.fetchone()
             def finish(reason,status='completed'):
                 return result_view(db,run_id,task_id,state,expect_flags,reason,status)
+            if state['success_verified']:
+                return finish(state['verified_stop_reason'])
             if target != state['task']['target']:
                 return finish('task_target_changed','waiting_operator')
             damaged=report_integrity.unresolved(steps(db,task_id))
@@ -620,7 +636,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
             for waiting in [r for r in steps(db,task_id) if r['status']=='waiting_operator']:
                 question=next((q for q in questions if q['step_id']==waiting['id']),None)
                 if question:
-                    if question['status']=='answered':
+                    if question['status']!='pending':
                         update_step(db,waiting['id'],'failed',error='operator_question_answered_no_action')
                 elif continue_run:
                     update_step(db,waiting['id'],'failed',error='operator_requested_replan')
@@ -628,6 +644,8 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                     return finish('legacy_operator_question_requires_replan','waiting_operator')
             state=snapshot(db,task_id,expect_flags)
             pending_questions=[q for q in questions if q['status']=='pending']
+            if any(q['kind']=='flag_confirmation' for q in pending_questions) and not flag_review.useful_work(db,task_id,expect_flags):
+                return finish('operator_questions_pending','waiting_operator')
             if pending_questions and (not operator_questions.available(state) or
                     run_status=='waiting_operator' and not continue_run):
                 return finish('operator_questions_pending','waiting_operator')
@@ -638,6 +656,8 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 db.execute("UPDATE pm_coordinator_runs SET status='running',pause_step_id=NULL WHERE id=?",(run_id,))
             for _ in range(max_steps):
                 state = snapshot(db,task_id,expect_flags)
+                if any(q['status']=='pending' and q['kind']=='flag_confirmation' for q in state['operator_questions']) and not flag_review.useful_work(db,task_id,expect_flags):
+                    return finish('operator_questions_pending','waiting_operator')
                 if any(q['status']=='pending' for q in state['operator_questions']) and not operator_questions.available(state):
                     return finish('operator_questions_pending','waiting_operator')
                 if state['authorization_block']:
@@ -759,6 +779,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                         return finish('role_report_incomplete_requires_review','waiting_operator')
                     registry=flag_verify.scan(task_id,db=db)
                     objectives.process_report(db,task_id,report,registry)
+                    flag_review.reconcile(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
                     state=snapshot(db,task_id,expect_flags)
                     update_step(db,step_id,'completed',report_path=report.get('report_path'),
                                 knowledge_after_sha256=state['knowledge_sha256'])

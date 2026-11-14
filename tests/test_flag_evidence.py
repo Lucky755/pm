@@ -14,7 +14,7 @@ if __package__:
 else:
     import test_coordinated_attack as fixtures
 from orchestrator import agent_actions as a, coordinated_attack as c, diagnostics as d
-from orchestrator import flag_verify as flags, http_artifacts as artifacts, objectives
+from orchestrator import flag_verify as flags, http_artifacts as artifacts, objectives, flag_review, operator_questions
 
 
 class FlagEvidenceTests(unittest.TestCase):
@@ -44,11 +44,18 @@ class FlagEvidenceTests(unittest.TestCase):
         with self.case.connect() as db:
             return flags.scan(11, db=db)
 
-    def test_single_saved_target_response_is_enough(self):
+    def accept_pending(self):
+        with self.case.connect() as db:
+            flag_review.reconcile(db,11,a.CAPABILITY_LOG/'task_11.jsonl')
+            for question in operator_questions.listing(db,11,pending=True):
+                if question['kind']=='flag_confirmation':operator_questions.answer(db,11,question['id'],'approve','Offline test: CTF accepted')
+
+    def test_single_saved_target_response_is_a_witness_pending_platform_answer(self):
         aid = self.capture()
         result = self.registry()
-        self.assertEqual([f['value'] for f in result['confirmed']], [self.value])
-        proof = result['confirmed'][0]['verified_evidence'][0]
+        self.assertEqual(result['confirmed'],[])
+        self.assertEqual([f['value'] for f in result['candidates']], [self.value])
+        proof = result['candidates'][0]['verified_evidence'][0]
         self.assertEqual(proof['capture_ref'], f'http_artifact:{aid}')
         self.assertEqual(proof['target'], '10.0.0.1')
         self.assertEqual(proof['path'], '/flag.txt')
@@ -57,7 +64,7 @@ class FlagEvidenceTests(unittest.TestCase):
 
     def test_original_http_status_is_preserved_instead_of_claiming_200(self):
         self.capture(status=404)
-        proof = self.registry()['confirmed'][0]['verified_evidence'][0]
+        proof = self.registry()['candidates'][0]['verified_evidence'][0]
         self.assertEqual(proof['status_code'],404)
 
     def test_request_reflection_is_candidate_and_cannot_finish(self):
@@ -75,7 +82,7 @@ class FlagEvidenceTests(unittest.TestCase):
         good = self.capture()
         reflected = self.capture(path='/echo/'+quote(self.value,safe=''))
         registry = self.registry()
-        proof = registry['confirmed'][0]['verified_evidence']
+        proof = registry['candidates'][0]['verified_evidence']
         self.assertEqual([p['capture_ref'] for p in proof],[f'http_artifact:{good}'])
         with self.case.connect() as db:
             objectives.save_objectives(db,11,'Capture the flag',exclusive=True)
@@ -83,7 +90,7 @@ class FlagEvidenceTests(unittest.TestCase):
             state = objectives.process_report(db,11,report,registry)
             self.assertNotEqual(state['primary']['status'],'confirmed')
             report['flags'][0]['goal_evidence']=f'http_artifact:{good}'
-            self.assertEqual(objectives.process_report(db,11,report,registry)['primary']['status'],'confirmed')
+            self.assertEqual(objectives.process_report(db,11,report,registry)['primary']['status'],'open')
 
     def test_path_reflection_with_literal_plus_is_not_discovery(self):
         value='THM{known+reflected+value}'
@@ -110,21 +117,21 @@ class FlagEvidenceTests(unittest.TestCase):
         self.record(id='b'*24, tool='read_file', provenance='local')
         self.assertEqual(self.registry()['confirmed'], [])
         self.capture()
-        first = self.registry()['confirmed'][0]['verified_evidence']
+        first = self.registry()['candidates'][0]['verified_evidence']
         self.record(id='c'*24, tool='capability_read', provenance='local')
-        self.assertEqual(self.registry()['confirmed'][0]['verified_evidence'], first)
+        self.assertEqual(self.registry()['candidates'][0]['verified_evidence'], first)
 
     def test_duplicate_capture_preserves_both_references_without_extra_witness(self):
         first, second = self.capture(), self.capture()
         result = self.registry()
-        proof = result['confirmed'][0]['verified_evidence']
+        proof = result['candidates'][0]['verified_evidence']
         self.assertEqual(len(proof), 1)
         self.assertEqual(proof[0]['capture_refs'], [f'http_artifact:{first}', f'http_artifact:{second}'])
         with self.case.connect() as db:
             objectives.save_objectives(db,11,'Capture the flag',exclusive=True)
             report = {'flags':[{'value':self.value,'objective_key':'goal','goal_evidence':f'http_artifact:{second}'}]}
             state = objectives.process_report(db,11,report,result)
-        self.assertEqual(state['primary']['status'],'confirmed')
+        self.assertEqual(state['primary']['status'],'open')
 
     def test_typed_capture_result_id_keeps_the_existing_report_contract(self):
         aid = self.capture()
@@ -135,7 +142,7 @@ class FlagEvidenceTests(unittest.TestCase):
             objectives.save_objectives(db,11,'Capture the flag',exclusive=True)
             report = {'flags':[{'value':self.value,'objective_key':'goal','goal_evidence':'a'*24}]}
             state = objectives.process_report(db,11,report,registry)
-        self.assertEqual(state['primary']['status'],'confirmed')
+        self.assertEqual(state['primary']['status'],'open')
 
     def test_poc_cannot_claim_a_capture_link_to_complete_a_goal(self):
         aid = self.capture()
@@ -146,14 +153,14 @@ class FlagEvidenceTests(unittest.TestCase):
             report = {'flags':[{'value':self.value,'objective_key':'goal','goal_evidence':'a'*24}]}
             state = objectives.process_report(db,11,report,registry)
         self.assertNotEqual(state['primary']['status'],'confirmed')
-        self.assertEqual(registry['confirmed'][0]['status'],'confirmed')
+        self.assertEqual(registry['candidates'][0]['status'],'candidate')
 
     def test_git_blob_is_redecoded_and_hash_checked(self):
         body = ('# README\n'+self.value+'\n').encode()
         raw = b'blob '+str(len(body)).encode()+b'\0'+body
         oid = hashlib.sha1(raw).hexdigest()
         aid = self.capture(zlib.compress(raw), f'/.git/objects/{oid[:2]}/{oid[2:]}')
-        proof = self.registry()['confirmed'][0]['verified_evidence'][0]
+        proof = self.registry()['candidates'][0]['verified_evidence'][0]
         self.assertEqual(proof['kind'], 'git_blob')
         self.assertEqual(proof['object_id'], oid)
         self.assertEqual(proof['capture_ref'], f'http_artifact:{aid}')
@@ -218,6 +225,10 @@ class FlagEvidenceTests(unittest.TestCase):
             self.case.role(*args, **kwargs)
         model = Mock(return_value=fixtures.decision('recon', 'Capture the saved target response?'))
         result = c.run(11, api_key='fake-only', model=model, role_runner=role, max_steps=1, expect_flags=1)
+        self.assertFalse(result['succeeded'])
+        self.assertEqual(result['stop_reason'],'operator_questions_pending')
+        self.accept_pending()
+        result=c.run(11,expect_flags=1,model=Mock(side_effect=AssertionError('No model after CTF answer')))
         self.assertTrue(result['succeeded'])
         self.assertEqual(result['stop_reason'], 'goal_confirmed')
         self.assertEqual(model.call_count, 1)
@@ -234,12 +245,15 @@ class FlagEvidenceTests(unittest.TestCase):
         self.case.role(11,'recon','Capture evidence',1,1,1)
         model = Mock(side_effect=AssertionError('unneeded model request'))
         result = c.run(11,model=model,expect_flags=1)
-        self.assertTrue(result['succeeded'])
+        self.assertFalse(result['succeeded'])
+        self.assertEqual(result['stop_reason'],'operator_questions_pending')
+        self.accept_pending()
         model.assert_not_called()
         sha = hashlib.sha256(('flag: '+self.value+'\n').encode()).hexdigest()
         (artifacts.ROOT/'task-11'/(sha+'.body')).write_bytes(b'corrupted capture')
         result = self.case.run_mode([fixtures.decision()],expect_flags=1)
-        self.assertFalse(result['succeeded'])
+        self.assertTrue(result['succeeded'])  # platform decision survives loss of an old capture
+        self.assertTrue(self.registry()['evidence_errors'])
 
     def test_candidates_and_specific_blockers_reach_actual_coordinator_prompt(self):
         self.record(provenance='local')

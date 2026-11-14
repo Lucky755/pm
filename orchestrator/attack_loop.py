@@ -61,7 +61,7 @@ NORMAL_STOP_REASONS = frozenset({'iterations_done', 'flag_confirmed', 'no_progre
                                  'goal_confirmed', 'objectives_done'})
 KNOWN_STOP_REASONS = NORMAL_STOP_REASONS | frozenset(
     {'stalled', 'state_unavailable', 'recon_failed', 'vuln_failed',
-     'target_unreachable', 'flags_without_goal','report_damaged'})
+     'target_unreachable', 'flags_without_goal','report_damaged','operator_questions_pending'})
 STAGE_STATUSES = frozenset({'completed', 'salvaged', 'error','report_damaged'})
 
 
@@ -196,6 +196,11 @@ def task_objectives(task_id):
 def objective_stop_reason(state, confirmed_count, expect):
     """Keep the legacy threshold when no primary objective is configured."""
     primary = state.get('primary')
+    review=state.get('manual_flag_review')
+    if review is not None:
+        required=max(expect,review.get('expected_flags') or 0,state.get('expected_flags') or 0)
+        if review['accepted_count']<required or any(row['key'] not in review['reviewed_goal_keys'] for row in state['objectives']):return None
+        return ('goal_confirmed' if state.get('exclusive') and len(state['objectives'])==1 else 'objectives_done') if primary else 'flag_confirmed'
     if not primary or state.get('mode') == 'all-flags':
         return 'flag_confirmed' if confirmed_count >= expect else None
     if primary['status'] == 'confirmed' and state.get('exclusive'):
@@ -486,8 +491,15 @@ def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
     pattern_db = agent_actions.connect()
     try:
         patterns = flag_verify.load_patterns(pattern_db, task_id)
+        from orchestrator import flag_review, operator_questions
+        flag_review.activate(pattern_db,task_id,expect)
+        flag_review.reconcile(pattern_db,task_id,agent_actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
+        completed=flag_review.completion(pattern_db,task_id,expect)
+        waiting=bool(operator_questions.listing(pattern_db,task_id,pending=True)) and not flag_review.useful_work(pattern_db,task_id,expect)
     finally:
         pattern_db.close()
+    if completed:return finish(task_id,stages,completed,None,expect)
+    if waiting:return finish(task_id,stages,'operator_questions_pending',None,expect)
     stop_reason = 'iterations_done'
     previous = None
     first_iteration = next_iteration(task_id)
@@ -685,6 +697,10 @@ def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
             if found and len(found) < expect:
                 say(f'[FLAG] подтверждено {len(found)} из {expect} — продолжаю поиск '
                     'остальных')
+            with agent_actions.connect() as review_db:
+                flag_review.reconcile(review_db,task_id,agent_actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
+                waiting=bool(operator_questions.listing(review_db,task_id,pending=True)) and not flag_review.useful_work(review_db,task_id,expect)
+            if waiting:return finish(task_id,stages,'operator_questions_pending',report,expect)
             reason = objective_stop_reason(objective_state, len(found), expect)
             if reason:
                 stop_reason = reason
@@ -698,7 +714,7 @@ def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
                     say('[FLAG] внимание: заявлены, но сырым выводом не подтверждены: '
                         + ', '.join(unbacked[:5]))
                     say('      цикл останавливается — эти значения проверьте отдельно')
-                if reason in ('goal_confirmed', 'objectives_done', 'flags_without_goal'):
+                if objective_state.get('manual_flag_review') is not None or reason in ('goal_confirmed', 'objectives_done', 'flags_without_goal'):
                     return finish(task_id, stages, stop_reason, previous, expect)
                 if role != 'verify' and 'verify' not in roles:
                     say('      внимание: роль verify не включена — независимое '
@@ -843,7 +859,7 @@ def finish(task_id, stages, stop_reason, previous, expect=DEFAULT_EXPECTED_FLAGS
     problems = []
     if stop_reason not in KNOWN_STOP_REASONS:
         problems.append(f'неизвестная причина остановки: {stop_reason!r}')
-    if not stages:
+    if not stages and stop_reason not in ('operator_questions_pending','flag_confirmed','goal_confirmed','objectives_done'):
         problems.append('ни одна стадия не запускалась')
     for item in stages:
         status = item.get('status')
@@ -877,9 +893,12 @@ def finish(task_id, stages, stop_reason, previous, expect=DEFAULT_EXPECTED_FLAGS
     # The structured state is part of the result, not only of the free-text
     # summary: an operator reading the loop JSON must see the access level and
     # the open hypotheses without querying the database by hand.
+    queued=[]
     try:
         db = agent_actions.connect()
         try:
+            from orchestrator import operator_questions
+            queued=operator_questions.listing(db,task_id)
             access_state = fact_state.access_state(db, task_id)
             hypotheses = fact_state.list_hypotheses(db, task_id, limit=200)
             try:
@@ -907,8 +926,12 @@ def finish(task_id, stages, stop_reason, previous, expect=DEFAULT_EXPECTED_FLAGS
         problems.append('основная цель не подтверждена')
     succeeded = (not problems and stop_reason in NORMAL_STOP_REASONS and
                  (not primary or primary['status'] == 'confirmed'))
+    review=objective_data.get('manual_flag_review')
+    if review is not None:
+        succeeded=succeeded and bool(objective_stop_reason(objective_data,len(confirmed),expect))
     result = {
-        'status': 'completed' if succeeded else 'incomplete',
+        'status': 'completed' if succeeded else 'waiting_operator' if stop_reason=='operator_questions_pending' else 'incomplete',
+        'operator_questions':queued,
         'succeeded': succeeded,
         'problems': problems,
         'warnings': warnings,

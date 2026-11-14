@@ -1308,6 +1308,19 @@ def continuation_requested(args):
     return (getattr(args,'continue_coordinated',False) or getattr(args,'abandon_running_step',None) is not None)
 
 
+def render_flag_candidate(question):
+    candidate=question.get('flag_candidate')
+    if not candidate:return
+    line(f"    Кандидат #{candidate['id']} · цель {safe_display(candidate['objective_key'])}: {safe_display(candidate['objective_title'])}")
+    # JSON literals preserve whitespace and cannot inject terminal controls.
+    line('    Точное значение (JSON): '+json.dumps(candidate['value'],ensure_ascii=True))
+    for source in candidate['sources']:
+        line('    Источник: '+safe_display(source['source'])+' · способ: '+safe_display(source['method']))
+    line('    Материалы: '+', '.join(safe_display(ref) for ref in candidate['materials']))
+    if question['status']=='pending':line('    Проверьте значение самостоятельно на CTF-платформе. Принят? Да / Нет. Машина может быть выключена.')
+    elif candidate['status']=='rejected':line(f"    Отклонён. Явный пересмотр: questions {candidate['task_id']} --reconsider {candidate['id']} --note-file PATH")
+
+
 def render_coordinator_result(result, args):
     if getattr(args,'json',False):
         line(json.dumps(result,ensure_ascii=False,indent=2))
@@ -1324,6 +1337,7 @@ def render_coordinator_result(result, args):
     for question in result.get('operator_questions',[]):
         line(f"  Вопрос #{question['id']} [{question['status']}] · {safe_display(question['kind'])} · ветка {safe_display(question['branch_id'])}")
         line('    '+safe_display(question['question']))
+        render_flag_candidate(question)
         line('    Причина: '+safe_display(question['reason']))
         line('    Границы: '+safe_display(json.dumps(question['boundaries'],ensure_ascii=False)))
         line('    Ссылки: '+', '.join(safe_display(ref) for ref in question['references']))
@@ -1527,16 +1541,25 @@ def op_new(args, *, defer_execution=False):
 
 @diagnostics.stage
 def op_resume(args):
-    from orchestrator import coordinated_attack, task_runtime
+    from orchestrator import coordinated_attack, task_runtime, flag_review
     with coordinated_attack.task_lock(args.task_id), connect() as db:
         requested=getattr(args,'coordinated',None)
         mode=chosen_task_mode(db,args)
         validate_launch_options(args,mode)
         args.coordinated=mode=='coordinated'
         task_target(db,args.task_id)
+        from orchestrator import agent_actions
+        flag_review.reconcile(db,args.task_id,flag_review.local_log(db,args.task_id,
+            agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl'))
+        solved=flag_review.completed_result(db,args.task_id,getattr(args,'expect_flags',None))
+        if solved:return render_coordinator_result(solved,args)
         paused=task_runtime.pause(db,args.task_id)
         if not args.coordinated and paused and (task_runtime.saved(db,args.task_id) or {}).get('mode')=='coordinated':
             raise OperatorError('Сначала разбери сохранённую паузу coordinated-режима; переключение режима её не отменяет')
+        if not args.coordinated and paused and paused.get('operator_questions') and not continuation_requested(args):
+            if getattr(args,'_explicit_flags',set())-{'--legacy','--json'}:
+                raise OperatorError('Сначала ответь на сохранённые вопросы; просмотр не применяет флаги запуска')
+            return render_coordinator_result(paused,args)
         if not args.coordinated and paused and paused.get('coordinator_run_id'):
             return render_coordinator_result(paused,args)
         if args.coordinated:
@@ -2473,25 +2496,38 @@ def op_status(args):
 
 
 def op_questions(args):
-    from orchestrator import coordinated_attack, operator_questions, agent_actions
+    from orchestrator import coordinated_attack, operator_questions, agent_actions, flag_review
+    if getattr(args,'answer',None) is not None and getattr(args,'reconsider',None) is not None:
+        raise OperatorError('Выберите ответ на вопрос либо пересмотр кандидата')
+    if getattr(args,'decision',None) and getattr(args,'answer',None) is None:
+        raise OperatorError('--decision используется вместе с --answer')
     with coordinated_attack.task_lock(args.task_id), connect() as db:
         task_target(db,args.task_id)
+        log=flag_review.local_log(db,args.task_id,agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl')
+        flag_review.reconcile(db,args.task_id,log)
+        if getattr(args,'reconsider',None) is not None:
+            text=getattr(args,'answer_text','')
+            if getattr(args,'note_file',None):text=Path(args.note_file).read_text(encoding='utf-8')
+            flag_review.reconsider(db,args.task_id,args.reconsider,text)
         if getattr(args,'answer',None) is not None:
             if not getattr(args,'decision',None):raise OperatorError('Для ответа нужен --decision')
             text=getattr(args,'answer_text','')
             if getattr(args,'note_file',None):text=Path(args.note_file).read_text(encoding='utf-8')
             operator_questions.answer(db,args.task_id,args.answer,args.decision,text,
-                capability_log=agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl')
+                capability_log=log)
         rows=operator_questions.listing(db,args.task_id)
         if getattr(args,'json',False):line(json.dumps(rows,ensure_ascii=False,indent=2))
         else:
             for item in rows:
                 line(f"  Вопрос #{item['id']} [{item['status']}] {safe_display(item['kind'])} · {safe_display(item['branch_id'])}")
                 line('    '+safe_display(item['question'])+' · '+safe_display(item['reason']))
+                render_flag_candidate(item)
                 line('    Границы: '+safe_display(json.dumps(item['boundaries'],ensure_ascii=False)))
                 line('    Ссылки: '+', '.join(safe_display(ref) for ref in item['references']))
             if not rows:line('  Ожидающих или сохранённых вопросов нет.')
             line('  Ответ не расширяет scope и бюджеты. Продолжение — обычный resume.')
+        solved=flag_review.completed_result(db,args.task_id)
+        if solved and not getattr(args,'json',False):render_coordinator_result(solved,args)
         return rows
 
 
@@ -2524,8 +2560,11 @@ def attack_task(args):
         raise OperatorError('Параметры координатора требуют --coordinated')
     with connect() as db:
         from orchestrator import task_runtime
+        from orchestrator import flag_review
+        solved=flag_review.completed_result(db,args.task_id,getattr(args,'expect_flags',None))
+        if solved:return render_coordinator_result(solved,args)
         paused=task_runtime.pause(db,args.task_id)
-        if not getattr(args,'coordinated',False) and paused and paused.get('coordinator_run_id'):
+        if not getattr(args,'coordinated',False) and paused and (paused.get('coordinator_run_id') or paused.get('operator_questions')):
             return render_coordinator_result(paused,args)
         save_flag_options(db, args.task_id, args)
         objective_state = save_objective_options(db, args.task_id, args)
@@ -2577,6 +2616,8 @@ def attack_task(args):
     line('')
     heading('Итог цикла')
     line('  ' + tint('Остановка:', 'muted') + ' ' + safe_display(result['stop_reason']))
+    for question in result.get('operator_questions',[]):
+        if question['status']=='pending':render_flag_candidate(question)
     for row in result.get('objectives_matrix') or []:
         line('  ' + safe_display(row))
     for stage in result.get('stages', []):
@@ -2648,6 +2689,10 @@ def flags_confirmed_by_evidence(db, task_id):
 
 
 def offer_cleanup_if_verified(db, task_id, result):
+    from orchestrator import flag_review
+    if flag_review.policy(db,task_id) is not None and flag_review.completion(db,task_id) is None:
+        line('  Подтверждение на CTF-платформе ещё не завершено; изоляция сохранена.')
+        return
     if not flags_confirmed_by_evidence(db, task_id):
         line('  Статус цели: флаги не подтверждены; изоляция сохранена.')
         return
@@ -2744,6 +2789,9 @@ def netguard_task_state(db, task_id):
                         (task_id,)).fetchone()
     if (closed and closed[0]) or status.lower() in ('completed', 'closed'):
         return 'closed', target
+    from orchestrator import flag_review
+    if flag_review.policy(db,task_id) is not None:
+        return ('solved' if flag_review.completion(db,task_id) else 'active'),target
     if loop_goal_reached(task_id):
         return 'solved', target
     return 'active', target
@@ -2903,6 +2951,7 @@ def parser_main():
     questions = sub.add_parser('questions', help='Очередь вопросов оператору; без API и сети')
     questions.add_argument('task_id',type=int)
     questions.add_argument('--answer',type=int,help='ID ожидающего вопроса')
+    questions.add_argument('--reconsider',type=int,help='ID отклонённого кандидата для явного пересмотра; нужна причина в --note-file')
     questions.add_argument('--decision',choices=('approve','decline','information'))
     questions.add_argument('--note-file',help='Файл пояснения UTF-8; ответ не передаётся модели до продолжения')
     questions.add_argument('--json',action='store_true')
@@ -2945,9 +2994,9 @@ def parser_main():
         cmd.add_argument('--goal-weight', default=None,
                          help='Вес основной цели от 1 до 10000 (по умолчанию 100)')
         cmd.add_argument('--goal-exclusive', action='store_true',
-                         help='Остановиться сразу после подтверждения основной цели')
+                         help='Приоритет основной цели; подтверждение всех заданных целей и expected_flags сохраняется')
         cmd.add_argument('--goal-first', action='store_true',
-                         help='Сначала основная цель, затем побочные до ожидаемого числа')
+                         help='Сначала основная цель, затем остальные заданные цели')
         cmd.add_argument('--all-flags', action='store_true',
                          help='Прежний режим: искать флаги до ожидаемого числа')
         cmd.add_argument('--flag-pattern', action='append', help='Дополнительный regex флага; повторяется')
@@ -3149,11 +3198,16 @@ def interactive():
             elif choice == '9':
                 args.task_id=int(input('Номер задачи: ').strip())
                 args.answer=None
-                interactive_operation(op_questions,args)
+                queued=interactive_operation(op_questions,args)
                 raw=input('ID вопроса для ответа (Enter — вернуться): ').strip()
                 if raw:
                     args.answer=int(raw)
-                    args.decision=input('Ответ approve / decline / information: ').strip()
+                    selected=next((q for q in queued if q['id']==args.answer),None)
+                    if selected and selected['kind']=='flag_confirmation':
+                        response=input('Платформа приняла флаг? Да / Нет: ').strip().lower()
+                        if response not in ('да','д','yes','y','нет','н','no','n'):raise OperatorError('Нужен ответ Да или Нет после проверки на платформе')
+                        args.decision='approve' if response in ('да','д','yes','y') else 'decline'
+                    else:args.decision=input('Ответ approve / decline / information: ').strip()
                     args.answer_text=input('Пояснение: ').strip()
                     interactive_operation(op_questions,args)
             else:

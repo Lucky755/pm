@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 from tests import test_coordinated_attack as fixture
 from tests import test_coordinator_checkpoints as captures
-from orchestrator import coordinated_attack as c, task_runtime, task_memory
+from orchestrator import coordinated_attack as c, task_runtime, task_memory, objectives
 
 
 def branch_decision(role=None, question='Inspect saved evidence', branch='task', kind=None):
@@ -92,9 +92,13 @@ class AutonomousWorkflowTests(unittest.TestCase):
             original=db.execute('SELECT * FROM pm_operator_approvals').fetchall()
             for kind in sorted(questions.KINDS):
                 request=branch_decision(question='Need operator input: '+kind,kind=kind)
+                if kind=='flag_confirmation':
+                    from orchestrator import flag_review
+                    proposal=flag_review.propose(db,11,'THM{task_linked_candidate}',source='saved test result')
+                    request['references']=['flag_proposal:'+str(proposal['id'])]
                 question=questions.request(db,11,'10.0.0.1',request,None)
                 self.assertEqual(questions.request(db,11,'10.0.0.1',request,None)['id'],question['id'])
-                questions.answer(db,11,question['id'],'information','Requested input supplied')
+                questions.answer(db,11,question['id'],'approve' if kind=='flag_confirmation' else 'information','Requested input supplied')
                 with self.assertRaises(ValueError):questions.answer(db,11,question['id'],'decline')
             self.assertEqual(len(questions.listing(db,11)),4)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_operator_question_events').fetchone()[0],8)
@@ -188,6 +192,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         from orchestrator import flag_verify, operator_questions
         from orchestrator import agent_actions
         agent_actions.CAPABILITY_LOG.mkdir(exist_ok=True)
+        with self.case.connect() as db:objectives.save_objectives(db,11,'Capture a flag',expected_flags=1)
         value='THM{operator_review_candidate}'
         (agent_actions.CAPABILITY_LOG/'task_11.jsonl').write_text(json.dumps({'id':'b'*24,'task_id':11,
             'tool':'poc_run','provenance':'unknown','result':{'status':'completed','exit_code':0,'stdout':value}})+'\n')
@@ -196,7 +201,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.assertEqual(registry['confirmed'],[])
         choice=branch_decision(question='Confirm the recorded flag candidate',kind='flag_confirmation')
         choice['references']=['flag:'+c.digest(value)];choice['inputs']=[{'reference':choice['references'][0]}]
-        result=self.case.run_mode([choice])
+        result=c.run(11,expect_flags=1,model=Mock(side_effect=AssertionError('Question is queued without model')))
         qid=result['operator_questions'][0]['id']
         with self.case.connect() as db:
             operator_questions.answer(db,11,qid,'approve','Operator checked the room response',

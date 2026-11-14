@@ -4,9 +4,14 @@ A flag is not "found" because an agent says so. This module reads the raw
 records the capabilities actually produced (storage/capability_log) and the
 agent reports, then classifies every candidate:
 
-  confirmed  locally validated target capture/derived artifact, or explicit
-             operator confirmation;
-  candidate  execution output or an agent claim without a validated witness.
+  confirmed  explicit platform confirmation by the operator, or a preserved
+             historical confirmation with its original provenance;
+  candidate  discovered value awaiting a task-linked platform decision;
+  rejected   candidate declined by the operator (history remains available).
+
+Local HTTP/Git validation describes technical provenance; it does not replace
+a platform answer for a newly discovered flag. Arbitrary exact values can be
+registered through task-linked proposals, independently of regex discovery.
 
 Execution counts are diagnostic metadata, never a confirmation threshold.
 
@@ -330,6 +335,8 @@ def scan(task_id, patterns=None, db=None):
     owns_db = db is None
     db = db if db is not None else connect()
     ensure_schema(db)
+    from orchestrator import flag_review
+    flag_review.activate(db,task_id)
     before = diagnostics.state_snapshot(db, task_id) if diagnostics.active() else {}
     patterns = patterns if patterns is not None else flag_patterns(db, task_id)
     pattern_sources = dict(db.execute('SELECT pattern,source FROM pm_flag_patterns WHERE task_id=?', (task_id,)))
@@ -426,12 +433,18 @@ def scan(task_id, patterns=None, db=None):
                 (task_id,)):
             found.setdefault(value, empty_entry())
 
+        # Retain discovered candidates even when their old log/capture has aged
+        # out of a display window. Availability is not a platform decision.
+        for saved in db.execute('SELECT value FROM pm_verified_flags WHERE task_id=?',(task_id,)):
+            found.setdefault(saved[0],empty_entry())
+        for proposal in flag_review.listing(db,task_id):found.setdefault(proposal['value'],empty_entry())
+        for legacy in flag_review.policy(db,task_id)['legacy_flags']:found.setdefault(legacy['value'],empty_entry())
         results = []
         stamp = now()
         for value, entry in found.items():
             roles = sorted({ref.split(':')[1] for ref in entry['claims'] if ref.count(':') >= 2})
             independent_sources = len(entry['independent'])
-            status = 'confirmed' if entry['verified_evidence'] else 'candidate'
+            status = flag_review.registry_status(db,task_id,value)
 
             previous = db.execute(
                 'SELECT operator_confirmed, sources_json, objective_key, weight FROM pm_verified_flags '
@@ -460,7 +473,7 @@ def scan(task_id, patterns=None, db=None):
                 'omitted_verified_evidence': max(0, len(entry['verified_evidence'])-8),
                 'result_ids': sorted(entry['result_ids']),
                 'rejected_evidence':entry['rejected_evidence'][:8],
-                'confirmation_reasons': ([] if status == 'confirmed' else ['no_verified_target_capture'] +
+                'confirmation_reasons': ([] if status == 'confirmed' else ['operator_rejected'] if status=='rejected' else ['operator_confirmation_required'] + ([] if entry['verified_evidence'] else ['no_verified_target_capture']) +
                     (['self_generated_output'] if entry['self_generated'] else []) +
                     (['local_output_without_capture_link'] if entry['local_hits'] else []) +
                     (['execution_output_is_not_a_capture'] if entry['raw'] else []) +
@@ -469,6 +482,9 @@ def scan(task_id, patterns=None, db=None):
                     (['source_changed_during_execution'] if entry['source_unverified'] else [])),
                 'evidence_errors':evidence_errors[:8],
             }
+            original=next((f for f in flag_review.policy(db,task_id)['legacy_flags'] if f['value']==value),None)
+            if original:
+                sources['legacy_confirmation']={'origin':original['reported_by'],'original_sources':json.loads(original['sources_json'])}
             if value in transferred:
                 sources['transfer'] = transferred[value]
             if operator_confirmed:
@@ -478,7 +494,11 @@ def scan(task_id, patterns=None, db=None):
                     sources['operator'] = 'operator confirmed'
             if previous:
                 try:
-                    marker = json.loads(previous[1]).get('goal_claim_unverified')
+                    original_sources=json.loads(previous[1])
+                    if not isinstance(original_sources,dict):original_sources={}
+                    marker = original_sources.get('goal_claim_unverified')
+                    sources['discovery_sources']=original_sources.get('discovery_sources') or {
+                        key:original_sources[key] for key in ('raw','local_hits','claims','tools','result_ids','verified_evidence') if key in original_sources}
                 except (ValueError, TypeError):
                     marker = None
                 if marker:
@@ -541,7 +561,8 @@ def scan(task_id, patterns=None, db=None):
             db.close()
 
     confirmed = [item for item in results if item['status'] == 'confirmed']
-    candidates = [item for item in results if item['status'] != 'confirmed']
+    candidates = [item for item in results if item['status'] == 'candidate']
+    rejected = [item for item in results if item['status']=='rejected']
     raw_values = [item['value'] for item in results if item['raw_hits']]
     mismatches = [{
         'value': item['value'],
@@ -552,7 +573,7 @@ def scan(task_id, patterns=None, db=None):
         'task_id': task_id,
         'count': len(results),
         'confirmed': confirmed,
-        'candidates': candidates,
+        'candidates': candidates, 'rejected':rejected,
         'evidence_errors': evidence_errors,
         'mismatches': mismatches,
         'patterns_used': list(patterns),
@@ -594,7 +615,7 @@ def operator_confirm(task_id, value, note='', *, db=None):
     owned=db is None
     db = connect() if owned else db
     existing = db.execute('SELECT value,sources_json FROM pm_verified_flags WHERE task_id=? AND value=?',
-                          (task_id, str(value).strip())).fetchone()
+                          (task_id, str(value))).fetchone()
     value = existing[0] if existing else canonical_flag_value(value, flag_patterns(db, task_id))
     if value is None:
         if owned:db.close()
@@ -608,6 +629,7 @@ def operator_confirm(task_id, value, note='', *, db=None):
         if not isinstance(sources, dict):
             sources = {}
         sources['operator'] = note[:500] or 'operator confirmed'
+        sources.pop('goal_claim_unverified',None)
         sources.setdefault('evidence_source', 'none')
         sources.setdefault('matched_by', 'default')
         db.execute(
@@ -706,7 +728,7 @@ def self_test():
                 'HTB{repr_capture}': 'candidate', 'DUP{same_poc}': 'candidate',
                 'FAKE{in_source}': 'candidate',
                 'SESS{only_shell_output}': 'candidate',
-                'SESS{corroborated_output}': 'candidate'}
+                'SESS{corroborated_output}': 'candidate', 'STALE{old}':'candidate'}
     if statuses != expected:
         raise ValueError(f'Unexpected flag statuses: {statuses}')
     dup = next(item for item in result['candidates'] if item['value'] == 'DUP{same_poc}')
@@ -723,8 +745,8 @@ def self_test():
         raise ValueError('normalise_captured did not unescape a bytes repr')
     if normalise_captured('a\\\\r\\\\nb') != 'a\nb':
         raise ValueError('normalise_captured did not unescape a doubled repr')
-    if 'STALE{old}' in listed:
-        raise ValueError('A stale candidate survived the scan')
+    if 'STALE{old}' not in listed:
+        raise ValueError('A registered candidate was lost when its source left the history window')
     errors = {item['value']: item['closest'] for item in result['mismatches']}
     if errors.get('HTB{first_0ne}') != 'HTB{first_one}':
         raise ValueError(f'Typo detection failed: {errors}')

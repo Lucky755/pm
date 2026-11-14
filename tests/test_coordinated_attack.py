@@ -354,10 +354,14 @@ class CoordinatorTests(unittest.TestCase):
         self.assertFalse(result['succeeded'])
 
     def test_verified_goal_uses_existing_stop_checks_without_model_or_roles(self):
+        from orchestrator import operator_questions
         with self.connect() as db:
-            objectives.save_objectives(db,11,'Primary flag',exclusive=True)
-            db.execute("UPDATE pm_objectives SET status='confirmed',evidence_ref='operator-reviewed' WHERE task_id=11")
-        result=self.run_mode([])
+            objectives.save_objectives(db,11,'Primary flag',exclusive=True,expected_flags=1)
+            a.save_report(db,{'task_id':11,'target':'10.0.0.1'},'recon',1,{'summary':'Saved candidate',
+                'flags':[{'value':'exact platform candidate','source':'saved SSH output','objective_key':'goal'}]},1)
+            question=operator_questions.listing(db,11,pending=True)[0]
+            operator_questions.answer(db,11,question['id'],'approve','CTF accepted')
+        result=self.run_mode([],expect_flags=1)
         self.assertTrue(result['succeeded']);self.assertEqual(self.prompts,[]);self.assertEqual(self.calls,[])
 
     def test_completed_goal_uses_capture_proof_without_operator_verify_round(self):
@@ -372,13 +376,17 @@ class CoordinatorTests(unittest.TestCase):
                                         'goal_evidence':f'http_artifact:{aid}'}]}
             self.role(*args,**kwargs)
         with patch.object(http_artifacts,'ROOT',self.root/'http'):
-            result=c.run(11,api_key='fake-only',model=self.model([decision('recon','Read target capture?')]),role_runner=role)
-        self.assertEqual(result['stop_reason'],'goal_confirmed')
-        self.assertEqual(result['status'],'completed')
-        self.assertTrue(result['succeeded'])
+            result=c.run(11,api_key='fake-only',model=self.model([decision('recon','Read target capture?')]),role_runner=role,expect_flags=1)
+        self.assertEqual(result['stop_reason'],'operator_questions_pending')
+        self.assertEqual(result['status'],'waiting_operator')
+        self.assertFalse(result['succeeded'])
+        from orchestrator import operator_questions
+        with self.connect() as db:
+            question=operator_questions.listing(db,11,pending=True)[0]
+            operator_questions.answer(db,11,question['id'],'approve','CTF accepted')
         with self.connect() as db:self.assertEqual(objectives.objective_status(db,11)['primary']['status'],'confirmed')
         with patch.object(http_artifacts,'ROOT',self.root/'http'):
-            result=self.run_mode([],continue_run=True)
+            result=self.run_mode([],continue_run=True,expect_flags=1)
         self.assertTrue(result['succeeded'])
         self.assertEqual(len(self.calls),1)
 

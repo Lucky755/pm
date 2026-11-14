@@ -61,6 +61,11 @@ def pause(db, task_id):
                         'checkpoints':[], 'checkpoint_classifier_blocking':False,
                         'operator_questions':questions,
                         'steps':[coordinator.step_view(r) for r in rows]}
+    queued=operator_questions.listing(db,task_id,pending=True)
+    if queued:
+        return {'task_id':task_id,'coordinator_run_id':None,'status':'waiting_operator','succeeded':False,
+                'stop_reason':'operator_questions_pending','steps':[],
+                'operator_questions':operator_questions.listing(db,task_id),'checkpoints':[]}
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_tcp_full_scans'").fetchone():
         if db.execute("SELECT 1 FROM pm_tcp_full_scans WHERE task_id=? AND status='running' "
                       'AND target=(SELECT target FROM tasks WHERE id=?)',(task_id,task_id)).fetchone():

@@ -77,7 +77,14 @@ def list_objectives(db, task_id):
 def objective_status(db, task_id):
     rows = list_objectives(db, task_id)
     primary = next((row for row in rows if row['key'] == 'goal'), None)
-    return {'primary': primary,
+    from orchestrator import flag_review
+    review=flag_review.progress(db,task_id)
+    if review is not None:
+        waiting={p['objective_key'] for p in review['proposals'] if p['status']=='pending'}
+        rows=[{**g,'recorded_status':g['status'],'status':('awaiting_operator' if g['key'] in waiting else 'open') if
+            g['status']=='confirmed' and g['key'] not in review['reviewed_goal_keys'] else g['status']} for g in rows]
+        primary=next((g for g in rows if g['key']=='goal'),None)
+    return {'manual_flag_review':review, 'primary': primary,
             'confirmed': [row for row in rows if row['status'] == 'confirmed'],
             'open': [row for row in rows if row['status'] != 'confirmed'],
             'exclusive': bool(primary and primary['exclusive']),
@@ -198,89 +205,9 @@ def _record_for(task_id, result_id):
 
 @diagnostics.committed_changes
 def process_report(db, task_id, report, registry):
-    """Attribute objectives only to locally validated original capture witnesses."""
-    state = objective_status(db, task_id)
-    if not state['primary']:
-        return state
-    rows = {item['key']: item for item in state['objectives']}
-    values = {item['value']: item for item in registry['confirmed'] + registry['candidates']}
-    patterns = flag_verify.flag_patterns(db, task_id)
-    from orchestrator import flag_evidence
-    witnesses, _ = flag_evidence.collect(db, task_id)
-    for claim in report.get('flags') or []:
-        if not isinstance(claim, dict) or claim.get('objective_key') not in rows:
-            continue
-        raw = str(claim.get('value') or '')
-        value = (flag_verify.canonical_flag_value(raw, patterns) or
-                 flag_verify.canonical_flag_value('flag: ' + raw, patterns))
-        item = values.get(value)
-        if not item:
-            continue
-        key = claim['objective_key']
-        result_id = str(claim.get('goal_evidence') or '')
-        record = _record_for(task_id, result_id) if result_id and not result_id.startswith('http_artifact:') else None
-        valid = any(value in text and not flag_evidence.value_in_request(proof,value)
-                    and flag_evidence.reference_matches(db, task_id, result_id, proof, record)
-                    for proof, text in witnesses)
-        stored = db.execute('SELECT sources_json FROM pm_verified_flags WHERE task_id=? AND value=?',
-                            (task_id, value)).fetchone()
-        if not stored:
-            continue
-        try:
-            sources = json.loads(stored[0])
-        except (ValueError, TypeError):
-            sources = {}
-        if not isinstance(sources, dict):
-            sources = {}
-        if not valid:
-            sources['goal_claim_unverified'] = 'заявлено как цель, но result_id не доказывает её'
-            item['goal_claim_unverified'] = sources['goal_claim_unverified']
-            status = 'confirmed' if item.get('operator_confirmed') or item.get('verified_evidence') else 'candidate'
-            db.execute('UPDATE pm_verified_flags SET status=?,sources_json=? WHERE task_id=? AND value=?',
-                       (status, json.dumps(sources, ensure_ascii=False), task_id, value))
-            if status == 'candidate' and item in registry['confirmed']:
-                registry['confirmed'].remove(item)
-                registry['candidates'].append(item)
-                item['status'] = 'candidate'
-            payload = (record or {}).get('result') or {}
-            if record and payload.get('status') in ('completed','ok') and rows[key]['status']=='open':
-                # A saved execution can establish an attempt, never completion.
-                db.execute("UPDATE pm_objectives SET status='attempted',updated_at=? WHERE task_id=? AND key=?",
-                           (flag_verify.now(),task_id,key))
-            if rows[key]['status']=='confirmed' and rows[key]['evidence_ref']==result_id:
-                # Preserve the evidence reference/history, but a withdrawn or
-                # corrupted witness cannot keep proving the objective.
-                db.execute("UPDATE pm_objectives SET status='attempted',updated_at=? WHERE task_id=? AND key=?",
-                           (flag_verify.now(),task_id,key))
-            continue
-        row = rows[key]
-        confirmed = valid
-        flag_status = 'confirmed' if confirmed or item.get('operator_confirmed') else 'candidate'
-        sources.pop('goal_claim_unverified', None)
-        item.pop('goal_claim_unverified', None)
-        db.execute('UPDATE pm_verified_flags SET status=?,objective_key=?,weight=?,sources_json=? '
-                   'WHERE task_id=? AND value=?',
-                   (flag_status, key, row['weight'],
-                    json.dumps(sources, ensure_ascii=False), task_id, value))
-        item['objective_key'], item['weight'] = key, row['weight']
-        if confirmed:
-            if item in registry['candidates']:
-                registry['candidates'].remove(item)
-                registry['confirmed'].append(item)
-                item['status'] = 'confirmed'
-            refs = row['evidence_refs']
-            if result_id not in refs:
-                refs.append(result_id)
-            db.execute("UPDATE pm_objectives SET status='confirmed',evidence_ref=?,"
-                       'evidence_refs_json=?,updated_at=? WHERE task_id=? AND key=?',
-                       (result_id, json.dumps(refs), flag_verify.now(), task_id, key))
-            row['evidence_refs'] = refs
-        elif row['status'] == 'open':
-            if item in registry['confirmed'] and flag_status == 'candidate':
-                registry['confirmed'].remove(item)
-                registry['candidates'].append(item)
-                item['status'] = 'candidate'
-            db.execute("UPDATE pm_objectives SET status='attempted',updated_at=? "
-                       'WHERE task_id=? AND key=?', (flag_verify.now(), task_id, key))
-    db.commit()
+    """Link proposals to goals. Only an operator decision completes a new goal."""
+    from orchestrator import flag_review
+    flag_review.activate(db,task_id)
+    with db:
+        flag_review.ingest_report(db,task_id,report)
     return objective_status(db, task_id)

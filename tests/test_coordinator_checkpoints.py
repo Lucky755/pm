@@ -92,6 +92,12 @@ class CheckpointTests(unittest.TestCase):
         with sqlite3.connect('file:'+str(self.case.database)+'?mode=ro',uri=True) as db:
             self.assertIsNone(task_runtime.pause(db,11))
         result,model=self.run_mode([decision('verify','repeat source capture with another result id'),decision('vuln','flag capture')])
+        self.assertEqual(result['status'],'waiting_operator');self.assertFalse(result['succeeded'])
+        from orchestrator import operator_questions
+        with self.case.connect() as db:
+            question=operator_questions.listing(db,11,pending=True)[0]
+            operator_questions.answer(db,11,question['id'],'approve','Accepted on the CTF platform')
+        result=c.run(11,expect_flags=1,model=Mock(side_effect=AssertionError('No extra model')))
         self.assertTrue(result['succeeded']);self.assertEqual(result['stop_reason'],'goal_confirmed')
         self.assertEqual(model.call_count,2);self.assertEqual([r[2] for r in self.case.calls],[1,2,3,4,5,6])
         self.assertEqual((a.REPORT_DIR/'task_11/recon-04.json').read_bytes(),original)

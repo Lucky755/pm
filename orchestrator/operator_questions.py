@@ -39,6 +39,10 @@ def listing(db,task_id,*,pending=False):
         item=dict(zip([col[0] for col in cursor.description],row))
         for field in ('boundaries','references','answer'):
             raw=item.pop(field+'_json');item[field]=json.loads(raw) if raw else None
+        if item['kind']=='flag_confirmation':
+            from orchestrator import flag_review
+            proposal=flag_review.for_question(db,task_id,item)
+            if proposal:item['flag_candidate']=proposal
         result.append(item)
     return result
 
@@ -47,21 +51,35 @@ def branch(decision):return decision.get('branch_id','task')
 
 
 def available(state):
-    pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending']
+    pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending' and q['kind']!='flag_confirmation']
+    if not pending:return state['known_resources']
     if any(q['branch_id']=='task' for q in pending):return []
     blocked={q['branch_id'] for q in pending}
     return [r for r in state['known_resources'] if r.startswith('service:') and r not in blocked]
 
 
 def blocked(decision,state):
-    pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending']
+    pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending' and q['kind']!='flag_confirmation']
     return bool(pending and (branch(decision)=='task' or any(
         q['branch_id']=='task' or q['branch_id']==branch(decision) for q in pending)))
 
 
-def request(db,task_id,target,decision,step_id):
+def request(db,task_id,target,decision,step_id,*,_flag_proposal=None):
     kind=decision['operator_question']['kind']
     if kind not in KINDS:raise ValueError('invalid_operator_question')
+    if kind=='flag_confirmation' and _flag_proposal is None:
+        from orchestrator import flag_review
+        flag_review.activate(db,task_id)
+        proposals=flag_review.listing(db,task_id)
+        selected=[p for p in proposals if 'flag_proposal:'+str(p['id']) in decision['references']]
+        if not selected:
+            value=flag_subject(db,task_id,decision['references'])
+            selected=[p for p in proposals if p['value']==value and p['status']=='pending']
+        if len(selected)!=1:raise ValueError('Flag confirmation needs one task-linked pending proposal')
+        question=flag_review.enqueue(db,selected[0]['id'],step_id)
+        if step_id is not None and question['step_id'] is None:
+            db.execute('UPDATE pm_operator_questions SET step_id=? WHERE id=?',(step_id,question['id']))
+        return next(q for q in listing(db,task_id) if q['id']==question['id'])
     content={'kind':kind,'branch_id':branch(decision),'question':decision['question'],
              'boundaries':decision['boundaries'],'references':decision['references']}
     fingerprint=hashlib.sha256(task_memory.encoded(content).encode()).hexdigest()
@@ -97,12 +115,12 @@ def answer(db,task_id,question_id,decision,text='',*,capability_log=None):
         item=next((q for q in listing(db,task_id) if q['id']==question_id),None)
         if not item or item['status']!='pending':raise ValueError('No matching pending question')
         payload={'decision':decision,'text':text,'permission_effect':'none; saved scope and budgets remain authoritative'}
-        if item['kind']=='flag_confirmation' and decision=='approve':
-            value=flag_subject(db,task_id,item['references'])
-            if value is None:raise ValueError('Flag question needs one existing flag reference')
-            from orchestrator import flag_verify
-            flag_verify.operator_confirm(task_id,value,text,db=db)
-            payload['flag_status_effect']='operator_confirmed; not new network evidence'
+        if item['kind']=='flag_confirmation':
+            from orchestrator import flag_review
+            proposal=flag_review.for_question(db,task_id,item)
+            if not proposal:raise ValueError('Flag question has no task-linked proposal; reconcile saved reports')
+            flag_review.decide(db,proposal,decision,text,question_id)
+            payload['flag_status_effect']='operator_confirmed' if decision=='approve' else 'operator_rejected'
         db.execute("UPDATE pm_operator_questions SET status='answered',answer_json=?,answered_at=? WHERE id=? AND status='pending'",
                    (task_memory.encoded(payload),now(),question_id))
         db.execute('INSERT INTO pm_operator_question_events(question_id,task_id,event,payload_json,created_at) '

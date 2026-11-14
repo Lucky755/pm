@@ -15,5 +15,6 @@ authentic evidence for the same flag must be evaluated independently.
 
 Validation coverage: tests/test_verify_saved_capture.py and
 tests/test_flag_evidence.py use real temporary capture storage and local
-validators. This path supports HTTP / loose Git objects, not automatic flag
-confirmation from SSH/shell output. Missing provenance needs operator review.
+validators. This technical audit supports HTTP / loose Git objects. It does
+not validate SSH/shell output as a capture. Platform confirmation is a
+separate operator decision and does not require this procedure or a new request.

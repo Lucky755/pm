@@ -19,6 +19,8 @@ class ObjectiveTests(unittest.TestCase):
         self.database = self.root / 'tasks.db'
         with self.db() as db:
             objectives.ensure_schema(db)
+            db.execute('CREATE TABLE tasks(id INTEGER PRIMARY KEY,target TEXT)')
+            db.execute("INSERT INTO tasks VALUES(1,'10.0.0.1')")
 
     def connect(self):
         return sqlite3.connect(self.database)
@@ -114,7 +116,7 @@ class ObjectiveTests(unittest.TestCase):
         with self.db() as db:
             result = objectives.process_report(db, 1, report, registry)
         self.assertEqual(result['primary']['status'], 'open')
-        self.assertEqual(registry['candidates'][0]['status'], 'candidate')
+        self.assertEqual(registry['confirmed'][0]['status'], 'confirmed')  # historical confirmation is not reassigned
 
     def test_07_one_network_source_marks_attempted(self):
         self.goals(count=0)
@@ -129,7 +131,7 @@ class ObjectiveTests(unittest.TestCase):
                              'goal_confirmed': True, 'goal_evidence': 'probe-1'}]}
         with patch.object(flag_verify, 'CAPABILITY_LOG', self.root), self.db() as db:
             result = objectives.process_report(db, 1, report, registry)
-        self.assertEqual(result['primary']['status'], 'attempted')
+        self.assertEqual(result['primary']['status'], 'open')
         self.assertEqual(registry['candidates'][0]['status'], 'candidate')
 
     def test_08_weighted_spec_preserves_slashes(self):

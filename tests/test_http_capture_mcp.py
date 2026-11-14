@@ -85,6 +85,12 @@ class CaptureMCPTests(unittest.TestCase):
         with d.run('registered capture',11):
             result=c.run(11,model=model,role_runner=role,expect_flags=1,max_steps=1)
             events=d.read_events()
+        self.assertFalse(result['succeeded']);self.assertEqual(result['stop_reason'],'operator_questions_pending')
+        from orchestrator import operator_questions
+        with self.case.connect() as db:
+            question=operator_questions.listing(db,11,pending=True)[0]
+            operator_questions.answer(db,11,question['id'],'approve','Offline CTF accepted')
+        result=c.run(11,expect_flags=1,model=Mock(side_effect=AssertionError('No extra model')))
         self.assertTrue(result['succeeded']);self.assertEqual(result['stop_reason'],'goal_confirmed')
         self.assertEqual(len(self.calls),1);self.assertEqual(model.call_count,1)
         self.assertEqual([r[0] for r in self.case.calls],['recon'])
@@ -113,7 +119,7 @@ class CaptureMCPTests(unittest.TestCase):
         self.assertEqual([r['provenance'] for r in records],['network','local'])
         with self.case.connect() as db:
             reg=flag_verify.scan(11,db=db)
-            self.assertEqual(len(reg['confirmed'][0]['verified_evidence']),1)
+            self.assertEqual(len(reg['candidates'][0]['verified_evidence']),1)
 
     def test_registered_git_capture_is_verified_from_binary_bytes(self):
         raw=b'blob '+str(len(self.body)).encode()+b'\0'+self.body
@@ -124,7 +130,7 @@ class CaptureMCPTests(unittest.TestCase):
         self.assertEqual(reply['decoded_artifact']['object_id'],oid)
         with self.case.connect() as db:
             reg=flag_verify.scan(11,db=db)
-        self.assertEqual(reg['confirmed'][0]['verified_evidence'][0]['object_id'],oid)
+        self.assertEqual(reg['candidates'][0]['verified_evidence'][0]['object_id'],oid)
         self.assertEqual(len(self.calls),1)
 
     def test_scope_and_unsafe_paths_are_refused_before_broker(self):
@@ -143,7 +149,7 @@ class CaptureMCPTests(unittest.TestCase):
         self.assertEqual(len(self.calls),1)
         genuine=self.call()
         with self.case.connect() as db:
-            proofs=flag_verify.scan(11,db=db)['confirmed'][0]['verified_evidence']
+            proofs=flag_verify.scan(11,db=db)['candidates'][0]['verified_evidence']
         self.assertEqual([p['capture_ref'] for p in proofs],[genuine['artifact_ref']])
 
     def test_http_request_budget_is_shared_with_discovery(self):

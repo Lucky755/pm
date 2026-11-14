@@ -176,6 +176,9 @@ def source_state(db,task_id,capability_log):
         put('constraints','operator_approval',{k:v for k,v in approval.items() if k not in ('approved_at',)})
     for goal in rows(db,'pm_objectives',task_id):put('goals','objective:'+goal['key'],goal)
     from orchestrator import operator_questions
+    from orchestrator import flag_review
+    for proposal in flag_review.listing(db,task_id):
+        put('goals','flag_proposal:'+str(proposal['id']),proposal)
     for question in operator_questions.listing(db,task_id):
         put('questions','operator_question:'+str(question['id']),question)
     for event in rows(db,'pm_operator_policy_events',task_id):
