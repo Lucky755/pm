@@ -19,10 +19,86 @@ def listing(db,task_id):
     cursor=db.execute('SELECT * FROM pm_pivot_routes WHERE task_id=? ORDER BY id',(task_id,))
     result=[]
     for row in cursor:
-        item=dict(zip([c[0] for c in cursor.description],row));item['receipt']=json.loads(item.pop('receipt_json'))
+        item=dict(zip([c[0] for c in cursor.description],row))
+        try:item['receipt']=json.loads(item.pop('receipt_json'))
+        except (ValueError,TypeError):item['receipt']=None
+        problem=receipt_problem(item)
+        if problem:item['diagnostic']=problem
         item['reachability']='unknown; last probe is historical'
         result.append(item)
     return result
+
+
+def receipt_problem(item):
+    """Validate saved identity without reconstructing missing historical data."""
+    receipt=item['receipt']
+    if not isinstance(receipt,dict) or not isinstance(receipt.get('manifest'),dict) or not isinstance(receipt.get('request_id'),str):
+        return {'reason_category':'pivot_receipt_incomplete',
+                'reason_summary':'Stored pivot receipt is incomplete; review original broker records. No reconstruction or replay.'}
+    manifest=receipt['manifest']
+    try:
+        spec=pivot_spec(manifest['spec'])
+        valid=(receipt['request_id']==tool_digest(manifest) and manifest['task_id']==item['task_id']
+            and spec['source_session']==item['source_session'] and spec['resource_ref']==item['resource_ref']
+            and isinstance(manifest['listener'],str) and isinstance(manifest['rights'],str)
+            and isinstance(manifest['actions'],list) and isinstance(manifest['source_ssh'],dict))
+    except (KeyError,ValueError,TypeError):valid=False
+    if not valid:
+        return {'reason_category':'pivot_receipt_incomplete',
+                'reason_summary':'Stored pivot identity cannot be verified; review original broker records. No reconstruction or replay.'}
+    return None
+
+
+def blocked(item):
+    return {**item,'status':'blocked',**item['diagnostic'],'execution_started':False}
+
+
+def merge_reply(item,reply,action):
+    """A short error is an outcome, never a replacement route identity."""
+    receipt=item['receipt']
+    status=reply.get('status') if isinstance(reply,dict) else None
+    matching=(isinstance(reply,dict) and reply.get('request_id')==receipt['request_id']
+              and reply.get('manifest')==receipt['manifest'])
+    state=reply.get('route_state') if status=='completed' else status
+    states={'prepared','approved','creating','active','established_unverified','closed','broken_source','unknown','failed'}
+    valid=matching and isinstance(state,str) and state in states
+    if state=='closed' and (type(reply.get('exit_code')) is not int or reply['exit_code']!=0 or reply.get('error')):valid=False
+    merged={**receipt,**reply} if valid else dict(receipt)
+    # A previous probe's route_state/exit code cannot complete a new operation.
+    for key in ('route_state','probe_performed','reason','reason_category','reason_summary','error','exit_code'):
+        merged.pop(key,None)
+    if valid:
+        merged.update(reply)
+        if status!='completed':merged.pop('route_state',None)
+    else:
+        mismatch=isinstance(reply,dict) and any(key in reply and reply[key]!=receipt[key] for key in ('request_id','manifest'))
+        category='pivot_receipt_mismatch' if mismatch else 'outcome_unknown' if status in ('unknown','timeout','error') else 'pivot_reply_incomplete'
+        state='unknown'
+        merged.update(status='unknown',reason_category=category,
+            reason_summary='Pivot '+action+' was not confirmed; original identity retained. Query status; no automatic replay.')
+    if state=='unknown' and not merged.get('reason_summary'):
+        merged.update(reason_category='outcome_unknown',
+            reason_summary='Pivot '+action+' outcome is unknown; retain its source and query status without replay.')
+    merged['last_operation']={'action':action,'outcome':state}
+    return merged,state
+
+
+def record_reply(db,item,reply,action,*,capability_log=None):
+    receipt,state=merge_reply(item,reply,action)
+    dependency='closed' if state=='closed' else 'broken_source' if state=='broken_source' else (
+        'active' if state in ('active','established_unverified') else 'unknown')
+    if capability_log is None:
+        from orchestrator.agent_actions import CAPABILITY_LOG
+        capability_log=CAPABILITY_LOG/f"task_{item['task_id']}.jsonl"
+    with task_memory.atomic(db):
+        db.execute('UPDATE pm_pivot_routes SET state=?,receipt_json=? WHERE task_id=? AND id=?',
+            (state,task_memory.encoded(receipt),item['task_id'],item['id']))
+        db.execute('INSERT INTO pm_session_dependencies VALUES(?,?,?,?) ON CONFLICT(task_id,session_id,dependent_ref) '
+            'DO UPDATE SET state=excluded.state',(item['task_id'],item['source_session'],'pivot:'+str(item['id']),dependency))
+        task_memory.sync(db,item['task_id'],capability_log,reason='pivot_'+action+'_result')
+    diagnostics.emit('pivot.state',task_id=item['task_id'],current_state=state,
+        identifiers={'route_id':item['id'],'request_id':receipt['request_id']},reason=receipt.get('reason_category'))
+    return next(r for r in listing(db,item['task_id']) if r['id']==item['id'])
 
 
 def call(task_id,action,*,spec=None,request_id=None):
@@ -33,6 +109,9 @@ def call(task_id,action,*,spec=None,request_id=None):
         try:
             result=subprocess.run(argv,capture_output=True,text=True,timeout=35,env={**os.environ,**diagnostics.child_env()})
             reply=json.loads(result.stdout)
+            if not isinstance(reply,dict):raise ValueError('Broker reply is not an object')
+            if result.returncode:
+                reply={'status':'unknown','reason_category':'outcome_unknown','error':'BrokerExitNonzero'}
         except (OSError,ValueError,subprocess.TimeoutExpired) as exc:
             reply={'status':'unknown','reason_category':'outcome_unknown','error':type(exc).__name__}
         event.status=reply.get('status','unknown');event.fields.update(diagnostics.failure_details(reply))
@@ -78,24 +157,30 @@ def answered(db,question,decision):
     return True
 
 
-def apply(db,task_id,route_id,*,authorize=False,execute=None,perform=True):
+def apply(db,task_id,route_id,*,authorize=False,execute=None,perform=True,capability_log=None):
     execute=execute or call
     item=next((r for r in listing(db,task_id) if r['id']==route_id),None)
     if not item:raise ValueError('Unknown task route')
+    if item.get('diagnostic'):return blocked(item)
     if item['state'] in ('pending','declined','closed','broken_source'):return item
     receipt=item['receipt'];rid=receipt['request_id']
     if authorize:
         authorized=execute(task_id,'authorize',request_id=rid)
-        if authorized.get('status')=='approved':receipt=authorized
+        receipt,state=merge_reply(item,authorized,'authorize')
+        if state!='approved':return record_reply(db,item,authorized,'authorize',capability_log=capability_log)
+        item={**item,'receipt':receipt,'state':'approved'}
     result=execute(task_id,'apply' if perform and item['state']=='approved' else 'status',request_id=rid)
-    merged={**receipt,**result}
-    if merged.get('request_id')!=rid or merged.get('manifest')!=receipt['manifest']:
-        merged={**receipt,'status':'unknown','reason_category':'outcome_unknown'}
-    state=merged.get('route_state',merged.get('status','unknown'))
-    if state=='prepared':state='approved'
-    with task_memory.atomic(db):
-        db.execute('UPDATE pm_pivot_routes SET state=?,receipt_json=? WHERE id=?',(state,task_memory.encoded(merged),route_id))
-        if state in ('active','established_unverified'):
-            db.execute('INSERT INTO pm_session_dependencies VALUES(?,?,?,?) ON CONFLICT(task_id,session_id,dependent_ref) '
-                'DO UPDATE SET state=excluded.state',(task_id,item['source_session'],'pivot:'+str(route_id),'active'))
-    return next(r for r in listing(db,task_id) if r['id']==route_id)
+    if isinstance(result,dict) and result.get('status')=='prepared':
+        # The DB approval is durable; applying an unauthorised root receipt did
+        # not execute a forward. Explicit operator authorization is still needed.
+        result={**result,'status':'approved'}
+    return record_reply(db,item,result,'apply' if perform and item['state']=='approved' else 'status',capability_log=capability_log)
+
+
+def close(db,task_id,route_id,*,capability_log=None):
+    item=next((r for r in listing(db,task_id) if r['id']==route_id),None)
+    if not item:raise ValueError('Unknown task route')
+    if item.get('diagnostic'):return blocked(item)
+    if item['state']=='closed':return item
+    reply=call(task_id,'close',request_id=item['receipt']['request_id'])
+    return record_reply(db,item,reply,'close',capability_log=capability_log)

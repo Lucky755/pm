@@ -1922,20 +1922,19 @@ def pm_pivot(task_id:int,route_id:int,action:str='status')->str:
     with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
         route=next((r for r in pivoting.listing(db,task_id) if r['id']==route_id),None)
         if not route:return tool_response({'status':'blocked','error':'Unknown task route'})
+        if route.get('diagnostic'):return tool_response(pivoting.blocked(route))
+        log=CAPABILITY_LOG/f'task_{task_id}.jsonl'
         if action=='probe' and route['state'] in ('active','established_unverified'):
             reply=json.loads(run_capability(['sudo','-n','/usr/local/sbin/pm-netguard','pivot','--task-id',str(task_id),
                 '--action','probe','--request-id',route['receipt']['request_id']],15,tool='pivot_probe',task_id=task_id))
-            if reply.get('request_id')==route['receipt']['request_id'] and reply.get('manifest')==route['receipt']['manifest']:
-                state=reply.get('route_state',reply.get('status','unknown'))
-                db.execute('UPDATE pm_pivot_routes SET state=?,receipt_json=? WHERE id=?',(state,json.dumps(reply),route_id))
-                task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='pivot_probe_result');db.commit()
-            return tool_response(reply)
+            saved=pivoting.record_reply(db,route,reply,'probe',capability_log=log)
+            db.commit()
+            return tool_response(saved['receipt'])
         if action=='close':
-            receipt=pivoting.call(task_id,'close',request_id=route['receipt']['request_id'])
-            db.execute('UPDATE pm_pivot_routes SET state=?,receipt_json=? WHERE id=?',(receipt.get('status','unknown'),json.dumps(receipt),route_id))
-            db.execute("UPDATE pm_session_dependencies SET state='closed' WHERE task_id=? AND dependent_ref=?",(task_id,'pivot:'+str(route_id)))
-            db.commit();payload=receipt
-        else:payload=pivoting.apply(db,task_id,route_id,perform=action=='apply')
+            payload=pivoting.close(db,task_id,route_id,capability_log=log)
+        else:payload=pivoting.apply(db,task_id,route_id,perform=action=='apply',capability_log=log)
+        payload={**payload,'status':payload.get('status',payload['state']),
+                 **{k:payload['receipt'][k] for k in ('reason_category','reason_summary') if k in payload['receipt']}}
     rid=log_capability('pivot_status',task_id,payload,0)
     return tool_response({**payload,'result_id':rid})
 

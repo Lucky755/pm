@@ -88,7 +88,7 @@ def save(db,task_id,sid,payload,*,resource='',username='',purpose='',retain=None
             (task_id,sid,state,task_memory.encoded(event_payload),now()))
         if state in ('closed','disconnected','unknown'):
             dependent_state='source_unknown' if state=='unknown' else 'broken_source'
-            db.execute('UPDATE pm_session_dependencies SET state=? WHERE task_id=? AND session_id=?',(dependent_state,task_id,sid))
+            db.execute("UPDATE pm_session_dependencies SET state=? WHERE task_id=? AND session_id=? AND state!='closed'",(dependent_state,task_id,sid))
             if task_memory.exists(db,'pm_pivot_routes'):
                 db.execute("UPDATE pm_pivot_routes SET state=? WHERE task_id=? AND source_session=? AND state NOT IN ('pending','declined','closed')",(dependent_state,task_id,sid))
     diagnostics.emit('session.state',task_id=task_id,current_state=state,
@@ -138,7 +138,14 @@ def role_scope(db,task_id,purpose,*,check_remote=True):
         try:
             for session in listing(db,task_id):
                 if session['owner']!=owner():continue
-                active_dependencies=any(d['state'] in ('active','source_unknown') for d in session['dependencies'])
+                active_dependencies=any(d['state'] in ('active','source_unknown','unknown') for d in session['dependencies'])
+                # Old interrupted closes may have falsely marked a dependency
+                # closed and lost its receipt. Never free that source on trust
+                # in the dependency row alone; viewing history stays read-only.
+                from orchestrator import pivoting
+                active_dependencies=active_dependencies or any(r['source_session']==session['session_id'] and
+                    (r.get('diagnostic') or r['state'] not in ('pending','declined','closed','broken_source'))
+                    for r in pivoting.listing(db,task_id))
                 action='release' if session['retain'] or active_dependencies else 'close'
                 result=call(task_id,action,session['session_id'])
                 if result.get('status') in ('released','closed'):

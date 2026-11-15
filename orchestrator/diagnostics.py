@@ -245,6 +245,9 @@ def failure_details(payload=None, exc=None):
     payload = payload if isinstance(payload, dict) else {}
     acquisition_reasons = {
         'session_busy':'Another live agent owns this terminal; input was not sent.',
+        'pivot_receipt_incomplete':'Stored pivot identity is incomplete; inspect original broker records. No automatic reconstruction or replay.',
+        'pivot_receipt_mismatch':'Broker reply belongs to another pivot identity; original receipt retained and outcome unknown.',
+        'pivot_reply_incomplete':'Broker did not confirm the pivot operation; retain its source and query status without replay.',
         'callback_address_invalid':'Callback address/interface is absent or does not follow the laboratory route; operator correction required.',
         'receiver_unavailable':'The callback receiver failed to bind or start.',
         'callback_budget_exhausted':'Callback variant budget exhausted; diagnose the route/listener before another attempt.',

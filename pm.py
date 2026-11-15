@@ -1362,12 +1362,17 @@ def render_tool_request(question):
 def render_pivot_request(question):
     route=question.get('pivot_request')
     if not route:return
+    if route.get('diagnostic'):
+        line(f"    Маршрут #{route['id']}: квитанция повреждена · {safe_display(route['diagnostic']['reason_category'])}")
+        line('    '+safe_display(route['diagnostic']['reason_summary']))
+        return
     manifest=route['receipt']['manifest'];spec=manifest['spec']
     line(f"    Маршрут #{route['id']}: сессия {safe_display(spec['source_session'])} → {safe_display(spec['destination'])}:{spec['port']}")
     line('    Назначение: '+safe_display(spec['purpose'])+' · состояние '+safe_display(route['state']))
     line('    Endpoint: '+safe_display(manifest['listener'])+' в namespace задачи; scope прежний')
     line('    Действия: '+safe_display(json.dumps(manifest['actions'],ensure_ascii=False)))
     line('    Права: '+safe_display(manifest['rights']))
+    if route['receipt'].get('reason_summary'):line('    Диагностика: '+safe_display(route['receipt']['reason_summary']))
     if route['receipt'].get('probe'):line('    Последняя проверка: '+safe_display(json.dumps(route['receipt']['probe'],ensure_ascii=False)))
 
 
