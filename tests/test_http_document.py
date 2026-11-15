@@ -75,8 +75,8 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(args[-1],'http://billing.lab:80/mbilling/')
         for option in ('--location','--data','--cookie','--request'):
             self.assertNotIn(option,args)
-        with self.assertRaises(ValueError):
-            broker.tool_args('http_document',TARGET,80,'','http','/x?token=secret')
+        query=broker.tool_args('http_document',TARGET,80,'','http','/x?token=secret#browser')
+        self.assertEqual(query[-1],f'http://{TARGET}:80/x?token=secret')
         normal = broker.tool_args('http_path',TARGET,80,'','http','/')
         self.assertEqual(normal[normal.index('--max-filesize')+1],'32768')
 

@@ -228,7 +228,7 @@ def has_service_map(task_id, iteration):
     db = agent_actions.connect()
     try:
         current = agent_actions.service_map(db, task_id, iteration)
-        return current['scan_mode'] == 'spot_check'
+        return current['scan_mode'] in ('spot_check','web_only')
     finally:
         db.close()
 

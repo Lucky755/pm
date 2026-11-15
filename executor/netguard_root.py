@@ -12,7 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, quote, urlsplit, urlencode
 import pwd
 import re
 import shutil
@@ -28,7 +28,7 @@ BASE = Path('/etc/pentest-master/netguard')
 STATE = Path('/run/pentest-master-netguard')
 PREV_FORWARD = STATE / 'ip_forward.previous'
 DOCS = tuple(ipaddress.ip_network(v) for v in
-             ('192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24'))
+             ('192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24','2001:db8::/32'))
 MAX_TASK = 200
 HTTP_CAPTURE_BODY_LIMIT = 2 * 1024 * 1024
 HTTP_CAPTURE_WIRE_LIMIT = HTTP_CAPTURE_BODY_LIMIT + 65536
@@ -103,18 +103,172 @@ def task_values(task):
                 subnet=f'10.253.{task}.0/30', hostip=f'10.253.{task}.1',
                 peerip=f'10.253.{task}.2',
                 table=f'pm_t{task}', nat=f'pm_nat{task}',
+                host6=f'fd7a:706d:{task:x}::1',peer6=f'fd7a:706d:{task:x}::2',
+                subnet6=f'fd7a:706d:{task:x}::/64',nat6=f'pm_nat6{task}',
                 config=BASE / f'task-{task}.json')
+
+
+def http_origin(scheme,host,port):return scheme+'://'+('['+host+']' if ':' in host else host)+':'+str(port)
+
+
+def resource_url(value):
+    """Lossless request components; fragments are retained only as browser data."""
+    if not isinstance(value,str) or not value or len(value)>8192 or any(ord(c)<=32 or ord(c)==127 for c in value) or '\\' in value:
+        raise ValueError('Invalid resource: whitespace, controls or excessive length')
+    original=value
+    try:
+        candidate=value[1:-1] if value.startswith('[') and value.endswith(']') and value.count('[')==value.count(']')==1 else value
+        ip=ipaddress.ip_address(candidate)
+        if '%' in value:raise ValueError('Scoped IPv6 zone identifiers are not supported')
+        return {'input':original,'kind':'address','host':str(ip),'address':str(ip)}
+    except ValueError:
+        if ':' in value and '://' not in value:raise ValueError('IPv6 address or explicit http(s) URL required')
+    if '://' not in value:
+        host=value.rstrip('.').encode('idna').decode('ascii').lower()
+        if '/' in value or '?' in value or '#' in value:raise ValueError('Use an explicit http(s) URL')
+        if not re.fullmatch(r'(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?',host) or any(not x or len(x)>63 or x.startswith('-') or x.endswith('-') for x in host.split('.')) or host.replace('.','').isdigit():
+            raise ValueError('Invalid domain')
+        return {'input':original,'kind':'domain','host':host}
+    parsed=urlsplit(value)
+    if parsed.scheme.lower() not in ('http','https') or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError('Only http(s) URLs without embedded credentials are supported')
+    host=parsed.hostname.encode('idna').decode('ascii').lower().rstrip('.')
+    try:host=str(ipaddress.ip_address(host))
+    except ValueError:host=resource_url(host)['host']
+    if '%' in host:raise ValueError('IPv6 zone identifiers are not supported')
+    port=parsed.port if parsed.port is not None else (443 if parsed.scheme.lower()=='https' else 80)
+    if not 1<=port<=65535:raise ValueError('Invalid resource port')
+    origin=http_origin(parsed.scheme.lower(),host,port)
+    request_path=safe_http_path((parsed.path or '/')+('?' + parsed.query if '?' in value.split('#',1)[0] else ''))
+    return {'input':original,'kind':'url','scheme':parsed.scheme.lower(),'host':host,'port':port,
+            'origin':origin,'path':request_path.split('?',1)[0],'query':parsed.query,'fragment':parsed.fragment,
+            'request_path':request_path,'request_url':origin+request_path}
+
+
+def validate_resource_policy(policy,allowed):
+    """Single policy contract shared with PM; the installed copy is root-owned."""
+    if not isinstance(policy,dict) or policy.get('version')!=1 or policy.get('area') not in ('web','host','lab'):
+        raise ValueError('Invalid resource policy')
+    if set(policy)!={'version','area','machine','addresses','host_addresses','origins','networks','denied','ssrf'}:
+        raise ValueError('Missing or unknown resource policy field')
+    addresses=policy.get('addresses',[])
+    if not addresses or len(addresses)>16 or any(check_target(a,allowed)!=a for a in addresses):raise ValueError('Invalid policy addresses')
+    if any(a not in addresses for a in policy['host_addresses']) or policy['area']=='web' and policy['host_addresses']:
+        raise ValueError('Invalid host investigation grants')
+    origins=policy.get('origins',[])
+    if policy['area']=='web' and not origins:raise ValueError('Web scope requires an origin')
+    if len(origins)>32:raise ValueError('Too many authorized origins')
+    for item in origins:
+        value=resource_url(item['origin'])
+        if value['kind']!='url' or value['request_path']!='/' or value['fragment'] or value['origin']!=item['origin']:
+            raise ValueError('Invalid origin grant')
+        if not item.get('addresses') or any(a not in addresses for a in item['addresses']):raise ValueError('Unpinned origin')
+        prefix=item.get('path_prefix','/')
+        if prefix!=safe_http_path(prefix) or '?' in prefix:raise ValueError('Invalid HTTP path boundary')
+        if item.get('purpose')=='page_dependency' and item.get('request_path')!=safe_http_path(item.get('request_path','')):
+            raise ValueError('Page dependency needs one exact request path')
+    networks=policy.get('networks',[])
+    if policy['area']!='lab' and networks:raise ValueError('Only lab scope grants networks')
+    for network in networks:
+        if str(ipaddress.ip_network(network)) not in allowed:raise ValueError('Lab network not in root scope')
+    if len(policy.get('ssrf',[]))>32 or len(policy.get('denied',[]))>64:raise ValueError('Too many policy restrictions')
+    for value in policy.get('denied',[]):
+        try:ipaddress.ip_network(value)
+        except ValueError:resource_url(value)
+    for grant in policy.get('ssrf',[]):
+        if grant.get('application') not in [x['origin'] for x in origins] or grant.get('context')!=policy.get('machine'):
+            raise ValueError('SSRF must name its authorized application and target machine context')
+        resource_url(grant['destination'])
+    return policy
+
+
+def resource_denied(policy,url):
+    for denied in policy.get('denied',[]):
+        try:
+            net=ipaddress.ip_network(denied,strict=False)
+            try:
+                if ipaddress.ip_address(url['host']) in net:return True
+            except ValueError:pass
+        except ValueError:
+            item=resource_url(denied)
+            if item['kind']=='domain' and item['host']==url['host']:return True
+            if item['kind']=='url' and item['origin']==url['origin'] and url['path'].startswith(item['path']):return True
+    return False
+
+
+def authorize_resource(policy,operation,target,*,scheme='http',hostname='',port=80,path='/',destination='',context=''):
+    """DNS/links never grant host scan authority. SSRF loopback is target-relative."""
+    if not policy:return
+    if operation in ('http','ssrf'):
+        host=hostname or target
+        if resource_denied(policy,{'host':target,'path':'/','origin':f'{scheme}://{target}:{port}'}):raise ValueError('Address explicitly excluded by room/task boundary')
+        value=resource_url(f'{scheme}://'+('['+host+']' if ':' in host else host)+f':{int(port)}{path}')
+        if resource_denied(policy,value):raise ValueError('Resource explicitly excluded by room/task boundary')
+        matching=[o for o in policy['origins'] if o['origin']==value['origin'] and target in o['addresses']
+                  and path_within(value['path'],o.get('path_prefix','/'))
+                  and (o.get('purpose')!='page_dependency' or operation=='http' and o['request_path']==value['request_path'])]
+        if policy['area']=='web' and not matching:raise ValueError('HTTP origin/address/path is outside web scope')
+        if policy['area']!='web' and target not in policy['addresses'] and not any(ipaddress.ip_address(target) in ipaddress.ip_network(n) for n in policy.get('networks',[])):
+            raise ValueError('HTTP destination outside task resources')
+        if hostname and hostname!=target and not matching:raise ValueError('Virtual host is not authorized for this address')
+        if not matching and any(o.get('path_prefix','/')!='/' for o in policy['origins']):raise ValueError('HTTP request does not match configured path boundaries')
+        if operation=='ssrf':
+            if context!=policy['machine']:raise ValueError('SSRF requires the target-machine context, not Kali')
+            inner=resource_url(destination)
+            if inner['kind']!='url' or resource_denied(policy,inner):raise ValueError('SSRF destination outside task boundaries')
+            exact=any(g['application']==value['origin'] and g['destination']==inner['request_url']
+                      and g['context']==context==policy['machine'] for g in policy.get('ssrf',[]))
+            lab=False
+            try:
+                addr=ipaddress.ip_address(inner['host'])
+                lab=policy['area']=='lab' and not addr.is_loopback and any(addr in ipaddress.ip_network(n) for n in policy.get('networks',[]))
+            except ValueError:pass
+            if not matching or not (exact or lab):raise ValueError('SSRF application/destination/route is not authorized')
+    elif policy['area']=='web':
+        raise ValueError('Web scope permits bounded HTTP tools, not host scans, shell or arbitrary PoC')
+    else:
+        address=ipaddress.ip_address(target)
+        if resource_denied(policy,{'host':target,'path':'/','origin':f'http://{target}:80'}):
+            raise ValueError('Address excluded by room/task boundary')
+        if target not in policy['host_addresses'] and not any(address in ipaddress.ip_network(n) for n in policy.get('networks',[])):
+            raise ValueError('Address outside task resources')
+        if operation in ('exec','poc_run','session'):
+            if (set(policy['addresses'])-set(policy['host_addresses']) or any(not _network_exclusion(d) for d in policy['denied'])
+                    or any(o.get('path_prefix','/')!='/' for o in policy['origins'])):
+                raise ValueError('Arbitrary execution cannot enforce origin-only grants/exclusions; use bounded HTTP tools')
+
+
+def _network_exclusion(value):
+    try:ipaddress.ip_network(value);return True
+    except ValueError:return False
+
+
+def path_within(path,prefix):return prefix=='/' or path==prefix.rstrip('/') or path.startswith(prefix.rstrip('/')+'/')
+
+
+def resource_filter_rules(v,allowed,egress,policy=None):
+    rules=filter_rules(v,allowed,egress)
+    if not policy:return rules
+    # Network exclusions also apply to arbitrary code, before every allow rule.
+    drops=[]
+    for value in policy['denied']:
+        if _network_exclusion(value):
+            net=ipaddress.ip_network(value)
+            drops.append(f'add rule inet {v["table"]} forward iifname "{v["host"]}" '+('ip' if net.version==4 else 'ip6')+f' daddr {net} counter drop')
+    marker=f'add rule inet {v["table"]} forward '
+    index=rules.index(marker)
+    return rules[:index]+('\n'.join(drops)+'\n' if drops else '')+rules[index:]
 
 
 def allow_networks(raw):
     if not raw or len(raw) > 16:
-        raise ValueError('Specify 1..16 allowed IPv4 networks')
+        raise ValueError('Specify 1..16 allowed IP networks')
     nets = []
     for value in raw:
         net = ipaddress.ip_network(value, strict=False)
-        if net.version != 4 or net.prefixlen < 8:
-            raise ValueError('IPv4 only; scope must be at least /8 specific')
-        if net.overlaps(ipaddress.ip_network('127.0.0.0/8')):
+        if net.prefixlen < (8 if net.version==4 else 32):
+            raise ValueError('Scope must be at least /8 (IPv4) or /32 (IPv6) specific')
+        if net.overlaps(ipaddress.ip_network('127.0.0.0/8')) or net.overlaps(ipaddress.ip_network('::1/128')):
             raise ValueError('Host loopback cannot be exposed inside a namespace')
         if any(net.overlaps(doc) for doc in DOCS):
             raise ValueError('Documentation addresses cannot be used for live execution')
@@ -134,6 +288,8 @@ def validate_egress(value):
 
 def filter_rules(v, allowed, egress):
     # Early filter hooks fail closed for traffic from this task's veth.
+    if any(ipaddress.ip_network(n).version==6 for n in allowed):
+        return dual_stack_rules(v,allowed,egress)
     scope = '{ ' + ', '.join(allowed) + ' }'
     permitted_forward = (f'iifname "{v["host"]}" ip saddr {v["peerip"]} '
                          f'ip daddr {scope} ')
@@ -163,9 +319,31 @@ add rule ip {v['nat']} postrouting ip saddr {v['peerip']} ip daddr {scope} masqu
 {research_nat}'''
 
 
+def dual_stack_rules(v,allowed,egress):
+    lines=[f'add table inet {v["table"]}',
+           f'add set inet {v["table"]} research_ips {{ type ipv4_addr; flags timeout; }}',
+           f'add chain inet {v["table"]} input {{ type filter hook input priority -150; policy accept; }}',
+           f'add rule inet {v["table"]} input iifname "{v["host"]}" icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert }} accept',
+           f'add rule inet {v["table"]} input iifname "{v["host"]}" counter drop',
+           f'add chain inet {v["table"]} forward {{ type filter hook forward priority -150; policy accept; }}']
+    interface=f'oifname "{egress}" ' if egress!='auto' else ''
+    for family,peer,nat,version in (('ip',v['peerip'],v['nat'],4),('ip6',v['peer6'],v['nat6'],6)):
+        scope=[n for n in allowed if ipaddress.ip_network(n).version==version]
+        if scope:lines.append(f'add rule inet {v["table"]} forward iifname "{v["host"]}" {family} saddr {peer} {family} daddr {{ '+', '.join(scope)+f' }} {interface}accept')
+        lines += [f'add table {family} {nat}',f'add chain {family} {nat} postrouting {{ type nat hook postrouting priority 100; policy accept; }}']
+        if scope:lines.append(f'add rule {family} {nat} postrouting {family} saddr {peer} {family} daddr {{ '+', '.join(scope)+' } masquerade')
+    lines += [f'add rule inet {v["table"]} forward ip saddr {v["peerip"]} ip daddr @research_ips tcp dport {RESEARCH_PORT} accept',
+              f'add rule inet {v["table"]} forward iifname "{v["host"]}" counter drop',
+              f'add rule inet {v["table"]} forward oifname "{v["host"]}" ct state established,related accept',
+              f'add rule inet {v["table"]} forward oifname "{v["host"]}" counter drop']
+    if egress!='auto':lines.append(f'add rule ip {v["nat"]} postrouting ip saddr {v["peerip"]} oifname "{egress}" masquerade')
+    return '\n'.join(lines)+'\n'
+
+
 # Docker's iptables-nft FORWARD chain may DROP traffic even after the
 # earlier nftables NetGuard allow verdict. Bridge that single, scoped flow.
 IPTABLES = '/usr/sbin/iptables'
+IP6TABLES = '/usr/sbin/ip6tables'
 HOSTS_BASE = Path('/etc/netns')
 
 
@@ -176,40 +354,50 @@ def docker_forward_rules(v, config, egress=None):
         raise ValueError('Docker forward integration needs explicit --egress, e.g. tun0')
     # No broad source/destination matches. The nftables early hook remains
     # the independent enforcement point for the entire root-owned task scope.
-    if len(allowed) != 1 or not ipaddress.ip_network(allowed[0]).prefixlen == 32:
+    if not config.get('resource_policy') and (len(allowed) != 1 or not ipaddress.ip_network(allowed[0]).prefixlen == 32):
         raise ValueError('Docker forwarding currently requires one exact /32 target')
-    destination = allowed[0]
-    forward = ['-i', v['host'], '-o', egress,
-               '-s', v['peerip'] + '/32', '-d', destination, '-j', 'ACCEPT']
-    reverse = ['-i', egress, '-o', v['host'],
-               '-s', destination, '-d', v['peerip'] + '/32',
-               '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT']
-    return [forward, reverse]
+    result=[]
+    for destination in allowed:
+        version=ipaddress.ip_network(destination).version
+        if version not in config.get('docker_families',[4,6]):continue
+        peer=(v['peerip']+'/32') if version==4 else (v['peer6']+'/128')
+        result += [['-i',v['host'],'-o',egress,'-s',peer,'-d',destination,'-j','ACCEPT'],
+                   ['-i',egress,'-o',v['host'],'-s',destination,'-d',peer,'-m','conntrack','--ctstate','ESTABLISHED,RELATED','-j','ACCEPT']]
+    return result
 
 
-def docker_chain_exists():
-    return cmd(IPTABLES, '-w', '5', '-S', 'DOCKER-USER', check=False).returncode == 0
+def docker_chain_exists(binary=IPTABLES):
+    return cmd(binary, '-w', '5', '-S', 'DOCKER-USER', check=False).returncode == 0
 
 
-def docker_policy_drops_forward():
-    result = cmd(IPTABLES, '-w', '5', '-S', 'FORWARD')
+def docker_policy_drops_forward(version=4):
+    result = cmd(IPTABLES if version==4 else IP6TABLES, '-w', '5', '-S', 'FORWARD')
     return any(line.strip() == '-P FORWARD DROP' for line in result.stdout.splitlines())
 
 
 def docker_rule_exists(rule):
-    return cmd(IPTABLES, '-w', '5', '-C', 'DOCKER-USER', *rule, check=False).returncode == 0
+    return cmd(docker_rule_binary(rule), '-w', '5', '-C', 'DOCKER-USER', *rule, check=False).returncode == 0
+
+
+def docker_rule_binary(rule):return IP6TABLES if ':' in rule[rule.index('-s')+1] else IPTABLES
+
+
+def task_docker_families(config):
+    versions=sorted({ipaddress.ip_network(n).version for n in config['allowed']})
+    return [version for version in versions if (docker_policy_drops_forward() if version==4 else docker_policy_drops_forward(6))]
 
 
 def remove_docker_rules(rules):
     # Ignore already-absent rules, but never silently ignore a failed delete.
     for rule in reversed(rules):
         if docker_rule_exists(rule):
-            cmd(IPTABLES, '-w', '5', '-D', 'DOCKER-USER', *rule)
+            cmd(docker_rule_binary(rule), '-w', '5', '-D', 'DOCKER-USER', *rule)
 
 
 def add_docker_rules(rules, adopt_existing=False):
-    if not docker_chain_exists():
-        raise RuntimeError('DOCKER-USER chain unavailable; refusing FORWARD DROP bypass')
+    for binary in {docker_rule_binary(r) for r in rules}:
+        if not (docker_chain_exists() if binary==IPTABLES else docker_chain_exists(binary)):
+            raise RuntimeError('DOCKER-USER chain unavailable; refusing FORWARD DROP bypass')
     inserted = []
     try:
         for index, rule in enumerate(rules, start=1):
@@ -217,7 +405,7 @@ def add_docker_rules(rules, adopt_existing=False):
                 if not adopt_existing:
                     raise ValueError('Matching DOCKER-USER rule already exists; use sync-forward to adopt explicitly')
             else:
-                cmd(IPTABLES, '-w', '5', '-I', 'DOCKER-USER', str(index), *rule)
+                cmd(docker_rule_binary(rule), '-w', '5', '-I', 'DOCKER-USER', str(index), *rule)
                 inserted.append(rule)
     except BaseException:
         remove_docker_rules(inserted)
@@ -229,8 +417,10 @@ def sync_forward(task):
     """Explicitly adopt existing scoped manual Docker rules (or insert them)."""
     ensure_root()
     v, config = owned_config(task)
-    if not docker_policy_drops_forward():
+    families=task_docker_families(config)
+    if not families:
         raise ValueError('FORWARD is not DROP; Docker bridge not required')
+    config=dict(config,docker_families=families)
     rules = docker_forward_rules(v, config)
     added = add_docker_rules(rules, adopt_existing=True)
     try:
@@ -277,9 +467,16 @@ def set_hostnames(task, hostnames):
     if sudo_uid is not None and int(sudo_uid) != config['uid']:
         raise ValueError('Invoker is not task owner')
     names = validate_hostnames(hostnames)
-    if len(config['allowed']) != 1 or not config['allowed'][0].endswith('/32'):
-        raise ValueError('Hostnames require an exact /32 scope')
-    destination = str(ipaddress.ip_network(config['allowed'][0]).network_address)
+    policy=config.get('resource_policy')
+    if policy:
+        mapping={name:list(dict.fromkeys(a for o in policy['origins'] if resource_url(o['origin'])['host']==name for a in o['addresses'])) for name in names}
+        if any(not values for values in mapping.values()):raise ValueError('Hostname not in approved resource policy')
+        destination=policy['addresses'][0]
+    else:
+        if len(config['allowed']) != 1 or ipaddress.ip_network(config['allowed'][0]).num_addresses!=1:
+            raise ValueError('Hostnames require one exact address scope')
+        destination = str(ipaddress.ip_network(config['allowed'][0]).network_address)
+        mapping={name:[destination] for name in names}
     if not HOSTS_BASE.exists():
         HOSTS_BASE.mkdir(mode=0o755)
     if (HOSTS_BASE.is_symlink() or HOSTS_BASE.stat().st_uid != 0 or
@@ -302,8 +499,7 @@ def set_hostnames(task, hostnames):
                 'hostnames': names, 'destination': destination})
         return
     previous = path.read_text() if path.exists() else None
-    content = ('127.0.0.1 localhost\n::1 localhost\n' + destination + ' ' +
-               ' '.join(names) + '\n')
+    content='127.0.0.1 localhost\n::1 localhost\n'+''.join(address+' '+name+'\n' for name in names for address in mapping[name])
     temporary = directory / '.hosts.tmp'
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
@@ -386,10 +582,25 @@ def sysctl_forward(enable):
         PREV_FORWARD.unlink()
 
 
-def setup(task, owner, allowed, egress):
+def sysctl_forward6(enable):
+    path=Path('/proc/sys/net/ipv6/conf/all/forwarding')
+    previous=STATE/'ip6_forward.previous'
+    if enable:
+        STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+        if not previous.exists():
+            previous.write_text(path.read_text().strip());previous.chmod(0o600)
+        path.write_text('1\n')
+    elif previous.exists() and not list(BASE.glob('task-*.json')):
+        prior=previous.read_text().strip()
+        if prior not in ('0','1'):raise ValueError('Invalid saved IPv6 forwarding state')
+        path.write_text(prior+'\n');previous.unlink()
+
+
+def setup(task, owner, allowed, egress, resource_policy=None):
     ensure_root()
     v = task_values(task)
     networks = allow_networks(allowed)
+    policy=validate_resource_policy(resource_policy,networks) if resource_policy is not None else None
     egress = validate_egress(egress)
     account = pwd.getpwnam(owner)
     if account.pw_uid == 0:
@@ -416,7 +627,7 @@ def setup(task, owner, allowed, egress):
             continue
         if existing.version == 4 and existing.overlaps(new_subnet):
             raise ValueError(f'Veth subnet overlaps existing Kali route: {destination}')
-    rules = filter_rules(v, networks, egress)
+    rules = resource_filter_rules(v, networks, egress,policy)
     cmd('/usr/sbin/nft', '-c', '-f', '-', input=rules)
     created = False
     docker_added = []
@@ -431,15 +642,23 @@ def setup(task, owner, allowed, egress):
         cmd('/usr/sbin/ip', 'netns', 'exec', v['name'], '/usr/sbin/ip', 'address', 'add', v['peerip'] + '/30', 'dev', 'eth0')
         cmd('/usr/sbin/ip', 'netns', 'exec', v['name'], '/usr/sbin/ip', 'link', 'set', 'eth0', 'up')
         cmd('/usr/sbin/ip', 'netns', 'exec', v['name'], '/usr/sbin/ip', 'route', 'add', 'default', 'via', v['hostip'])
+        if any(ipaddress.ip_network(n).version==6 for n in networks):
+            cmd('/usr/sbin/ip','-6','address','add',v['host6']+'/64','dev',v['host'],'nodad')
+            cmd('/usr/sbin/ip','netns','exec',v['name'],'/usr/sbin/ip','-6','address','add',v['peer6']+'/64','dev','eth0','nodad')
+            cmd('/usr/sbin/ip','netns','exec',v['name'],'/usr/sbin/ip','-6','route','add','default','via',v['host6'])
+            sysctl_forward6(True)
         sysctl_forward(True)
         config_data = {'task_id': task, 'name': v['name'], 'uid': account.pw_uid,
                        'gid': account.pw_gid, 'owner': owner, 'allowed': networks,
                        'egress': egress, 'approved_egress': egress,
                        'current_egress': egress,
                        'host_ip': v['hostip'], 'peer_ip': v['peerip']}
+        if policy is not None:config_data['resource_policy']=policy
         # Docker's FORWARD DROP otherwise silently makes an authorized scan
         # return zero observations. Refuse unhandled DROP, never weaken it.
-        if docker_policy_drops_forward():
+        families=task_docker_families(config_data)
+        if families:
+            config_data['docker_families']=families
             docker_rules = docker_forward_rules(v, config_data)
             docker_added = add_docker_rules(docker_rules)
             docker_managed = True
@@ -451,11 +670,13 @@ def setup(task, owner, allowed, egress):
             remove_docker_rules(docker_added)
         cmd('/usr/sbin/nft', 'delete', 'table', 'inet', v['table'], check=False)
         cmd('/usr/sbin/nft', 'delete', 'table', 'ip', v['nat'], check=False)
+        cmd('/usr/sbin/nft','delete','table','ip6',v['nat6'],check=False)
         if created:
             cmd('/usr/sbin/ip', 'netns', 'delete', v['name'], check=False)
         if v['config'].exists():
             v['config'].unlink()
         sysctl_forward(False)
+        sysctl_forward6(False)
         raise
     output({'status': 'configured', 'task_id': task, 'name': v['name'],
             'allowed': networks, 'egress': egress, 'host_veth_ip': v['hostip']})
@@ -489,9 +710,11 @@ def teardown(task):
         remove_docker_rules(docker_forward_rules(v, config))
     cmd('/usr/sbin/nft', 'delete', 'table', 'inet', v['table'], check=False)
     cmd('/usr/sbin/nft', 'delete', 'table', 'ip', v['nat'], check=False)
+    cmd('/usr/sbin/nft','delete','table','ip6',v['nat6'],check=False)
     # Sessions and the persistent workspace belong to the task lifetime.
     session_cleanup(task)
     v['config'].unlink()
+    sysctl_forward6(False)
     if config.get('hosts_managed'):
         hosts_path = namespace_hosts_path(v)
         if hosts_path.is_file() and not hosts_path.is_symlink():
@@ -506,8 +729,8 @@ def teardown(task):
 
 def check_target(target, allowed):
     ip = ipaddress.ip_address(target)
-    if ip.version != 4 or ip.is_loopback or ip.is_multicast or ip.is_unspecified:
-        raise ValueError('Only concrete non-loopback IPv4 targets permitted')
+    if ip.is_loopback or ip.is_multicast or ip.is_unspecified or '%' in target:
+        raise ValueError('Only concrete non-loopback IP targets permitted')
     if any(ip in doc for doc in DOCS):
         raise ValueError('Documentation targets cannot be scanned')
     if not any(ip in ipaddress.ip_network(net) for net in allowed):
@@ -516,18 +739,23 @@ def check_target(target, allowed):
 
 
 def safe_http_path(path):
-    """Strict read-only relative-to-origin URL path. No query, fragment or dot traversal."""
-    if not isinstance(path, str) or not 1 <= len(path) <= 180 or not path.startswith('/'):
-        raise ValueError('Expected an absolute HTTP path up to 180 bytes')
-    if not re.fullmatch(r"/[A-Za-z0-9._~!$&'()+,;=:@%/\-]*", path):
-        raise ValueError('Unsafe HTTP path characters (queries are not supported)')
-    decoded = path
+    """Bounded request target: preserve query exactly, discard browser fragment."""
+    if not isinstance(path,str) or not 1<=len(path)<=8192 or not path.startswith('/') or path.startswith('//'):
+        raise ValueError('Expected an absolute HTTP request path up to 8192 characters')
+    path=quote(path.split('#',1)[0],safe="/._~!$&'()*+,;=:@%/?[]-")
+    if len(path)>8192:raise ValueError('Encoded HTTP request target is too long')
+    if not re.fullmatch(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/?\[\]\-]*",path):
+        raise ValueError('Unsafe HTTP request characters')
+    decoded = path.split('?',1)[0]
     for _ in range(3):
         decoded = unquote(decoded)
         if ('\\' in decoded or '//' in decoded or
                 any(part == '..' for part in decoded.split('/')) or
                 any(ord(char) < 32 or ord(char) == 127 for char in decoded)):
             raise ValueError('Unsafe HTTP path or encoded traversal')
+    query=path.partition('?')[2]
+    for _ in range(3):query=unquote(query)
+    if any(ord(c)<32 or ord(c)==127 for c in query) or '\\' in query:raise ValueError('Unsafe HTTP query')
     if '%' in decoded and re.search(r'%(?:2e|2f|5c|0[0-9a-f]|7f)', decoded, flags=re.I):
         raise ValueError('Encoded traversal or control denied')
     return path
@@ -735,6 +963,8 @@ def poc_argv(poc_file, interp, uid, gid, workdir):
 
 
 def tool_args(profile, target, port, ports, scheme, path="/", hostname="", capture_limit=HTTP_CAPTURE_BODY_LIMIT):
+    ipv6=ipaddress.ip_address(target).version==6
+    nmap6=['-6'] if ipv6 else []
     def valid_port(raw):
         if not re.fullmatch(r'[0-9]{1,5}', str(raw)) or not 1 <= int(raw) <= 65535:
             raise ValueError('Invalid TCP port')
@@ -751,15 +981,15 @@ def tool_args(profile, target, port, ports, scheme, path="/", hostname="", captu
         # Operator-initiated one-off full TCP connect discovery (no exploits,
         # no UDP, no NSE scripts, no credential attacks). Exact target is still
         # enforced by the root-owned per-task /32 firewall and owner checks.
-        return ['/usr/bin/nmap', '-sT', '-Pn', '-n', '--min-rate', '1000',
+        return ['/usr/bin/nmap', *nmap6, '-sT', '-Pn', '-n', '--min-rate', '1000',
                 '--open', '--max-retries', '1', '--host-timeout', '240s',
                 '-p-', target]
     if profile in ('tcp_ports', 'service_versions'):
         selected = valid_ports(ports)
         if profile == 'tcp_ports':
-            return ['/usr/bin/nmap', '-sT', '-Pn', '-n', '--open', '--max-retries', '1',
+            return ['/usr/bin/nmap', *nmap6, '-sT', '-Pn', '-n', '--open', '--max-retries', '1',
                     '--host-timeout', '25s', '-p', selected, target]
-        return ['/usr/bin/nmap', '-sT', '-sV', '--version-light', '-Pn', '-n', '--open',
+        return ['/usr/bin/nmap', *nmap6, '-sT', '-sV', '--version-light', '-Pn', '-n', '--open',
                 '--max-retries', '1', '--host-timeout', '30s', '-p', selected, target]
     if profile not in ('http_headers', 'http_get', 'https_headers', 'http_path', 'http_document', 'http_capture'):
         raise ValueError('Unknown profile')
@@ -768,7 +998,7 @@ def tool_args(profile, target, port, ports, scheme, path="/", hostname="", captu
     if profile == 'https_headers': scheme = 'https'
     if scheme not in ('http', 'https'):
         raise ValueError('Invalid HTTP scheme')
-    result = ['/usr/bin/curl', '--silent', '--show-error', '--noproxy', '*',
+    result = ['/usr/bin/curl', '--globoff','--path-as-is','--silent', '--show-error', '--noproxy', '*',
               '--proto', '=http,https', '--max-redirs', '0', '--connect-timeout', '3',
               '--max-time', '12']
     if profile in ('http_headers', 'https_headers'):
@@ -779,17 +1009,17 @@ def tool_args(profile, target, port, ports, scheme, path="/", hostname="", captu
         limit = capture_limit if profile == 'http_capture' else 262144 if profile == 'http_document' else 32768
         result += ['--include', '--max-filesize', str(limit)]
     if profile in ('http_path', 'http_document', 'http_capture'):
-        safe_http_path(path)
+        path=safe_http_path(path)
         if hostname:
             if hostname == target:
                 hostname = ''
             elif not re.fullmatch(r'[a-z0-9.-]{1,253}', hostname):
                 raise ValueError('Invalid HTTP host')
         if hostname:
-            result += ['--resolve', f'{hostname}:{selected}:{target}']
-        authority = hostname or target
+            result += ['--resolve', f'{hostname}:{selected}:'+('['+target+']' if ipv6 else target)]
+        authority = hostname or ('['+target+']' if ipv6 else target)
         return result + ['--', f'{scheme}://{authority}:{selected}{path}']
-    return result + ['--', f'{scheme}://{target}:{selected}/']
+    return result + ['--', f'{scheme}://'+('['+target+']' if ipv6 else target)+f':{selected}/']
 
 
 def isolated_command(name, user, uid, gid, args, extra=(), workdir=None,
@@ -893,7 +1123,7 @@ def route_egress_interface(ip):
     the lab scope. Research lookups follow the host's own default route, so the
     masquerade rule must target whatever device that route selects.
     """
-    p = cmd('/usr/sbin/ip', '-4', 'route', 'get', ip, check=False)
+    p = cmd('/usr/sbin/ip', '-6' if ipaddress.ip_address(ip).version==6 else '-4', 'route', 'get', ip, check=False)
     if p.returncode:
         raise RuntimeError(f'No route to {ip}: {p.stderr[-300:]}')
     words = p.stdout.split()
@@ -919,32 +1149,35 @@ def ensure_target_egress(v, config, target):
         if actual == current:
             return config
         allowed = config['allowed']
-        if len(allowed) != 1 or ipaddress.ip_network(allowed[0]).prefixlen != 32:
-            raise EgressError('Automatic egress repair requires one exact /32 target')
+        if len(allowed) != 1 or ipaddress.ip_network(allowed[0]).num_addresses != 1:
+            raise EgressError('Automatic egress repair requires one exact address')
+        family='ip6' if ipaddress.ip_address(target).version==6 else 'ip'
+        peer=v['peer6'] if family=='ip6' else v['peerip']
+        nat_table=v['nat6'] if family=='ip6' else v['nat']
         old = current
         chain = cmd('/usr/sbin/nft', '-a', 'list', 'chain', 'inet', v['table'], 'forward').stdout
         old_rule = next((line for line in chain.splitlines()
                          if f'iifname "{v["host"]}"' in line
                          and f'oifname "{old}"' in line
-                         and 'ip daddr' in line and 'accept' in line), None)
+                         and family+' daddr' in line and 'accept' in line), None)
         handle = re.search(r'# handle (\d+)', old_rule or '')
         if not handle:
             raise EgressError('Scoped forwarding rule is missing; refusing repair')
         destination = allowed[0]
         new_docker = []
-        if docker_policy_drops_forward():
+        if task_docker_families(config):
             if not config.get('docker_forward_managed'):
                 raise EgressError('Docker forwarding is not managed for this task')
             new_docker = add_docker_rules(docker_forward_rules(v, config, actual),
                                           adopt_existing=True)
         try:
             cmd('/usr/sbin/nft', 'replace', 'rule', 'inet', v['table'], 'forward',
-                'handle', handle.group(1), 'iifname', v['host'], 'ip', 'saddr',
-                v['peerip'], 'ip', 'daddr', destination, 'oifname', actual, 'accept')
-            nat = cmd('/usr/sbin/nft', 'list', 'table', 'ip', v['nat']).stdout
+                'handle', handle.group(1), 'iifname', v['host'], family, 'saddr',
+                peer, family, 'daddr', destination, 'oifname', actual, 'accept')
+            nat = cmd('/usr/sbin/nft', 'list', 'table', family, nat_table).stdout
             if f'oifname "{actual}" masquerade' not in nat:
-                cmd('/usr/sbin/nft', 'add', 'rule', 'ip', v['nat'], 'postrouting',
-                    'ip', 'saddr', v['peerip'], 'ip', 'daddr', destination,
+                cmd('/usr/sbin/nft', 'add', 'rule', family, nat_table, 'postrouting',
+                    family, 'saddr', peer, family, 'daddr', destination,
                     'oifname', actual, 'masquerade')
             updated = dict(config, approved_egress=config.get('approved_egress',
                                                               config['egress']),
@@ -953,7 +1186,7 @@ def ensure_target_egress(v, config, target):
         except BaseException:
             remove_docker_rules(new_docker)
             raise
-        if docker_policy_drops_forward():
+        if task_docker_families(config):
             remove_docker_rules(docker_forward_rules(v, config, old))
         return updated
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
@@ -1045,12 +1278,24 @@ def ensure_research_egress(v, ip, config=None):
 
 def run(task, profile, target, port, ports, scheme, path="/", hostname="",
         capture_limit=HTTP_CAPTURE_BODY_LIMIT, argv=None, poc_file=None,
-        poc_interp='bash', research_host='', timeout=None):
+        poc_interp='bash', research_host='', timeout=None,ssrf_destination='',ssrf_context='',ssrf_parameter='url'):
     ensure_root()
     v, config = owned_config(task)
     sudo_uid = os.environ.get('SUDO_UID')
     if sudo_uid is not None and int(sudo_uid) != config['uid']:
         raise ValueError('Invoker is not the configured task owner')
+    policy=config.get('resource_policy')
+    if profile.startswith(('http','https')):path=safe_http_path(path)
+    if profile!='research':
+        operation='ssrf' if ssrf_destination else 'http' if profile.startswith(('http','https')) else profile
+        authorize_resource(policy,operation,target,scheme=scheme,hostname=hostname,port=port,path=path,
+                           destination=ssrf_destination,context=ssrf_context)
+        if ssrf_destination:
+            if profile!='http_capture' or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,63}',ssrf_parameter):raise ValueError('Unsupported SSRF request')
+            from urllib.parse import parse_qsl
+            if any(key==ssrf_parameter for key,_ in parse_qsl(urlsplit(path).query)):raise ValueError('Ambiguous duplicate SSRF parameter')
+            if not policy:raise ValueError('SSRF requires explicit resource policy')
+            path=safe_http_path(path)+('&' if '?' in path else '?')+urlencode({ssrf_parameter:resource_url(ssrf_destination)['request_url']})
     if isinstance(timeout, str) and timeout.isdigit():
         timeout = int(timeout)
     extra = ()
@@ -1099,7 +1344,7 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
         if profile in ('http_path', 'http_document', 'http_capture'):
             # Domain mapping is strictly per-task and points to the same /32 target.
             approved_hosts = config.get('hostnames', [])
-            if hostname and hostname != target and hostname not in approved_hosts:
+            if not policy and hostname and hostname != target and hostname not in approved_hosts:
                 raise ValueError('Hostname not approved for this NetGuard task')
         args = tool_args(profile, target, port, ports, scheme, path, hostname, capture_limit)
         run_timeout = 250 if profile == 'tcp_full' else 48
@@ -1108,11 +1353,12 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
         config = ensure_target_egress(v, config, target)
         verify_target_egress(config, target)
     # Require firewall tables still present, otherwise fail closed.
-    if docker_policy_drops_forward():
+    families=task_docker_families(config)
+    if families:
         if not config.get('docker_forward_managed'):
             raise EgressError('Docker FORWARD DROP requires sync-forward --task-id N')
         rules = docker_forward_rules(v, config)
-        if not docker_chain_exists() or not all(docker_rule_exists(rule) for rule in rules):
+        if not all(docker_rule_exists(rule) for rule in rules) or set(families)-set(config.get('docker_families',[4])):
             raise EgressError('Task-specific Docker forwarding rules missing; refusing run')
     cmd('/usr/sbin/nft', 'list', 'table', 'inet', v['table'])
     cmd('/usr/sbin/nft', 'list', 'table', 'ip', v['nat'])
@@ -1349,6 +1595,7 @@ def callback_listen(task, port, bind, timeout):
 def callback_open(task, port, bind, timeout):
     ensure_root()
     v, config = owned_config(task)
+    if config.get('resource_policy',{}).get('area')=='web':raise ValueError('Web scope does not authorize a host callback listener')
     port = callback_port(port)
     if bind:
         addr = ipaddress.ip_address(bind)
@@ -1521,6 +1768,8 @@ def session_open(task, argv, idle):
     """Start a long-lived interactive session inside the task namespace."""
     ensure_root()
     v, config = owned_config(task)
+    policy=config.get('resource_policy')
+    if policy:authorize_resource(policy,'session',policy['addresses'][0])
     if not config['allowed']:
         raise ValueError('Task has no allowed scope')
     directory = session_dir(task)
@@ -1891,6 +2140,7 @@ def main():
     s.add_argument('--owner', required=True)
     s.add_argument('--allow', action='append', required=True)
     s.add_argument('--egress', default='auto')
+    s.add_argument('--resource-policy',help='Explicit operator-configured JSON resource grants')
     t = sub.add_parser('teardown')
     t.add_argument('--task-id', type=int, required=True)
     wi = sub.add_parser('workdir')
@@ -1904,6 +2154,9 @@ def main():
     r.add_argument('--scheme', default='http')
     r.add_argument('--path', default='/')
     r.add_argument('--hostname', default='')
+    r.add_argument('--ssrf-destination',default='')
+    r.add_argument('--ssrf-context',default='')
+    r.add_argument('--ssrf-parameter',default='url')
     r.add_argument('--capture-limit',type=int,choices=HTTP_CAPTURE_LIMITS,default=HTTP_CAPTURE_BODY_LIMIT)
     r.add_argument('--argv', action='append', default=None)
     r.add_argument('--poc-file', default='')
@@ -1939,7 +2192,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == 'capabilities':
-            output({'capture_protocol': 1,
+            output({'capture_protocol': 1,'resource_policy_protocol':1,'ipv6':True,
                     'profiles': ['http_capture', 'exec', 'poc_run', 'research', 'session'],
                     'research_domains': list(RESEARCH_DOMAINS),
                     'session': {'max': SESSION_MAX, 'idle_default': SESSION_IDLE,
@@ -1951,13 +2204,15 @@ def main():
                     'poc_interpreters': list(POC_INTERPRETERS),
                     'callback': {'ports_min': 1024, 'max_bytes': CALLBACK_MAX_BYTES},
                     'capture_limit_bytes': HTTP_CAPTURE_BODY_LIMIT,'capture_limits':list(HTTP_CAPTURE_LIMITS)})
-        elif args.command == 'setup': setup(args.task_id, args.owner, args.allow, args.egress)
+        elif args.command == 'setup': setup(args.task_id, args.owner, args.allow, args.egress,
+                                          json.loads(args.resource_policy) if args.resource_policy else None)
         elif args.command == 'teardown': teardown(args.task_id)
         elif args.command == 'workdir': output(workdir_init(args.task_id))
         elif args.command == 'run': run(args.task_id, args.profile, args.target,
                                         args.port, args.ports, args.scheme, args.path, args.hostname,args.capture_limit,
                                         argv=args.argv, poc_file=args.poc_file, poc_interp=args.poc_interp,
-                                        research_host=args.research_host, timeout=args.timeout or None)
+                                        research_host=args.research_host, timeout=args.timeout or None,
+                                        ssrf_destination=args.ssrf_destination,ssrf_context=args.ssrf_context,ssrf_parameter=args.ssrf_parameter)
         elif args.command == 'sync-forward': sync_forward(args.task_id)
         elif args.command == 'callback':
             action = args.action

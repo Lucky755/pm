@@ -215,8 +215,8 @@ def task_context(db, task_id):
         target = load_task_target(db, task_id)
     except ValueError as exc:
         raise ValueError(f'Task {task_id}: {exc}') from exc
-    if not re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', str(target or '')):
-        raise ValueError(f'Task {task_id} has no IPv4 target')
+    try:ipaddress.ip_address(target)
+    except ValueError as exc:raise ValueError(f'Task {task_id} has no concrete IP target') from exc
     intent = ''
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                   "AND name='pm_task_intents'").fetchone():
@@ -600,6 +600,16 @@ def service_map(db, task_id, iteration, keep=12, work_root=None, note_keep=40, *
     legacy = _text_service_hints(db, task_id, iteration, keep=keep,
                                  work_root=work_root, note_keep=note_keep)
     hints = legacy['hints']
+    if isinstance(db,sqlite3.Connection):
+        from orchestrator import resources
+        scope=resources.saved(db,task_id)
+        if scope and scope['migration']:
+            for row in resources.graph(db,task_id)['resources']:
+                data=row['data']
+                if row['kind']=='service' and data.get('target')==scope['migration']['old_address']:
+                    hints.append({'kind':'previous_ip','requires_verification':True,'target':data['target'],
+                        'protocol':data['protocol'],'port':data['port'],'sources':data.get('sources',[]),
+                        'identifications':data.get('identifications',[]),'liveness':'unknown'})
     inherited, inherited_context = False, None
     if include_inherited:
         parent = lineage_predecessor(db, task_id)
@@ -632,7 +642,7 @@ def service_map(db, task_id, iteration, keep=12, work_root=None, note_keep=40, *
                   notes_selection={'lines_total': legacy['note_lines_total'],
                                    'lines_omitted': legacy['note_lines_omitted'], 'line_limit': note_keep})
     # Text can suggest a cheap spot check, but cannot refresh existing structured evidence.
-    if not mapped['total_entries'] and hints and (inherited or legacy['scan_mode'] == 'spot_check'):
+    if not mapped['total_entries'] and hints and mapped['scan_mode_reason']=='no_structured_services' and (inherited or legacy['scan_mode'] == 'spot_check'):
         mapped['scan_mode'] = 'spot_check'
         mapped['scan_mode_reason'] = 'unverified_hints_require_spot_check'
     mapped['needs_spot_check'] = bool(mapped['total_entries'] or hints)

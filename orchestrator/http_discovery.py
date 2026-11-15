@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import base64
+from executor.netguard_root import http_origin
 from html.parser import HTMLParser
 import ipaddress
 import json
@@ -57,7 +58,7 @@ def init(db):
         assets_json TEXT NOT NULL DEFAULT '[]',
         meta_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL,
-        UNIQUE(task_id,port,scheme,hostname,path)
+        UNIQUE(task_id,target,port,scheme,hostname,path)
     )''')
     db.execute("""CREATE TABLE IF NOT EXISTS pm_http_size_recovery (
         observation_id INTEGER PRIMARY KEY, previous_record_json TEXT NOT NULL,
@@ -97,7 +98,34 @@ def init(db):
         db.execute('ALTER TABLE pm_http_discovery ADD COLUMN assets_json TEXT')
     if 'meta_json' not in present:
         db.execute('ALTER TABLE pm_http_discovery ADD COLUMN meta_json TEXT')
+    migrate_route_key(db)
     db.commit()
+
+
+def migrate_route_key(db):
+    """Preserve observation IDs/columns while allowing separately pinned routes."""
+    legacy=False
+    for index in db.execute('PRAGMA index_list(pm_http_discovery)').fetchall():
+        if index[2] and [r[2] for r in db.execute('PRAGMA index_info("'+index[1]+'")')]==['task_id','port','scheme','hostname','path']:
+            legacy=True
+    if not legacy:return
+    from orchestrator import task_memory
+    for name, in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+        if any(r[2]=='pm_http_discovery' for r in db.execute('PRAGMA foreign_key_list("'+name.replace('"','""')+'")')):
+            raise ValueError('HTTP route migration requires explicit handling of foreign-key consumers')
+    original=db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='pm_http_discovery'").fetchone()[0]
+    schema=re.sub(r'(?i)CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[\"`\[]?pm_http_discovery[\"`\]]?',
+                  'CREATE TABLE pm_http_routes_migration',original,count=1)
+    schema,count=re.subn(r'(?i)UNIQUE\s*\(\s*task_id\s*,\s*port\s*,\s*scheme\s*,\s*hostname\s*,\s*path\s*\)',
+                         'UNIQUE(task_id,target,port,scheme,hostname,path)',schema)
+    if count!=1:raise ValueError('Unrecognized legacy HTTP uniqueness constraint')
+    auxiliary=[r[0] for r in db.execute("SELECT sql FROM sqlite_master WHERE tbl_name='pm_http_discovery' AND type IN ('index','trigger') AND sql IS NOT NULL")]
+    with task_memory.atomic(db):
+        db.execute(schema)
+        db.execute('INSERT INTO pm_http_routes_migration SELECT * FROM pm_http_discovery')
+        db.execute('DROP TABLE pm_http_discovery')
+        db.execute('ALTER TABLE pm_http_routes_migration RENAME TO pm_http_discovery')
+        for sql in auxiliary:db.execute(sql)
 
 
 def _safe_path(path):
@@ -107,7 +135,7 @@ def _safe_path(path):
     decoded = path
     for _ in range(3):
         decoded = unquote(decoded)
-    if any(segment.lower().split('.')[0] in SKIP_SEGMENTS for segment in decoded.split('/')):
+    if any(segment.lower().split('.')[0] in SKIP_SEGMENTS for segment in decoded.split('?',1)[0].split('/')):
         raise ValueError('Path matches potentially state-changing endpoint')
     return path
 
@@ -117,17 +145,17 @@ def normalize_href(href, base_url, target, allowed_hosts):
     if not isinstance(href, str) or not 1 <= len(href) <= 300:
         return None
     href = html.unescape(href.strip())
-    if not href or href.startswith(('#', '?')):
+    if not href or href.startswith('#'):
         return None
     try:
         url = urlsplit(urljoin(base_url, href))
         base = urlsplit(base_url)
         if (url.scheme not in ('http', 'https') or url.scheme != base.scheme or
                 url.username is not None or url.password is not None or
-                url.query or url.hostname not in allowed_hosts or
+                url.hostname not in allowed_hosts or
                 (url.port or (443 if url.scheme == 'https' else 80)) != (base.port or (443 if base.scheme == 'https' else 80))):
             return None
-        path = _safe_path(url.path or '/')
+        path = _safe_path((url.path or '/')+('?' + url.query if url.query else ''))
         return (url.scheme, url.hostname, url.port or (443 if url.scheme == 'https' else 80), path)
     except (ValueError, UnicodeError):
         return None
@@ -260,23 +288,40 @@ def permitted_hosts(db, task_id, target):
         row = db.execute('SELECT hostnames_json FROM pm_task_hostnames WHERE task_id=?', (task_id,)).fetchone()
         if row:
             hosts.extend(x for x in json.loads(row[0]) if isinstance(x, str))
+    from orchestrator import resources
+    scope=resources.saved(db,task_id)
+    if scope:hosts.extend(resource_url['host'] for resource_url in
+        (resources.parse(o['origin']) for o in scope['policy']['origins']))
     return list(dict.fromkeys(hosts))
 
 
 def validate_scope(db, task_id):
     from orchestrator import network_workflow, network_enrichment
     target = network_workflow.load_task_target(db, task_id)
-    if ipaddress.ip_address(target).version != 4:
-        raise ValueError('HTTP Discovery needs an exact IPv4 target')
     network_enrichment.verify_scope(db, task_id, target)
     # Console's operator approval exists for real runs; no implicit override.
     row = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_operator_approvals'").fetchone()
     if row:
         approval = db.execute('''SELECT target,allowed,closed_at FROM pm_operator_approvals
                                  WHERE task_id=?''', (task_id,)).fetchone()
-        if not approval or approval != (target, target + '/32', None):
+        from orchestrator import resources
+        scope=resources.saved(db,task_id)
+        allowed=','.join(resources.grants(scope['policy'])) if scope else resources.cidr(target)
+        if not approval or approval != (target, allowed, None):
             raise ValueError('Task has no active operator approval for the exact target')
     return target
+
+
+def validate_endpoint(db,task_id,target,scheme,hostname,port,path,*,destination='',context=''):
+    from orchestrator import resources
+    primary=validate_scope(db,task_id)
+    scope=resources.saved(db,task_id)
+    if not scope:
+        if target!=primary or hostname not in permitted_hosts(db,task_id,target):raise ValueError('HTTP endpoint outside task scope')
+    else:
+        resources.authorize(db,task_id,'ssrf' if destination else 'http',target,
+                            scheme=scheme,hostname=hostname,port=port,path=path,destination=destination,context=context)
+    if scheme not in ('http','https') or type(port) is not int or not 1<=port<=65535:raise ValueError('Invalid HTTP endpoint')
 
 
 def _observed_http_ports(db, task_id, target):
@@ -339,7 +384,7 @@ def _candidates(db, task_id, target, hosts, *, capture=False):
         if port not in ports:
             continue
         scheme = ports[port]
-        add(normalize_href(location, f'{scheme}://{target}:{port}/', target, hosts))
+        add(normalize_href(location, http_origin(scheme,target,port)+f'/', target, hosts))
 
     # Then: previously discovered public hrefs or Location redirects.
     asset_candidates = []
@@ -350,7 +395,7 @@ def _candidates(db, task_id, target, hosts, *, capture=False):
         port, scheme, hostname, path, location, raw_links, raw_assets, _, status, ctype, raw_forms, raw_refs = row
         if port not in ports or hostname not in hosts:
             continue
-        base = f'{scheme}://{hostname}:{port}{path}'
+        base = http_origin(scheme,hostname,port)+f'{path}'
         if location:
             add(normalize_href(location, base, target, hosts))
         for link in json.loads(raw_links)[:25]:
@@ -392,7 +437,7 @@ def _candidates(db, task_id, target, hosts, *, capture=False):
         if (error and 'curl: (63) Maximum file size exceeded' in error
                 and host in hosts and ports.get(port) == scheme
                 and not db.execute('SELECT 1 FROM pm_http_size_recovery WHERE observation_id=?', (oid,)).fetchone()):
-            candidate = normalize_href(path, f'{scheme}://{host}:{port}/', target, hosts)
+            candidate = normalize_href(path, http_origin(scheme,host,port)+f'/', target, hosts)
             if candidate:
                 recoverable.add(candidate)
                 add(candidate)
@@ -407,7 +452,7 @@ def _candidates(db, task_id, target, hosts, *, capture=False):
             break
         if db.execute('SELECT 1 FROM pm_http_document_refresh WHERE observation_id=?', (oid,)).fetchone():
             continue
-        candidate = normalize_href(path, f'{scheme}://{host}:{port}/', target, hosts)
+        candidate = normalize_href(path, http_origin(scheme,host,port)+f'/', target, hosts)
         if candidate and ports.get(port) == scheme and host in hosts:
             document_refreshable.add(candidate)
             add(candidate)
@@ -429,7 +474,7 @@ def _candidates(db, task_id, target, hosts, *, capture=False):
         if db.execute('SELECT 1 FROM pm_http_metadata_refresh WHERE observation_id=? AND parser_version=?',
                       (oid,PARSER_VERSION)).fetchone():
             continue
-        candidate = normalize_href(path, f'{scheme}://{host}:{port}/', target, hosts)
+        candidate = normalize_href(path, http_origin(scheme,host,port)+f'/', target, hosts)
         if candidate and ports.get(port) == scheme and host in hosts:
             refreshable.add(candidate)
             add(candidate)
@@ -450,7 +495,7 @@ def _candidates(db, task_id, target, hosts, *, capture=False):
                 continue
             if not any(x in (ctype or '').lower() for x in ('html','javascript','ecmascript','text/css','json','xml')):
                 continue
-            candidate = normalize_href(path,f'{scheme}://{host}:{port}/',target,hosts)
+            candidate = normalize_href(path,http_origin(scheme,host,port)+f'/',target,hosts)
             if candidate and host in hosts and ports.get(port) == scheme:
                 upgrades.add(candidate)
                 add(candidate)
@@ -465,7 +510,7 @@ def _candidates(db, task_id, target, hosts, *, capture=False):
                     or previous.get('capture_limit_bytes',limit) >= limit
                     or db.execute('SELECT 1 FROM pm_http_capture_upgrades WHERE observation_id=?',(oid,)).fetchone()):
                 continue
-            candidate = normalize_href(path,f'{scheme}://{host}:{port}/',target,hosts)
+            candidate = normalize_href(path,http_origin(scheme,host,port)+f'/',target,hosts)
             if candidate and host in hosts and ports.get(port) == scheme:
                 upgrades.add(candidate)
                 add(candidate)
@@ -531,13 +576,19 @@ def require_capture_support(*, runner=subprocess.run):
 
 
 @diagnostics.operation
-def request_capture(task_id, target, scheme, hostname, port, path, *, runner=subprocess.run, limit_bytes=2*1024*1024):
+def request_capture(task_id, target, scheme, hostname, port, path, *, runner=subprocess.run, limit_bytes=2*1024*1024,
+                    ssrf=None):
     from orchestrator import http_artifacts as artifacts
     if limit_bytes not in (artifacts.DEFAULT_BODY,artifacts.MAX_BODY):
         raise ValueError('Unsupported HTTP capture limit')
     command = ['sudo','-n',BROKER,'run','--task-id',str(task_id),'--profile','http_capture',
                '--target',target,'--scheme',scheme,'--hostname',hostname,'--port',str(port),'--path',path,
                '--capture-limit',str(limit_bytes)]
+    expected_path=path
+    if ssrf:
+        from urllib.parse import urlencode
+        command += ['--ssrf-destination',ssrf['destination'],'--ssrf-context',ssrf['context'],'--ssrf-parameter',ssrf['parameter']]
+        expected_path=path+('&' if '?' in path else '?')+urlencode({ssrf['parameter']:ssrf['destination']})
     result = runner(command,env={**os.environ, **diagnostics.child_env()},stdin=subprocess.DEVNULL,capture_output=True,text=True,errors='replace',timeout=60,check=False)
     diagnostics.execution_exit(result.returncode)
     try:
@@ -546,7 +597,7 @@ def request_capture(task_id, target, scheme, hostname, port, path, *, runner=sub
         raise ValueError('HTTP capture broker returned no valid JSON') from exc
     diagnostics.record_result(payload, result.returncode)
     expected = {'capture_protocol':1,'task_id':task_id,'target':target,'profile':'http_capture',
-                'port':port,'scheme':scheme,'hostname':hostname,'path':path}
+                'port':port,'scheme':scheme,'hostname':hostname,'path':expected_path}
     if result.returncode or not isinstance(payload,dict) or any(payload.get(k) != v for k,v in expected.items()):
         raise ValueError('HTTP capture broker rejected request or returned a scope/protocol mismatch')
     encoded = payload.get('response_b64')
@@ -574,10 +625,12 @@ def request_capture(task_id, target, scheme, hostname, port, path, *, runner=sub
     raw.capture = {'body':body,'headers':headers,'status':status,'complete':complete,
                    'metadata':{'capture_limit_bytes':limit_bytes,'bytes_received':len(body),
                                'download_limited':limited,'text_chars':len(text),**decoding}}
+    if ssrf:raw.capture['metadata']['route']={'method':'ssrf','application':http_origin(scheme,hostname,port)+f'',
+        'destination_contact':'unverified; capture is the application response',**ssrf}
     if headers.get('location'):
-        location = normalize_href(headers['location'],f'{scheme}://{hostname}:{port}{path}',target,[hostname])
+        location = normalize_href(headers['location'],http_origin(scheme,hostname,port)+f'{path}',target,[hostname])
         if location:
-            raw.capture['metadata']['approved_location'] = f'{scheme}://{hostname}:{port}{location[3]}'
+            raw.capture['metadata']['approved_location'] = http_origin(scheme,hostname,port)+f'{location[3]}'
     raw.probe_error = None if payload.get('exit_code') in (0,63) else 'HTTP capture failed: '+str(payload.get('status'))
     raw.download_limited = limited
     raw.broker_truncated = bool(payload.get('capture_truncated'))
@@ -629,7 +682,7 @@ def _capture_reply(db, task_id, artifact_id, *, cached):
 
 
 def capture_explicit(db, task_id, target, scheme, hostname, port, path, *,
-                     hypothesis_key='', new_evidence_id='', records=None):
+                     hypothesis_key='', new_evidence_id='', records=None,ssrf=None):
     """One explicit GET sharing discovery's scope, attempt and artifact budgets.
 
     Claim before I/O. Reuse a saved capture; failures/interrupted claims require
@@ -641,18 +694,20 @@ def capture_explicit(db, task_id, target, scheme, hostname, port, path, *,
     from orchestrator.application_discovery import PARSER_VERSION
     init(db)
     try:
-        if target != validate_scope(db,task_id):
-            raise ValueError('Target differs from authorized task scope')
-        if (scheme not in ('http','https') or type(port) is not int or not 1 <= port <= 65535
-                or hostname not in permitted_hosts(db,task_id,target)):
-            raise ValueError('HTTP endpoint is outside approved scope or has invalid parameters')
+        validate_endpoint(db,task_id,target,scheme,hostname,port,path,
+                          destination=ssrf['destination'] if ssrf else '',context=ssrf['context'] if ssrf else '')
         path = _safe_path(path)
+        original_path=path
+        if ssrf:
+            from urllib.parse import urlencode
+            path+='&' if '?' in path else '?'
+            path+=urlencode({ssrf['parameter']:ssrf['destination']})
     except ValueError as exc:
         raise CaptureRefused(str(exc)) from exc
     try:
         db.execute('BEGIN IMMEDIATE')
-        cursor=db.execute('SELECT * FROM pm_http_discovery WHERE task_id=? AND scheme=? '
-                          'AND hostname=? AND port=? AND path=?',(task_id,scheme,hostname,port,path))
+        cursor=db.execute('SELECT * FROM pm_http_discovery WHERE task_id=? AND target=? AND scheme=? '
+                          'AND hostname=? AND port=? AND path=?',(task_id,target,scheme,hostname,port,path))
         row=cursor.fetchone()
         old=dict(zip((c[0] for c in cursor.description),row)) if row else None
         if old and old['target'] != target:
@@ -669,7 +724,7 @@ def capture_explicit(db, task_id, target, scheme, hostname, port, path, *,
             raise CaptureRefused('Task HTTP request budget exhausted')
         if not old and path.lower().endswith(('.js','.css')) and len(static_attempts(db,task_id)) >= MAX_STATIC_TOTAL:
             raise CaptureRefused('Task static HTTP request budget exhausted')
-        assets=(('port',str(port)),('url',f'{scheme}://{hostname}:{port}{path}'))
+        assets=(('port',str(port)),('url',http_origin(scheme,hostname,port)+f'{path}'))
         for kind,key in assets:
             decision=fact_state.may_probe_asset(db,task_id,kind,key,hypothesis_key,new_evidence_id,records,consume=False)
             if not decision['allowed']:
@@ -693,7 +748,8 @@ def capture_explicit(db, task_id, target, scheme, hostname, port, path, *,
         raise
     artifact_id=None
     try:
-        raw=request_capture(task_id,target,scheme,hostname,port,path,limit_bytes=artifacts.response_limit(db,task_id))
+        capture_options={'ssrf':ssrf} if ssrf else {}
+        raw=request_capture(task_id,target,scheme,hostname,port,original_path,limit_bytes=artifacts.response_limit(db,task_id),**capture_options)
         artifact_id=artifacts.save(db,task_id,target,scheme,hostname,port,path,raw.capture,now())
         parsed=analyze_http(raw,target,scheme,hostname,port,path,permitted_hosts(db,task_id,target),artifacts.MAX_BODY,'http_capture')
         fields={key:parsed[key] for key in ('status','location','content_type','server','title')}
@@ -705,6 +761,7 @@ def capture_explicit(db, task_id, target, scheme, hostname, port, path, *,
         with db:
             db.execute('UPDATE pm_http_discovery SET '+','.join(key+'=?' for key in fields)+' WHERE id=?',
                        (*fields.values(),observation_id))
+            remember_resource_links(db,task_id,scheme,hostname,port,path,parsed,f'http_artifact:{artifact_id}')
         return _capture_reply(db,task_id,artifact_id,cached=False)
     except BaseException:
         with db:
@@ -803,10 +860,19 @@ def queue_status(db, task_id, *, capture=False):
                       else 'limited_documents' if limited_html else 'catalog_exhausted')}
 
 
+def remember_resource_links(db,task_id,scheme,hostname,port,path,parsed,evidence):
+    from orchestrator import resources
+    base=f'{scheme}://'+('['+hostname+']' if ':' in hostname else hostname)+f':{port}{path}'
+    for value in parsed.get('resource_links',[]):
+        try:resources.observe_link(db,task_id,base,value['href'],relation=value['relation'],evidence=evidence)
+        except (ValueError,UnicodeError):continue # An invalid external URL is not a usable resource.
+
+
 def analyze_http(raw, target, scheme, hostname, port, path, hosts, body_limit, profile):
     """Pure bounded interpretation, reusable against saved artifacts without network."""
     status, location, content_type, server, title = None, None, None, None, None
     links, forms, assets, meta, application, references = [], [], [], [], [], []
+    resource_links=[]
     status, headers, body = _headers_and_body(raw, body_limit)
     limited = bool(getattr(raw, "limited", False)) or body.limited
     metrics = {'body_chars_parsed': len(body), 'parse_limit': body_limit,
@@ -820,26 +886,28 @@ def analyze_http(raw, target, scheme, hostname, port, path, hosts, body_limit, p
     content_type, server = headers.get('content-type'), headers.get('server')
     from orchestrator.application_metadata import extract
     application = extract(body, content_type)
-    base = f'{scheme}://{hostname}:{port}{path}'
+    base = http_origin(scheme,hostname,port)+f'{path}'
     script_diagnostics = {}
     if any(x in (content_type or '').lower() for x in ('javascript', 'ecmascript')):
         references = script_references(body, base, target,diagnostics=script_diagnostics)
     raw_location = headers.get('location')
     if raw_location:
         approved_location = normalize_href(raw_location,
-            f'{scheme}://{hostname}:{port}{path}', target, hosts)
+            http_origin(scheme,hostname,port)+f'{path}', target, hosts)
         if approved_location:
-            location = f'{approved_location[0]}://{approved_location[1]}:{approved_location[2]}{approved_location[3]}'
+            location = http_origin(*approved_location[:3])+approved_location[3]
 
     # Only extracted metadata enters evidence; raw bodies stay in private artifacts.
     if 'html' in (content_type or '').lower() or body.lstrip().startswith(("<!DOCTYPE", "<html", "<HTML")):
         html_parser = PageMetadata(body_limit)
         html_parser.feed(body)
+        resource_links=[{'href':href,'relation':'link'} for href in html_parser.links]
+        resource_links += [{'href':a['href'],'relation':'page_dependency'} for a in html_parser.assets]
         allow_relative = True
         if html_parser.base_href is not None:
             effective = normalize_href(html_parser.base_href or path,base,target,[hostname])
             if effective:
-                base = f'{effective[0]}://{effective[1]}:{effective[2]}{effective[3]}'
+                base = http_origin(*effective[:3])+effective[3]
             else:
                 allow_relative = False
                 metrics['relative_urls_skipped'] = 'unsupported_html_base'
@@ -858,7 +926,7 @@ def analyze_http(raw, target, scheme, hostname, port, path, hosts, body_limit, p
         for link in html_parser.links:
             candidate = resolve_href(link)
             if candidate:
-                links.append(f'{candidate[0]}://{candidate[1]}:{candidate[2]}{candidate[3]}')
+                links.append(http_origin(*candidate[:3])+candidate[3])
         assets = []
         rejections = {}
         for asset in html_parser.assets:
@@ -866,7 +934,7 @@ def analyze_http(raw, target, scheme, hostname, port, path, hosts, body_limit, p
             if candidate and candidate[3].lower().endswith(('.js', '.css')):
                 assets.append({'kind': asset['kind'], 'path': candidate[3],
                                'hostname': candidate[1], 'port': candidate[2],
-                               'scheme': candidate[0], 'href': f'{candidate[0]}://{candidate[1]}:{candidate[2]}{candidate[3]}'})
+                               'scheme': candidate[0], 'href': http_origin(*candidate[:3])+candidate[3]})
             else:
                 try:
                     url = urlsplit(urljoin(base,asset['href']))
@@ -894,7 +962,7 @@ def analyze_http(raw, target, scheme, hostname, port, path, hosts, body_limit, p
         metrics.setdefault('metadata_limits',[]).append('script_'+flag)
     return {'status':status,'location':location,'content_type':content_type,'server':server,'title':title,
             'links':links,'forms':forms,'assets':assets,'meta':meta,'application':application,
-            'references':references,'limited':limited,'metrics':metrics}
+            'references':references,'resource_links':resource_links,'limited':limited,'metrics':metrics}
 
 
 def reparse_saved(db, task_id, path=None):
@@ -1061,7 +1129,7 @@ def execute_round(db, task_id, max_requests=2, *, requester=request, document_re
                             'sources': sources, 'metadata_refresh': bool(refresh_id), 'document_refresh': bool(document_id),
                             'artifact_id': artifact_id,'profile':'http_capture' if capture else 'http_document' if document_id else 'http_path'})
             safe_title = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', title or '')
-            print(f'[WEB] {hostname}:{port}{path} -> {status or "BLOCKED"}'
+            print(f'[WEB] {diagnostics.clean(hostname+":"+str(port)+path,limit=None)} -> {status or "BLOCKED"}'
                   + (f' | title={safe_title[:48]}' if safe_title else '')
                   + (f' | assets={len(assets)}' if assets else '')
                   + (f' | paths={len(references)}' if references else '')
@@ -1088,9 +1156,9 @@ def evidence_rows(db, task_id, limit=24):
     return [dict(observation_id=id, hostname=host, port=port, scheme=scheme,
                  path=path, status_code=status, redirect_location=location,
                  content_type=ctype, server=server, title=title,
-                 links=[normalize_href(x, f'{scheme}://{host}:{port}{path}', None, [host])[3]
+                 links=[normalize_href(x, http_origin(scheme,host,port)+f'{path}', None, [host])[3]
                         for x in json.loads(rawlinks)[:10]
-                        if normalize_href(x, f'{scheme}://{host}:{port}{path}', None, [host])],
+                        if normalize_href(x, http_origin(scheme,host,port)+f'{path}', None, [host])],
                  forms=json.loads(rawforms)[:8],
                  assets=[{'kind': a.get('kind'), 'path': a.get('path')}
                          for a in json.loads(rawassets or '[]')[:12] if isinstance(a,dict)],

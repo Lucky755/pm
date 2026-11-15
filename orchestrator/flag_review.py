@@ -46,7 +46,9 @@ def policy(db,task_id):
 
 def listing(db,task_id):
     if not task_memory.exists(db,'pm_flag_proposals') or not task_memory.exists(db,'tasks'):return []
-    cursor=db.execute('SELECT * FROM pm_flag_proposals WHERE task_id=? AND target=(SELECT target FROM tasks WHERE id=?) ORDER BY id',(task_id,task_id))
+    from orchestrator import resources
+    targets=resources.machine_targets(db,task_id) or [r[0] for r in db.execute('SELECT target FROM tasks WHERE id=?',(task_id,))]
+    cursor=db.execute('SELECT * FROM pm_flag_proposals WHERE task_id=? AND target IN ('+','.join('?' for _ in targets)+') ORDER BY id',(task_id,*targets))
     result=[]
     for row in cursor:
         item=dict(zip([c[0] for c in cursor.description],row))
@@ -126,12 +128,16 @@ def propose(db,task_id,value,*,objective_key=None,source='',method='',references
             not _goals(db,task_id) or any(g['key']==goal[0] for g in prior['legacy_goals']) and any(
                 f['value']==value and (f.get('objective_key')==goal[0] or
                     len(prior['legacy_goals'])==1 and len(old_operator)==1) for f in old_operator))
-        db.execute('INSERT OR IGNORE INTO pm_flag_proposals '
-            '(task_id,target,objective_key,objective_title,value,value_sha256,source_json,materials_json,status,created_at,updated_at) '
-            'VALUES(?,?,?,?,?,?,?,?,?,?,?)',(task_id,target[0],goal[0],goal[1],value,task_memory.digest(value),
-                task_memory.encoded([source_data]),task_memory.encoded(list(references)),
-                'legacy' if inherited else 'pending',stamp,stamp))
-        proposal=next(p for p in listing(db,task_id) if p['value']==value and p['objective_key']==goal[0])
+        # Explicit address changes preserve the logical machine and the exact
+        # platform decision. Keep the proposal's original evidence address.
+        proposal=next((p for p in listing(db,task_id) if p['value']==value and p['objective_key']==goal[0]),None)
+        if proposal is None:
+            db.execute('INSERT OR IGNORE INTO pm_flag_proposals '
+                '(task_id,target,objective_key,objective_title,value,value_sha256,source_json,materials_json,status,created_at,updated_at) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?)',(task_id,target[0],goal[0],goal[1],value,task_memory.digest(value),
+                    task_memory.encoded([source_data]),task_memory.encoded(list(references)),
+                    'legacy' if inherited else 'pending',stamp,stamp))
+            proposal=next(p for p in listing(db,task_id) if p['value']==value and p['objective_key']==goal[0])
         if not db.execute('SELECT 1 FROM pm_flag_proposal_events WHERE proposal_id=?',(proposal['id'],)).fetchone():
             _event(db,proposal,'proposed',{'value':value,'objective_key':goal[0],'source':source_data,'materials':list(references)})
         sources=proposal['sources'];materials=proposal['materials']

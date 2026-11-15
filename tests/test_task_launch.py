@@ -356,9 +356,9 @@ class TaskLaunchTests(unittest.TestCase):
             pm.session_api_key(args,required=True)
             self.assertEqual(os.environ['PM_RUN_ID'],d.context()['run_id'])
             d.emit('fixture.operation',task_id=11,reason='resume')
-        answers=['1','10.0.0.1','1','Find flags','','','','','','','','',
+        answers=['1','10.0.0.1','','1','Find flags','','','','','','','','',
                  '2','11','','','','0']
-        # New: IP/mode/task/side/exclusive/expect/limits/hints/pattern/force/hosts.
+        # New: address/area/mode/task/side/exclusive/expect/limits/hints/pattern/force/hosts.
         with patch('builtins.input',side_effect=answers),patch.object(pm,'op_new',side_effect=first),\
              patch.object(pm,'op_resume',side_effect=second),patch.object(pm.getpass,'getpass',return_value='fake-only') as key:
             pm.interactive()

@@ -323,11 +323,6 @@ def validate_plan(db, plan):
         plan["target"]
     )
 
-    if address.version != 4:
-        raise ValueError(
-            "Only IPv4 is supported"
-        )
-
     decision = check_action(
         db,
         plan["task_id"],

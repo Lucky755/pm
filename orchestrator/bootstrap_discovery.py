@@ -88,7 +88,7 @@ def safe_task_target(db, task_id):
     from orchestrator import network_enrichment as enrichment
     target = workflow.load_task_target(db, task_id)
     ip = ipaddress.ip_address(target)
-    if ip.version != 4 or ip.is_loopback or ip.is_unspecified or ip.is_multicast:
+    if ip.is_loopback or ip.is_unspecified or ip.is_multicast:
         raise ValueError('Bootstrap needs an authorized non-loopback IPv4 task target')
     enrichment.verify_scope(db, task_id, target)
     return target

@@ -41,12 +41,11 @@ def validate_target(value):
     address = ipaddress.ip_address(value)
 
     if (
-        address.version != 4
-        or address.is_multicast
+        address.is_multicast
         or address.is_unspecified
     ):
         raise ValueError(
-            "Only unicast IPv4 targets are supported in v1"
+            "Only concrete unicast IP targets are supported"
         )
 
     return str(address)
@@ -115,7 +114,7 @@ def tool_command(profile, target, port, ports):
             "--connect-timeout", "3",
             "--max-time", "8",
             "--",
-            f"http://{target}:{number}/",
+            'http://'+('['+target+']' if ':' in target else target)+f':{number}/',
         ]
 
     elif profile == "tcp_ports":

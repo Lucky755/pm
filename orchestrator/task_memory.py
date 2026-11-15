@@ -172,6 +172,12 @@ def source_state(db,task_id,capability_log):
     for settings in rows(db,'task_scope_settings',task_id):put('constraints','scope',settings)
     for network in rows(db,'task_scope_networks',task_id):
         put('constraints','network:'+network['network'],network)
+    from orchestrator import resources
+    scope=resources.graph(db,task_id)
+    if scope['configured']:
+        put('constraints','resource_scope',{k:v for k,v in scope.items() if k not in ('resources','relations')})
+        for item in scope['resources']:put('resources',item['id'],item)
+        for item in scope['relations']:put('relations','relation:'+digest(item),item)
     for approval in rows(db,'pm_operator_approvals',task_id,target=target):
         put('constraints','operator_approval',{k:v for k,v in approval.items() if k not in ('approved_at',)})
     for goal in rows(db,'pm_objectives',task_id):put('goals','objective:'+goal['key'],goal)

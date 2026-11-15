@@ -15,7 +15,11 @@ import argparse
 import ipaddress
 import json
 import sqlite3
+import sys
 from pathlib import Path
+
+ROOT=Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
 
 
 DATABASE = Path("/home/lucky/pentest-master/storage/tasks.db")
@@ -173,6 +177,10 @@ def address_allowed(db, task_id, address):
     )
 
     ip = parse_ip(address)
+    from orchestrator import resources
+    scope=resources.saved(db,task_id)
+    if scope:
+        return str(ip) in scope['policy']['addresses'] or any(ip in ipaddress.ip_network(n) for n in scope['policy']['networks'])
 
     if ip == parse_ip(initial_target):
         return True
@@ -200,6 +208,11 @@ def check_action(
     )
 
     destination = str(parse_ip(destination))
+    from orchestrator import resources
+    scope=resources.saved(db,task_id)
+    if scope and operation=='scan':
+        try:resources.authorize(db,task_id,'scan',destination)
+        except ValueError as exc:return {'decision':'DENY','reason':str(exc)}
 
     if not address_allowed(
         db,
@@ -230,6 +243,8 @@ def check_action(
                 "reason": "Intermediate host outside scope",
             }
 
+        if scope and operation=='pivot':
+            return {'decision':'DENY','reason':'Pivot route requires an answered operator question and explicit route configuration'}
         if operation == "pivot" and not allow_pivot:
             return {
                 "decision": "DENY",

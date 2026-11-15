@@ -31,9 +31,11 @@ def initialize(db):
 
 def listing(db,task_id,*,pending=False):
     if not task_memory.exists(db,'pm_operator_questions'):return []
+    from orchestrator import resources
+    targets=resources.machine_targets(db,task_id) or [r[0] for r in db.execute('SELECT target FROM tasks WHERE id=?',(task_id,))]
     cursor=db.execute('SELECT * FROM pm_operator_questions WHERE task_id=? '
-        'AND target=(SELECT target FROM tasks WHERE id=?) '+("AND status='pending' " if pending else '')+
-        'ORDER BY id',(task_id,task_id))
+        'AND target IN ('+','.join('?' for _ in targets)+') '+("AND status='pending' " if pending else '')+
+        'ORDER BY id',(task_id,*targets))
     result=[]
     for row in cursor:
         item=dict(zip([col[0] for col in cursor.description],row))
@@ -43,6 +45,9 @@ def listing(db,task_id,*,pending=False):
             from orchestrator import flag_review
             proposal=flag_review.for_question(db,task_id,item)
             if proposal:item['flag_candidate']=proposal
+        if item['branch_id'].startswith('resource:') and task_memory.exists(db,'pm_resources'):
+            resource=db.execute('SELECT kind,value,context FROM pm_resources WHERE task_id=? AND id=?',(task_id,item['branch_id'])).fetchone()
+            if resource:item['resource']={'kind':resource[0],'value':resource[1],'context':resource[2]}
         result.append(item)
     return result
 
@@ -55,7 +60,7 @@ def available(state):
     if not pending:return state['known_resources']
     if any(q['branch_id']=='task' for q in pending):return []
     blocked={q['branch_id'] for q in pending}
-    return [r for r in state['known_resources'] if r.startswith('service:') and r not in blocked]
+    return [r for r in state['known_resources'] if r.startswith(('service:','resource:')) and r not in blocked]
 
 
 def blocked(decision,state):
@@ -94,6 +99,11 @@ def request(db,task_id,target,decision,step_id,*,_flag_proposal=None):
         if cursor.rowcount:
             db.execute('INSERT INTO pm_operator_question_events(question_id,task_id,event,payload_json,created_at) '
                 "VALUES(?,?,'requested',?,?)",(qid,task_id,task_memory.encoded(content),now()))
+        if kind=='pivoting' and branch(decision).startswith('resource:'):
+            from orchestrator import resources
+            if resources.saved(db,task_id):
+                subject=resources.node(db,task_id,'operator_question',str(qid))
+                resources.link(db,task_id,branch(decision),'requires_pivot_question',subject,'operator_question:'+str(qid))
     diagnostics.emit('operator.question',task_id=task_id,reason=kind,identifiers={'question_id':qid,'step_id':step_id},
                      parameters={'branch_id':branch(decision)})
     return next(q for q in listing(db,task_id) if q['id']==qid)

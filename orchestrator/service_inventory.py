@@ -35,7 +35,7 @@ def decoded(value):
         return None
 
 
-def collect_full(db, task_id, *, at=None):
+def collect_full(db, task_id, *, at=None, address=None):
     """Complete structured inventory for execution, with the shared source filters.
 
     Do not pass this unbounded view to a model; collect() provides that view.
@@ -73,7 +73,12 @@ def collect_full(db, task_id, *, at=None):
         from orchestrator.network_workflow import load_task_target
         from executor.task_scope import check_action
         try:
-            target = load_task_target(db, task_id)
+            primary = load_task_target(db, task_id)
+            target=address or primary
+            if address and address!=primary:
+                from orchestrator import resources
+                state=resources.saved(db,task_id)
+                if not state or address not in state['policy']['addresses']:raise ValueError('Address is not associated with this task')
             scope_valid = check_action(db, task_id, 'connect', target)['decision'] == 'ALLOW'
             status['scope'] = 'allowed' if scope_valid else 'denied'
         except (sqlite3.Error, ValueError):
@@ -199,10 +204,18 @@ def collect_full(db, task_id, *, at=None):
     is_fresh = any(e['fresh'] for e in all_entries)
     reason = ('fresh_full_tcp_scan' if scan_fresh else 'fresh_structured_observations' if is_fresh
               else 'structured_data_stale' if all_entries else 'no_structured_services')
+    mode='spot_check' if is_fresh else 'full_scan'
+    if isinstance(db,sqlite3.Connection):
+        from orchestrator import resources
+        scope=resources.saved(db,task_id)
+        if scope and (scope['policy']['area']=='web' or scope['policy']['origins'] and not scope['policy']['host_addresses']):
+            mode,reason='web_only','web_scope_no_host_scan'
+        elif scope and scope['migration']:
+            mode,reason='spot_check','same_machine_address_change_reuse_saved_state'
     return {'task_id': task_id, 'target': target, 'scope_valid': scope_valid,
             'max_age_minutes': ttl, 'full_scan': coverage, 'source_status': status,
             'source_counts': counts, 'fresh': is_fresh,
-            'scan_mode': 'spot_check' if is_fresh else 'full_scan', 'scan_mode_reason': reason,
+            'scan_mode':mode, 'scan_mode_reason': reason,
             'total_entries': len(all_entries), 'omitted_entries': 0, 'entries': all_entries}
 
 

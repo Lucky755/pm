@@ -77,7 +77,7 @@ def get_target(db, task_id):
 
 
 def verify_scope(db, task_id, target):
-    ipaddress.IPv4Address(target)
+    ipaddress.ip_address(target)
 
     decision = check_action(
         db,

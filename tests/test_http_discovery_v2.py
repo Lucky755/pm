@@ -23,13 +23,14 @@ class WebDiscoveryTests(unittest.TestCase):
         self.assertIsNone(web.normalize_href('http://10.0.0.2/admin', 'http://10.0.0.1:80/', '10.0.0.1', ['10.0.0.1']))
         self.assertIsNone(web.normalize_href('http://10.0.0.1:81/a', 'http://10.0.0.1:80/', '10.0.0.1', ['10.0.0.1']))
         self.assertIsNone(web.normalize_href('/logout', 'http://10.0.0.1:80/', '10.0.0.1', ['10.0.0.1']))
-        self.assertIsNone(web.normalize_href('/index?token=secret', 'http://10.0.0.1:80/', '10.0.0.1', ['10.0.0.1']))
+        self.assertEqual(web.normalize_href('/index?token=secret#part', 'http://10.0.0.1:80/', '10.0.0.1', ['10.0.0.1']),
+                         ('http','10.0.0.1',80,'/index?token=secret'))
         self.assertEqual(web.normalize_href('http://billing.lab/mbilling', 'http://10.0.0.1:80/',
                                             '10.0.0.1', ['10.0.0.1','billing.lab']),
                          ('http','billing.lab',80,'/mbilling'))
 
     def test_broker_rejects_bad_paths_and_uses_resolve(self):
-        for path in ('/../etc/passwd', '/%2e%2e/x', '/%252e%252e/x', '/x?secret=1', '//evil/path',
+        for path in ('/../etc/passwd', '/%2e%2e/x', '/%252e%252e/x', '/x?secret=%0A1', '//evil/path',
                      '/x\nHeader: evil', '/%2fetc', '/a\\b'):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 broker.safe_http_path(path)

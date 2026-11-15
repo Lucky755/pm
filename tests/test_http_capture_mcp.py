@@ -135,7 +135,7 @@ class CaptureMCPTests(unittest.TestCase):
 
     def test_scope_and_unsafe_paths_are_refused_before_broker(self):
         for args in ({'target':'10.0.0.2'},{'hostname':'outside.example'},
-                     {'path':'/logout'},{'path':'/../secret'},{'path':'/x?flag=known'}):
+                     {'path':'/logout'},{'path':'/../secret'},{'path':'/x?flag=%0Aknown'}):
             with self.subTest(args=args):
                 self.assertEqual(self.call(**args)['status'],'blocked')
         self.assertEqual(self.calls,[])

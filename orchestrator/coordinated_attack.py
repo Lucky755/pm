@@ -114,7 +114,10 @@ def authorization(db, context, mapped):
                          (context['task_id'],)).fetchone()
     except sqlite3.OperationalError:
         row = None
-    if not row or row != (context['target'], context['target'] + '/32', None):
+    from orchestrator import resources
+    scope=resources.saved(db,context['task_id'])
+    allowed=','.join(resources.grants(scope['policy'])) if scope else resources.cidr(context['target'])
+    if not row or row != (context['target'], allowed, None):
         return 'scope_approval_required'
     return None
 
@@ -157,8 +160,22 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
              for q in operator_questions.listing(db,task_id) if q['status']=='answered']
     proposals=[{'objective_key':p['objective_key'],'value_sha256':p['value_sha256'],'status':p['status']}
                for p in flag_review.listing(db,task_id)]
+    from orchestrator import resources
+    graph=resources.graph(db,task_id)
+    def resource_semantics(row):
+        data=row['data']
+        if row['kind']=='service':
+            data={k:data[k] for k in ('target','protocol','port','state','status','current_address','liveness',
+                                     'identification_conflict','identification_uncertain') if k in data}
+            data['identifications']=semantic_set({k:v for k,v in identity.items() if k!='source'}
+                                                 for identity in row['data'].get('identifications',[]))
+        return {**{k:row[k] for k in ('kind','value','context')},'data':data}
+    resource_state={} if not graph['configured'] else {'resource_state':{'policy':graph['policy'],
+        'resources':semantic_set(resource_semantics(r) for r in graph['resources']),
+        'relations':semantic_set({**{k:r[k] for k in ('source','relation','destination')},
+                                 'data':{k:v for k,v in r['data'].items() if k!='sources'}} for r in graph['relations'])}}
     return {'version':2,**({'operator_answers':semantic_set(answers)} if answers else {}),
-            **({'flag_reviews':semantic_set(proposals)} if proposals else {}),'intent':context['intent'],'target':context['target'],
+            **({'flag_reviews':semantic_set(proposals)} if proposals else {}),**resource_state,'intent':context['intent'],'target':context['target'],
             'goals':[{k:g.get(k) for k in ('key','title','role','weight','status')} for g in goals['objectives']],
             'goal_policy':{k:goals.get(k) for k in ('mode','exclusive','expected_flags')},
             'access':access_knowledge(essential),'triage':triage,'services':semantic_set(services),
@@ -198,6 +215,9 @@ def snapshot(db, task_id, expect):
             for reference in proof['capture_refs']:
                 flag_refs[reference] = proof
     refs = {'intent': {'kind': 'operator_intent'}, **flag_refs}
+    from orchestrator import resources
+    resource_graph=resources.graph(db,task_id)
+    for item in resource_graph.get('resources',[]):refs[item['id']]=item
     scope_ref='scope:'+context['target']
     refs[scope_ref]={'task_id':task_id,'target':context['target'],'intent_ref':'intent'}
     for item in goals['objectives']:
@@ -232,12 +252,12 @@ def snapshot(db, task_id, expect):
     knowledge = knowledge_state(db,task_id,context,mapped,essential,goals,results,confirmed)
     memory=task_memory.context(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
     for ref,value in memory['material_index'].items():refs.setdefault(ref,value)
-    return {'task': context, 'objectives': goals, 'service_map': mapped, 'essential_state': essential,'task_memory':memory,
+    return {'task': context, 'resource_graph':resource_graph,'objectives': goals, 'service_map': mapped, 'essential_state': essential,'task_memory':memory,
             'open_hypotheses': [f for f in facts if f['status']=='untested'],
             'refutations': [f for f in facts if f['status']=='refuted' and f['probe_result_id'] and f['quote']],
             'recent_results': [{**{k:r[k] for k in ('result_id','tool','status')},
                                 'excerpt_untrusted': actions.clip_result(r['text'], max_chars=600)} for r in recent],
-            'references': refs, 'known_resources':[scope_ref]+sorted(k for k in refs if k.startswith('service:')),
+            'references': refs, 'known_resources':[scope_ref]+sorted(k for k in refs if k.startswith(('service:','resource:'))),
             'knowledge_sha256':digest(knowledge),
             'history_sha256':digest({'result_ids':[r['result_id'] for r in results],'reports':reports}),
             'state_sha256':digest(knowledge), 'confirmed_flags': confirmed,
@@ -285,7 +305,7 @@ def parse_decision(value, state, roles):
         raise ValueError('resource_not_authorized')
     branch=operator_questions.branch(decision)
     if (not isinstance(branch,str) or branch!='task' and (branch not in state['known_resources']
-            or not branch.startswith('service:') or resources!=[branch])):
+            or not branch.startswith(('service:','resource:')) or resources!=[branch])):
         raise ValueError('invalid_branch')
     if decision['action']=='wait_operator':
         question=decision.get('operator_question')
@@ -297,6 +317,9 @@ def parse_decision(value, state, roles):
     elif 'operator_question' in decision:raise ValueError('invalid_operator_question')
     if decision['action']=='run_role':
         if operator_questions.blocked(decision,state):raise ValueError('branch_waiting_operator')
+        graph=state.get('resource_graph',{})
+        if graph.get('configured') and any(r.startswith('resource:') and r not in graph['authorized_resources'] for r in resources):
+            raise ValueError('resource_not_authorized')
         if not isinstance(decision['profile'],str):raise ValueError('unknown_profile')
         instructions.profile(decision['role'],decision['profile'])
     elif decision['profile'] is not None:

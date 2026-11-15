@@ -124,7 +124,7 @@ def step_execution(row):
         return {'status':'unknown','results':[]}
     if not row.get('report_path') and row.get('error') in (
             'operator_requested_replan','role_approval_required','planned_transition_no_longer_allowed',
-            'assignment_state_changed','legacy_access_gate_retired_not_started',
+            'assignment_state_changed','legacy_access_gate_retired_not_started','address_changed_not_started',
             'operator_question_answered_no_action','operator_question_pending','operator_question_already_answered'):
         return {'status':'not_started','results':[]}
     if row['status'] in ('planned','waiting_operator') and not row.get('report_path'):

@@ -66,7 +66,7 @@ def already_planned(db, task_id, profile, target, parameters):
 
 def scope_check(db, task_id, target):
     from executor.task_scope import check_action
-    ipaddress.IPv4Address(target)
+    ipaddress.ip_address(target)
     decision = check_action(db, task_id, 'connect', target)
     if decision['decision'] != 'ALLOW':
         raise ValueError('Decision target is outside task scope')

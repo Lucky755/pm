@@ -128,7 +128,7 @@ class Tests(unittest.TestCase):
              patch('builtins.input',return_value='no'),\
              patch.object(pm,'launch_configured_task') as launch,\
              patch.object(pm,'get_egress',return_value='tun0'),redirect_stdout(io.StringIO()):
-            pm.op_change_ip(args)
+            pm.op_change_ip_successor(args) # Resuming the historical successor protocol remains supported.
         self.assertEqual(db.execute('SELECT target FROM tasks WHERE id=11').fetchone()[0],'10.10.10.65')
         self.assertEqual(db.execute('SELECT successor_task_id FROM pm_task_lineage').fetchone()[0],12)
         self.assertIsNotNone(db.execute('SELECT closed_at FROM pm_operator_approvals WHERE task_id=11').fetchone()[0])

@@ -31,7 +31,8 @@ class Tests(unittest.TestCase):
 
     def test_target_validation(self):
         self.assertEqual(pm.validate_target('10.10.10.161'), '10.10.10.161')
-        for bad in ('127.0.0.1', '192.0.2.10', '8.8.8.8/32', 'whatever'):
+        self.assertEqual(pm.validate_target('whatever'),'whatever')
+        for bad in ('127.0.0.1', '192.0.2.10', '8.8.8.8/32', 'not a domain'):
             with self.assertRaises(pm.OperatorError): pm.validate_target(bad)
 
     def test_reject_scope_mismatch(self):

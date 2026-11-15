@@ -158,6 +158,7 @@ def build_command(
         if profile == "tcp_ports":
             return [
                 nmap,
+                *(['-6'] if ':' in target else []),
                 "-sT",
                 "-Pn",
                 "-n",
@@ -170,6 +171,7 @@ def build_command(
 
         return [
             nmap,
+            *(['-6'] if ':' in target else []),
             "-sT",
             "-sV",
             "--version-light",
@@ -231,7 +233,7 @@ def build_command(
             "--max-filesize", "32768",
         ])
 
-    url = f"{scheme}://{target}:{number}/"
+    url = f"{scheme}://"+('['+target+']' if ':' in target else target)+f":{number}/"
 
     args.extend([
         "--",

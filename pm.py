@@ -121,13 +121,11 @@ def heading(name):
 
 def validate_target(raw):
     try:
-        ip = ipaddress.IPv4Address(raw)
-    except ipaddress.AddressValueError as exc:
-        raise OperatorError('Нужен один IPv4-адрес цели, не домен и не подсеть') from exc
-    if (ip.is_loopback or ip.is_multicast or ip.is_unspecified or
-            any(ip in net for net in DOC_NETS)):
-        raise OperatorError('Этот адрес нельзя использовать как живую цель')
-    return str(ip)
+        from orchestrator.resources import parse
+        item=parse(raw)
+        return item['address'] if item['kind']=='address' else item['input']
+    except (ValueError,UnicodeError) as exc:
+        raise OperatorError('Нужен IPv4, IPv6, домен или http(s) URL: '+str(exc)) from exc
 
 
 def initialize_tcp_scans(db):
@@ -201,6 +199,8 @@ def connect():
     initialize_tcp_scans(db)
     from orchestrator import task_memory
     task_memory.initialize(db)
+    from orchestrator import resources
+    resources.initialize(db)
     return db
 
 
@@ -212,18 +212,15 @@ def task_target(db, task_id):
 
 
 def ensure_task_scope(db, task_id, target, *, create=False):
+    from executor import task_scope
+    task_scope.initialize(db)
     try:
         row = db.execute('SELECT initial_target FROM task_scope_settings WHERE task_id=?',
                          (task_id,)).fetchone()
     except sqlite3.OperationalError:
         row = None
     if row is None and create:
-        command = [str(PYTHON), str(ROOT / 'executor/task_scope.py'),
-                   'init', '--task-id', str(task_id)]
-        proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, timeout=30)
-        if proc.returncode:
-            raise OperatorError('Ошибка инициализации Task Scope: ' + (proc.stderr or proc.stdout)[-700:])
+        task_scope.init_task_scope(db,task_id)
         row = db.execute('SELECT initial_target FROM task_scope_settings WHERE task_id=?',
                          (task_id,)).fetchone()
     if not row or row[0] != target:
@@ -236,7 +233,7 @@ def ensure_task_scope(db, task_id, target, *, create=False):
 
 
 def get_egress(target):
-    proc = subprocess.run(['/usr/sbin/ip', '-4', 'route', 'get', target],
+    proc = subprocess.run(['/usr/sbin/ip', '-6' if ipaddress.ip_address(target).version==6 else '-4', 'route', 'get', target],
                           capture_output=True, text=True, timeout=8)
     if proc.returncode:
         raise OperatorError('Нет маршрута к цели: ' + proc.stderr[-300:])
@@ -247,7 +244,9 @@ def get_egress(target):
 
 
 def ask_approval(db, task_id, target, egress, *, show=True, auto=False):
-    requested = target + '/32'
+    from orchestrator import resources
+    scope=resources.saved(db,task_id)
+    requested=','.join(resources.grants(scope['policy'])) if scope else resources.cidr(target)
     row = db.execute('SELECT target, allowed, egress, closed_at FROM pm_operator_approvals WHERE task_id=?',
                      (task_id,)).fetchone()
     if row and row == (target, requested, egress, None):
@@ -263,7 +262,7 @@ def ask_approval(db, task_id, target, egress, *, show=True, auto=False):
         line(f'  Разрешённый:  {requested}')
         line(f'  Выход:        {egress}')
         line('  Доступно:     ограниченные профили сетевой разведки')
-        line('  Эксплуатация и повышение привилегий требуют отдельного подтверждения.')
+        line('  Действия — внутри задания и условий комнаты; выбор роли не расширяет разрешения.')
     if auto:
         # Only called from the explicit NEW task workflow, after the operator
         # supplied the exact IPv4 target and the independently checked route.
@@ -328,12 +327,18 @@ def broker_is_trusted():
         raise OperatorError('Привилегированный NetGuard должен быть root-owned и не writable группой/остальными')
 
 
-def ensure_netguard(task_id, target, egress):
+def ensure_netguard(task_id, target, egress, *, policy=None):
+    from orchestrator import resources
+    allowed=resources.grants(policy) if policy else [resources.cidr(target)]
     broker_is_trusted()
     sudo_authenticate()
+    if policy is not None:
+        capabilities,_=sudo_checked(['capabilities'])
+        if capabilities.get('resource_policy_protocol')!=1:
+            raise OperatorError('Установленный NetGuard не поддерживает модель ресурсов; нужно операторское обновление брокера')
     existing, rc = sudo_checked(['status', '--task-id', str(task_id)], allow_error=True)
     if rc == 0 and existing.get('status') == 'configured':
-        if (existing.get('allowed') != [target + '/32'] or
+        if (existing.get('allowed') != allowed or policy is not None and existing.get('resource_policy')!=policy or
                 existing.get('approved_egress', existing.get('egress')) != egress):
             raise OperatorError('Существующий NetGuard не соответствует подтверждённому scope')
         line(f'  ✓ NetGuard pmns{task_id}: уже настроен, правила не дублируются')
@@ -342,19 +347,20 @@ def ensure_netguard(task_id, target, egress):
         error = str(existing.get('error', '')).lower()
         if 'not configured' not in error and 'not found' not in error:
             raise OperatorError('Невозможно проверить NetGuard: ' + str(existing.get('error')))
-        result, _ = sudo_checked(['setup', '--task-id', str(task_id),
-                                  '--owner', getpass.getuser(), '--allow', target + '/32',
-                                  '--egress', egress], timeout=45)
+        command=['setup','--task-id',str(task_id),'--owner',getpass.getuser(),
+                 *[arg for network in allowed for arg in ('--allow',network)],'--egress',egress]
+        if policy is not None:command+=['--resource-policy',json.dumps(policy)]
+        result, _ = sudo_checked(command,timeout=45)
         if result.get('status') != 'configured':
             raise OperatorError('Настройка NetGuard не подтверждена')
         line(f'  ✓ NetGuard pmns{task_id}: создан')
     state, _ = sudo_checked(['status', '--task-id', str(task_id)])
-    if (state.get('allowed') != [target + '/32'] or
+    if (state.get('allowed') != allowed or policy is not None and state.get('resource_policy')!=policy or
             state.get('approved_egress', state.get('egress')) != egress or
             not state.get('docker_forward_managed', False) and docker_forward_drop()):
         raise OperatorError('NetGuard не подтвердил изоляцию/DOCKER-USER; запуск отменён')
     # Do not auto-run sync-forward: root broker v2 setup must be atomic.
-    line(f'  ✓ Сетевой выход: {egress}, только {target}/32')
+    line(f'  ✓ Сетевой выход: {egress}, только '+', '.join(allowed))
 
 
 def docker_forward_drop():
@@ -834,6 +840,12 @@ def configure(db, task_id, args, *, create_scope=False, plan=None):
     if task_id > 200:
         raise OperatorError('NetGuard поддерживает только Task ID 1..200')
     ensure_task_scope(db, task_id, target, create=create_scope)
+    from orchestrator import resources
+    scope=resources.saved(db,task_id)
+    if scope:
+        with db:
+            for network in scope['policy']['networks']:
+                db.execute('INSERT OR IGNORE INTO task_scope_networks VALUES(?,?)',(task_id,network))
     egress = args.egress or get_egress(target)
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', egress) or egress == 'auto':
         raise OperatorError('Нужен конкретный интерфейс, например tun0; auto запрещён в этом CLI')
@@ -842,12 +854,20 @@ def configure(db, task_id, args, *, create_scope=False, plan=None):
         raise OperatorError(f'Маршрут Kali идёт через {actual}, а указан {egress}. Проверь VPN до запуска.')
     if plan:
         show_plan(task_id, plan)
-    ask_approval(db, task_id, target, egress, show=not create_scope, auto=create_scope)
+    ask_approval(db, task_id, target, egress, show=not create_scope,
+                 auto=create_scope or bool(scope and scope['migration'] and scope['migration']['status']=='connections_pending'))
     heading('Сетевая изоляция')
-    ensure_netguard(task_id, target, egress)
+    from orchestrator import resources
+    scope=resources.saved(db,task_id)
+    if scope:
+        ensure_netguard(task_id,target,egress,policy=scope['policy'])
+    else:ensure_netguard(task_id, target, egress)
     from orchestrator.http_discovery import require_capture_support
     require_capture_support()
-    configure_hostnames(db, task_id, target, getattr(args, 'hostnames', None))
+    aliases=getattr(args,'hostnames',None)
+    if scope:
+        aliases=','.join(host for host in scope['entry'].get('bindings',{}) if ':' not in host and not host.replace('.','').isdigit()) or aliases
+    configure_hostnames(db, task_id, target, aliases)
     return target
 
 
@@ -1337,6 +1357,7 @@ def render_coordinator_result(result, args):
     for question in result.get('operator_questions',[]):
         line(f"  Вопрос #{question['id']} [{question['status']}] · {safe_display(question['kind'])} · ветка {safe_display(question['branch_id'])}")
         line('    '+safe_display(question['question']))
+        if question.get('resource'):line('    Ресурс: '+diagnostics.clean(question['resource']['value'],limit=None)+' · контекст '+safe_display(question['resource']['context']))
         render_flag_candidate(question)
         line('    Причина: '+safe_display(question['reason']))
         line('    Границы: '+safe_display(json.dumps(question['boundaries'],ensure_ascii=False)))
@@ -1412,6 +1433,13 @@ def run_task_coordinator(db, task_id, args):
 def launch_configured_task(db, task_id, target, args):
     from orchestrator.coordinated_attack import task_lock
     with task_lock(task_id):
+        from orchestrator import resources
+        scope=resources.saved(db,task_id)
+        validate_resource_launch(args,scope)
+        if scope and scope['migration']:
+            return launch_rebound_task(db,task_id,target,args,scope)
+        if scope and (scope['policy']['area']=='web' or scope['policy']['origins'] and not scope['policy']['host_addresses']):
+            return launch_web_task(db,task_id,target,args,scope)
         if getattr(args,'coordinated',False):
             return launch_coordinated_task(db,task_id,target,args)
         from orchestrator import task_runtime
@@ -1419,6 +1447,75 @@ def launch_configured_task(db, task_id, target, args):
             paused=task_runtime.pause(db,task_id)
             if paused and paused.get('coordinator_run_id'):return render_coordinator_result(paused,args)
         return launch_legacy_task(db,task_id,target,args)
+
+
+def validate_resource_launch(args,scope):
+    if not scope:return
+    policy=scope['policy']
+    web=policy['area']=='web' or policy['origins'] and not policy['host_addresses']
+    if web and not getattr(args,'coordinated',False):raise OperatorError('Веб-точка входа требует coordinated-режима')
+    if web and (getattr(args,'reprobe',None) or getattr(args,'sync_burp',False) or '--max-rounds' in getattr(args,'_explicit_flags',set())):
+        raise OperatorError('Веб-маршрут не использует --reprobe, --sync-burp или --max-rounds; бюджет HTTP — --max-jobs')
+    if scope.get('migration') and (getattr(args,'reprobe',None) or getattr(args,'sync_burp',False)):
+        raise OperatorError('Маршрут смены адреса использует сохранённые соединения; --reprobe/--sync-burp здесь не поддерживаются')
+
+
+def launch_web_task(db,task_id,target,args,scope):
+    """Bounded original URL capture, never tcp_full or shared-IP enumeration."""
+    from orchestrator import http_discovery as web, task_runtime, resources
+    if not getattr(args,'coordinated',False):raise OperatorError('Веб-область требует coordinated-режима')
+    task_runtime.reconnaissance(db,task_id,'running')
+    used=0;accessible=False
+    for origin in scope['policy']['origins']:
+        url=resources.parse(origin['origin'])
+        path=scope['entry'].get('request_path','/') if url['host']==scope['entry']['host'] else '/'
+        for address in origin['addresses']:
+            if used>=args.max_jobs:break
+            used+=1
+            try:
+                result=web.capture_explicit(db,task_id,address,url['scheme'],url['host'],url['port'],path)
+                accessible=True
+                diagnostics.emit('resource.initial_capture',task_id=task_id,reason='web_scope_no_host_scan',
+                    identifiers={'artifact_ref':result.get('artifact_ref')},parameters={'origin':url['origin'],'cached':result.get('cached',False)})
+                break
+            except (web.CaptureRefused,OSError,ValueError,subprocess.SubprocessError) as exc:
+                diagnostics.emit('resource.initial_capture_failed',task_id=task_id,reason_category='web_capture',
+                                 reason_summary=str(exc)[:240],parameters={'origin':url['origin']})
+    if not accessible and not getattr(args,'force_unreachable',False):
+        task_runtime.reconnaissance(db,task_id,'waiting_operator','web_entrypoint_unavailable')
+        return render_coordinator_result({'task_id':task_id,'status':'waiting_operator','succeeded':False,
+            'stop_reason':'web_entrypoint_unavailable','steps':[],'operator_questions':[]},args)
+    task_runtime.reconnaissance(db,task_id,'completed')
+    return run_task_coordinator(db,task_id,args)
+
+
+def launch_rebound_task(db,task_id,target,args,scope):
+    from orchestrator import resources,task_runtime
+    ports=scope['migration']['ports']
+    if not ports:
+        task_runtime.reconnaissance(db,task_id,'waiting_operator','address_changed_no_known_connection')
+        return render_coordinator_result({'task_id':task_id,'status':'waiting_operator','succeeded':False,
+            'stop_reason':'address_changed_no_known_connection','steps':[]},args)
+    if scope['migration']['status']=='connections_checked':return run_task_coordinator(db,task_id,args) if getattr(args,'coordinated',False) else attack_task(args)
+    if scope['policy']['area']=='web':
+        from orchestrator import http_discovery as web
+        origin=resources.parse(scope['policy']['origins'][0]['origin'])
+        path=scope['entry'].get('request_path','/')
+        capture=web.capture_explicit(db,task_id,target,origin['scheme'],origin['host'],origin['port'],path)
+        result={'reachable':[origin['port']] if capture['status']=='completed' else [],
+                'unreachable':[] if capture['status']=='completed' else [origin['port']],
+                'unchecked':[],'artifact_ref':capture['artifact_ref']}
+    else:result=preflight_target(db,task_id,target,ports)
+    if not result['reachable'] and not getattr(args,'force_unreachable',False):
+        reason='address_change_connections_unchecked' if result.get('unchecked') else 'address_change_connections_unreachable'
+        task_runtime.reconnaissance(db,task_id,'waiting_operator',reason)
+        return render_coordinator_result({'task_id':task_id,'status':'waiting_operator','succeeded':False,'stop_reason':reason,'steps':[]},args)
+    with db:
+        migration={**scope['migration'],'status':'connections_checked','result':result}
+        db.execute('UPDATE pm_resource_scope SET migration_json=? WHERE task_id=?',(json.dumps(migration),task_id))
+    task_runtime.reconnaissance(db,task_id,'completed')
+    if getattr(args,'coordinated',False):return run_task_coordinator(db,task_id,args)
+    return attack_task(args)
 
 
 def launch_coordinated_task(db, task_id, target, args):
@@ -1508,9 +1605,28 @@ def launch_legacy_task(db, task_id, target, args):
 
 @diagnostics.stage
 def op_new(args, *, defer_execution=False):
+    from orchestrator import resources
+    raw=validate_target(args.target)
+    entry=resources.parse(raw)
+    area=getattr(args,'area',None) or ('web' if entry['kind'] in ('url','domain') else 'host')
+    if resources.web_entry(entry,area,getattr(args,'address',None)):
+        if '--legacy' in getattr(args,'_explicit_flags',set()):raise OperatorError('Веб-область использует координатор; --legacy несовместим')
+        args.coordinated=True
     mode='coordinated' if getattr(args,'coordinated',False) else 'legacy'
     validate_launch_options(args,mode,new=True)
-    target = validate_target(args.target)
+    prepared=resources.resolve(raw,area=area,addresses=getattr(args,'address',None) or (),
+        aliases=validate_hostnames(getattr(args,'hostnames',None)),networks=getattr(args,'allow_network',None) or (),
+        allow=getattr(args,'allow_resource',None) or (),deny=getattr(args,'deny_resource',None) or (),
+        ssrf=getattr(args,'ssrf_destination',None) or (),path_prefix=getattr(args,'path_prefix',None) or '/',
+        page=getattr(args,'page_resource',None) or ())
+    validate_resource_launch(args,{'policy':prepared['policy']})
+    target=prepared['target']
+    from executor.netguard_root import authorize_resource
+    if prepared['policy']['origins']:
+        first=resources.parse(prepared['policy']['origins'][0]['origin'])
+        authorize_resource(prepared['policy'],'http',target,scheme=first['scheme'],hostname=first['host'],port=first['port'],
+                           path=prepared['entry'].get('request_path','/'))
+    else:authorize_resource(prepared['policy'],'tcp_full',target)
     heading('Создание задачи')
     # Interactive mode already composed limits and hints; the CLI passes them
     # separately, so normalise here instead of duplicating the logic.
@@ -1521,18 +1637,19 @@ def op_new(args, *, defer_execution=False):
     objective_numbers(args)
     key = session_api_key(args, required=True)
     task_id, plan = run_planner_with_validation_retry(
-        target, task_text, key, getattr(args, 'planner_context', None))
+        target, task_text, key, {**(getattr(args,'planner_context',None) or {}),'resource_scope':prepared})
     from orchestrator import coordinated_attack, task_runtime
     args.task_id=task_id
     with coordinated_attack.task_lock(task_id), diagnostics.scope(task_id=task_id), connect() as db:
         if task_target(db, task_id) != target:
             raise OperatorError('IP цели в SQLite не соответствует запросу; запуск запрещён')
         task_runtime.save_mode(db,task_id,mode)
+        resources.save(db,task_id,prepared)
         args.coordinated=mode=='coordinated'
-        configured = configure(db, task_id, args, create_scope=True, plan=plan)
         save_task_intent(db, task_id, task_text)
         save_flag_options(db, task_id, args)
         save_objective_options(db, task_id, args, str(args.task).splitlines()[0])
+        configured = configure(db, task_id, args, create_scope=True, plan=plan)
         if not defer_execution:
             launch_configured_task(db, task_id, configured, args)
             line(f'Продолжить позже: pentest-master → [02] задача {task_id}')
@@ -1548,6 +1665,8 @@ def op_resume(args):
         validate_launch_options(args,mode)
         args.coordinated=mode=='coordinated'
         task_target(db,args.task_id)
+        from orchestrator import resources
+        validate_resource_launch(args,resources.saved(db,args.task_id))
         from orchestrator import agent_actions
         flag_review.reconcile(db,args.task_id,flag_review.local_log(db,args.task_id,
             agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl'))
@@ -1778,6 +1897,59 @@ def complete_pending_transition(db, old_id, new_id, *, broker_call=None,
 
 @diagnostics.stage
 def op_change_ip(args):
+    """Explicit new address for the same logical machine, without a new plan."""
+    from orchestrator import resources,service_inventory,coordinated_attack,task_runtime,task_memory
+    new_ip=validate_target(args.target)
+    if resources.parse(new_ip)['kind']!='address':raise OperatorError('Смена IP требует конкретный IPv4/IPv6')
+    with coordinated_attack.task_lock(args.task_id),connect() as db:
+        # Keep resumable legacy successor transitions working; never discard their state.
+        if task_memory.exists(db,'pm_task_lineage') and db.execute('SELECT 1 FROM pm_task_lineage WHERE previous_task_id=?',(args.task_id,)).fetchone():
+            return op_change_ip_successor(args)
+        if getattr(args,'archive_work',False) or getattr(args,'sync_burp',False):
+            raise OperatorError('Для смены IP той же машины --archive-work/--sync-burp не поддерживаются; файлы сохраняются на месте')
+        if task_memory.exists(db,'pm_coordinator_steps') and any(r['status']=='running' for r in coordinated_attack.steps(db,args.task_id)):
+            raise OperatorError('Сначала разберите running-шаг с неизвестным исходом; смена IP его не завершает')
+        old_ip=task_target(db,args.task_id)
+        prior=resources.saved(db,args.task_id)
+        ports=[e['port'] for e in service_inventory.collect_full(db,args.task_id)['entries'] if e['protocol']=='tcp']
+        if prior:ports.extend(resources.parse(o['origin'])['port'] for o in prior['policy']['origins'])
+        if old_ip==new_ip:raise OperatorError('Новый IP совпадает с текущим')
+        if prior:
+            from executor.netguard_root import resource_denied
+            if resource_denied(prior['policy'],{'host':new_ip,'path':'/','origin':f'http://{new_ip}:80'}):
+                raise OperatorError('Новый адрес исключён условиями комнаты')
+            if prior['policy']['area']=='lab' and prior['policy']['networks'] and not any(ipaddress.ip_address(new_ip) in ipaddress.ip_network(n) for n in prior['policy']['networks']):
+                raise OperatorError('Новый адрес вне границ лаборатории; нужен вопрос оператору о pivoting/scope')
+        # Validate route before changing persisted scope or isolation.
+        args.egress=getattr(args,'egress',None) or get_egress(new_ip)
+        approval=db.execute('SELECT target,closed_at FROM pm_operator_approvals WHERE task_id=?',(args.task_id,)).fetchone()
+        if not approval or approval!=(old_ip,None):raise OperatorError('У задачи нет действующего scope')
+        broker_is_trusted();sudo_authenticate()
+        capabilities,_=sudo_checked(['capabilities'])
+        if capabilities.get('resource_policy_protocol')!=1:
+            raise OperatorError('Обновите NetGuard до изменения сетевых правил; текущая задача сохранена')
+        result,_=sudo_checked(['teardown','--task-id',str(args.task_id)],timeout=45)
+        if result.get('status')!='removed':raise OperatorError('NetGuard не подтвердил снятие прежних сетевых правил')
+        with db:
+            resources.rebind(db,args.task_id,new_ip,ports)
+            db.execute('DELETE FROM pm_operator_approvals WHERE task_id=?',(args.task_id,))
+            if task_memory.exists(db,'pm_coordinator_steps'):
+                db.execute("UPDATE pm_coordinator_steps SET status='failed',error='address_changed_not_started' WHERE task_id=? AND status='planned'",(args.task_id,))
+        configure(db,args.task_id,args,create_scope=True)
+        meta=task_runtime.saved(db,args.task_id)
+        args.coordinated=bool(meta and meta['mode']=='coordinated')
+        task_memory.sync(db,args.task_id,resources_path(db,args.task_id),reason='operator_same_machine_address_change')
+        line(f'  Машина задачи #{args.task_id}: {old_ip} → {new_ip}. История и файлы сохранены; доступ требует проверки живости.')
+        return launch_configured_task(db,args.task_id,new_ip,args)
+
+
+def resources_path(db,task_id):
+    from orchestrator.flag_review import local_log
+    return local_log(db,task_id)
+
+
+@diagnostics.stage
+def op_change_ip_successor(args):
     """Linked successor task: keep evidence honest across a machine reboot.
 
     Old evidence/report rows retain their original target and are not used as
@@ -2521,6 +2693,7 @@ def op_questions(args):
             for item in rows:
                 line(f"  Вопрос #{item['id']} [{item['status']}] {safe_display(item['kind'])} · {safe_display(item['branch_id'])}")
                 line('    '+safe_display(item['question'])+' · '+safe_display(item['reason']))
+                if item.get('resource'):line('    Ресурс: '+diagnostics.clean(item['resource']['value'],limit=None))
                 render_flag_candidate(item)
                 line('    Границы: '+safe_display(json.dumps(item['boundaries'],ensure_ascii=False)))
                 line('    Ссылки: '+', '.join(safe_display(ref) for ref in item['references']))
@@ -2934,6 +3107,14 @@ def parser_main():
     reparse.add_argument('--path')
     new = sub.add_parser('new', help='Создать задачу через GLM и начать разведку после подтверждения')
     new.add_argument('--target', required=True)
+    new.add_argument('--area',choices=('web','host','lab'),help='Область исследования: веб-ресурс, хост, среда лаборатории')
+    new.add_argument('--address',action='append',help='Явный закреплённый IPv4/IPv6 вместо DNS; повторяется')
+    new.add_argument('--allow-network',action='append',help='Разрешённая сеть лаборатории; только --area lab')
+    new.add_argument('--allow-resource',action='append',help='Дополнительный разрешённый URL или IP лаборатории')
+    new.add_argument('--page-resource',action='append',help='Разрешить загрузку одного точного URL зависимости страницы без исследования её узла')
+    new.add_argument('--deny-resource',action='append',help='Явное исключение комнаты: домен, URL-путь или IP/сеть')
+    new.add_argument('--ssrf-destination',action='append',help='Точный URL назначения SSRF через исходное приложение, включая target loopback')
+    new.add_argument('--path-prefix',help='Явная граница HTTP-путей комнаты, например /app/; query остаётся данными')
     new.add_argument('--task', required=True)
     new.add_argument('--hints', help='Зацепки оператора для агентов (проверяются инструментами)')
     new.add_argument('--hints-file', help='Файл подсказок UTF-8 с переносами строк')
@@ -3137,8 +3318,22 @@ def interactive():
         )
         try:
             if choice == '1':
-                args.target = validate_target(input('IP лабораторной машины: ').strip())
-                args.coordinated=interactive_mode()
+                args.target = validate_target(input('IPv4 / IPv6 / домен / URL: ').strip())
+                area=input('Область исследования: 1 — веб-ресурс, 2 — хост, 3 — среда лаборатории (Enter — по вводу): ').strip()
+                if area not in ('','1','2','3'):raise OperatorError('Выберите область 1, 2 или 3')
+                args.area={'1':'web','2':'host','3':'lab'}.get(area)
+                from orchestrator import resources
+                entry=resources.parse(args.target)
+                selected_area=args.area or ('host' if entry['kind']=='address' else 'web')
+                if selected_area=='host' and not resources.concrete_host(entry):
+                    args.address=[x.strip() for x in input('Явные IP этой машины (через запятую; DNS не даёт разрешение на весь IP): ').split(',') if x.strip()]
+                    if not args.address:raise OperatorError('Для области host у домена нужен явный IP машины')
+                if args.area=='lab':
+                    args.allow_network=[n.strip() for n in input('Границы лаборатории (CIDR через запятую): ').split(',') if n.strip()]
+                if resources.web_entry(entry,selected_area,getattr(args,'address',None)):
+                    args.coordinated=True
+                    line('  Веб-точка входа: координатор и HTTP capture, без полного скана IP.')
+                else:args.coordinated=interactive_mode()
                 task = input('Что требуется сделать: ').strip()
                 side = input('Дополнительные флаги-цели (вес:описание через ; Enter — нет): ').strip()
                 if side:

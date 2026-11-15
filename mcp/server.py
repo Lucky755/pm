@@ -585,11 +585,6 @@ def run_network_probe(
     try:
         address = ipaddress.ip_address(target)
 
-        if address.version != 4:
-            raise ValueError(
-                "Only IPv4 targets are supported"
-            )
-
         target = str(address)
 
     except ValueError:
@@ -723,7 +718,7 @@ def valid_task(task_id):
 
 def valid_ipv4(text):
     try:
-        return str(ipaddress.IPv4Address(text))
+        return str(ipaddress.ip_address(text))
     except (ipaddress.AddressValueError, ValueError, TypeError):
         return None
 
@@ -963,6 +958,17 @@ def track_memory_operation(function):
                 return function(command,timeout,tool,task_id)
             row=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()
             if not row:return function(command,timeout,tool,task_id)
+            from orchestrator import resources
+            def option(name,default=''):
+                try:return command[list(command).index('--'+name)+1]
+                except (ValueError,IndexError):return default
+            profile=option('profile',tool)
+            if profile!='research' and not (tool in ('session','callback') and option('action') in ('read','list','close','interrupt')):
+                try:
+                    resources.authorize(db,task_id,'http' if profile.startswith(('http','https')) else profile,
+                        option('target',row[0]),scheme=option('scheme','http'),hostname=option('hostname'),
+                        port=int(option('port','80')),path=option('path','/'))
+                except ValueError as exc:return response(tool,'blocked',1,stderr=str(exc))
             # Provenance is known only after a result; it never grants a retry.
             description=task_memory.canonical_operation(tool,command,row[0],provenance='unknown')
             task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='execution_reconcile')
@@ -1495,8 +1501,8 @@ def pm_http_capture(
 ) -> str:
     """Save one bounded HTTP(S) GET as original evidence through NetGuard.
 
-    Exact authorized task target; only approved hostnames. No query, request
-    body, custom headers, redirects or shell. Returns artifact_ref and result_id.
+    Authorized task resource and pinned Host/SNI. Query is preserved; a fragment
+    is browser-only. No body, custom headers, redirects or shell. Returns artifact_ref and result_id.
     A previously saved URL is read from the artifact store without another GET.
     """
     from contextlib import closing
@@ -1511,11 +1517,8 @@ def pm_http_capture(
             raise web.CaptureRefused('Invalid task, target or missing task database')
         with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
             # Permission validation precedes asset-recheck consumption and I/O.
-            if address != web.validate_scope(db,task_id):
-                raise web.CaptureRefused('Target differs from authorized task scope')
             host=hostname or address
-            if scheme not in ('http','https') or host not in web.permitted_hosts(db,task_id,address):
-                raise web.CaptureRefused('HTTP hostname/scheme is outside approved scope')
+            web.validate_endpoint(db,task_id,address,scheme,host,port,path)
             path=web._safe_path(path)
             if type(port) is not int or not 1 <= port <= 65535:
                 raise web.CaptureRefused('Invalid TCP port')
@@ -1532,6 +1535,38 @@ def pm_http_capture(
         payload={'status':'error','kind':'broker','error':str(exc)[:240],'task_id':task_id,'target':target}
     record_id=log_capability('http_capture',task_id,payload,time.monotonic()-started,command)
     return tool_response(capability_digest(payload,record_id,'http_capture'))
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_http_ssrf(task_id:int,application:str,destination:str,parameter:str='url',context:str='') -> str:
+    """One bounded SSRF GET via an authorized application and explicit destination.
+
+    The destination is reached by the target application, never by Kali directly.
+    Target-relative loopback needs an explicit grant; arbitrary destinations are denied.
+    """
+    from orchestrator import resources, http_discovery as web
+    start=time.monotonic();command=['http_ssrf','--application',application,'--destination',destination]
+    try:
+        if not valid_task(task_id) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,63}',parameter):raise ValueError('Invalid SSRF parameters')
+        source=resources.parse(application);inner=resources.parse(destination)
+        if source['kind']!='url' or inner['kind']!='url':raise ValueError('SSRF requires explicit application and destination URLs')
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            scope=resources.saved(db,task_id)
+            if not scope:raise ValueError('SSRF requires saved resource scope')
+            endpoint=next((o for o in scope['policy']['origins'] if o['origin']==source['origin']),None)
+            if not endpoint:raise ValueError('SSRF application is not an authorized origin')
+            target=endpoint['addresses'][0];context=context or scope['policy']['machine']
+            route={'destination':inner['request_url'],'context':context,'parameter':parameter}
+            web.validate_endpoint(db,task_id,target,source['scheme'],source['host'],source['port'],source['request_path'],
+                                  destination=inner['request_url'],context=context)
+            payload=web.capture_explicit(db,task_id,target,source['scheme'],source['host'],source['port'],source['request_path'],ssrf=route)
+    except (ValueError,web.CaptureRefused) as exc:
+        payload={'status':'blocked','kind':'policy','error':str(exc),'task_id':task_id}
+    except (OSError,sqlite3.Error,subprocess.SubprocessError) as exc:
+        payload={'status':'error','kind':'broker','error':str(exc)[:240],'task_id':task_id}
+    rid=log_capability('http_ssrf',task_id,payload,time.monotonic()-start,command)
+    return tool_response(capability_digest(payload,rid,'http_ssrf'))
 
 
 @mcp.tool()
