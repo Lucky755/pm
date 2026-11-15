@@ -12,7 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-from urllib.parse import unquote, quote, urlsplit, urlencode
+from urllib.parse import unquote, quote, urlsplit, urlencode, parse_qsl
 import pwd
 import re
 import shutil
@@ -20,6 +20,7 @@ import signal
 import socket
 import stat
 import selectors
+import shlex
 import subprocess
 import sys
 import time
@@ -81,6 +82,347 @@ CALLBACK_PORTS = range(1024, 65536)
 CALLBACK_MAX_BYTES = 4 * 1024 * 1024
 CALLBACK_DIR = Path('/var/lib/pentest-master/callbacks')
 
+# Acquisition is a separate operator-granted capability, never generic root exec.
+TOOL_PROTOCOL = 1
+TOOL_MAX_BYTES = 16 * 1024 * 1024
+SYSTEM_TOOLS = {'nmap': '/usr/bin/nmap', 'curl': '/usr/bin/curl', 'jq': '/usr/bin/jq'}
+APT_CACHE = Path('/var/cache/apt/archives')
+TOOL_ENV = {'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','DEBIAN_FRONTEND':'noninteractive'}
+RAW_SCAN_PROFILES = ('nmap_syn', 'nmap_udp', 'nmap_os')
+
+
+class ToolError(ValueError):
+    def __init__(self, category, message):
+        self.category = category
+        super().__init__(message)
+
+
+def tool_spec(raw):
+    """Shared pure validator, also imported by the unprivileged PM frontend."""
+    if not isinstance(raw, dict): raise ToolError('invalid_request', 'Tool request must be an object')
+    common = {'kind', 'name', 'purpose', 'version'}
+    if not common <= raw.keys(): raise ToolError('invalid_request', 'Missing kind/name/purpose/version')
+    kind = raw['kind']
+    fields = common if kind == 'system_package' else common | {'source', 'channel', 'filename', 'sha256', 'interpreter'}
+    if set(raw) != fields or kind not in ('user_tool', 'documentation', 'system_package'):
+        raise ToolError('invalid_request', 'Unsupported tool specification fields')
+    if not isinstance(raw['name'], str) or not POC_NAME.fullmatch(raw['name']):
+        raise ToolError('invalid_request', 'Invalid tool name')
+    for key, limit in [('purpose', 1000), ('version', 120)]:
+        value = raw[key]
+        if not isinstance(value, str) or not value.strip() or len(value) > limit or any(ord(c) < 32 for c in value):
+            raise ToolError('invalid_request', 'Invalid '+key)
+    spec = dict(raw)
+    if kind == 'system_package':
+        if spec['name'] not in SYSTEM_TOOLS or not re.fullmatch(r'[A-Za-z0-9.+:~_-]+', spec['version']):
+            raise ToolError('invalid_request', 'Unsupported package/version (use candidate or an exact version)')
+        return spec
+    if not isinstance(spec['filename'], str) or not POC_NAME.fullmatch(spec['filename']):
+        raise ToolError('invalid_request', 'Invalid filename')
+    if spec['interpreter'] not in ('none', 'direct', 'python3', 'bash', 'perl', 'ruby'):
+        raise ToolError('invalid_request', 'Unsupported interpreter')
+    if kind == 'documentation' and spec['interpreter'] != 'none' or kind == 'user_tool' and spec['interpreter'] == 'none':
+        raise ToolError('invalid_request', 'Documentation is data; user tools require an invocation')
+    if not isinstance(spec['sha256'], str) or spec['sha256'] and not re.fullmatch(r'[a-f0-9]{64}', spec['sha256']):
+        raise ToolError('invalid_request', 'Invalid optional SHA256')
+    source = spec['source']
+    if not isinstance(source, str) or len(source) > 2048 or any(ord(c) <= 32 for c in source):
+        raise ToolError('invalid_request', 'Invalid source URL')
+    try: url = urlsplit(source); port = url.port
+    except ValueError: raise ToolError('invalid_request', 'Invalid source URL')
+    if url.username or url.password or url.fragment:
+        raise ToolError('invalid_request', 'Credentials and fragments are not download permissions')
+    if any(re.search(r'token|api.?key|auth|password|secret|signature|cookie', key, re.I) for key,_ in parse_qsl(url.query)):
+        raise ToolError('invalid_request', 'Secret-bearing source URLs are unsupported; use an operator-provided local file')
+    channel = spec['channel']
+    if channel == 'local_file':
+        if url.scheme != 'file' or url.netloc or not url.path.startswith('/') or url.query:
+            raise ToolError('invalid_request', 'local_file requires an absolute file:/// URL')
+    elif channel == 'kali_local':
+        if url.scheme != 'http' or url.hostname not in ('127.0.0.1', '::1', 'localhost'):
+            raise ToolError('network_denied', 'kali_local grants only a Kali loopback HTTP source')
+    elif channel == 'internet':
+        if url.scheme != 'https' or not url.hostname:
+            raise ToolError('network_denied', 'Internet acquisitions require one exact HTTPS URL')
+        if url.hostname.lower() == 'localhost': raise ToolError('network_denied', 'Use explicit kali_local channel')
+        try:
+            if not ipaddress.ip_address(url.hostname).is_global:
+                raise ToolError('network_denied', 'Laboratory/private sources use task isolation, not acquisition egress')
+        except ValueError as exc:
+            if isinstance(exc, ToolError): raise
+    else: raise ToolError('invalid_request', 'Unknown source channel')
+    return spec
+
+
+def tool_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def tool_receipt_path(task, request_id):
+    if not re.fullmatch(r'[a-f0-9]{64}', request_id): raise ToolError('invalid_request', 'Invalid broker request ID')
+    return BASE / f'tool-{int(task)}-{request_id}.json'
+
+
+def tool_store(path, data):
+    # Parent is a root-owned private broker directory, not the user's workspace.
+    parent = path.parent.stat()
+    if parent.st_uid != os.geteuid() or parent.st_mode & 0o077 or path.parent.is_symlink():
+        raise ToolError('permission_denied', 'Unsafe broker receipt directory')
+    temporary = path.with_suffix('.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(data, stream); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def tool_load(path):
+    if path.is_symlink(): raise ToolError('permission_denied', 'Unsafe receipt')
+    info = path.stat()
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ToolError('permission_denied', 'Unsafe receipt permissions')
+    return json.loads(path.read_text())
+
+
+def tool_package_plan(name, version):
+    """APT is only a local metadata reader here. No update, repository edit or download."""
+    if version == 'candidate':
+        policy = cmd('/usr/bin/apt-cache', 'policy', name, env=TOOL_ENV).stdout
+        match = re.search(r'^\s*Candidate:\s*(\S+)', policy, re.M)
+        if not match or match[1] == '(none)': raise ToolError('tool_missing', 'No package candidate in configured APT metadata')
+        version = match[1]
+    exact = name + '=' + version
+    args = ['/usr/bin/apt-get', '--yes', '--no-install-recommends', '--no-remove',
+            '-o', 'APT::Get::AllowUnauthenticated=false']
+    # --print-uris is not execution: APT checks metadata/authentication and prints
+    # the exact archives, including dependencies. All downloads below are pinned.
+    text = cmd(*args, '--print-uris', '--download-only', 'install', exact, timeout=40, env=TOOL_ENV).stdout
+    archives = []
+    for line in text.splitlines():
+        if not line.startswith("'"): continue
+        parts = shlex.split(line)
+        if len(parts) != 4 or not parts[2].isdigit(): raise ToolError('installation_failed', 'Unrecognized APT URI record')
+        url, filename, size, _ = parts
+        if not re.fullmatch(r'[a-z0-9][a-z0-9+.-]*_[A-Za-z0-9%+.:~=-]+_[a-z0-9]+\.deb', filename):
+            raise ToolError('installation_failed', 'Unsafe APT filename')
+        # Use SHA256 from the same local APT metadata, never a model-supplied hash.
+        pkg = filename.split('_')[0]
+        metadata = cmd('/usr/bin/apt-cache', 'show', pkg, timeout=20, env=TOOL_ENV).stdout
+        matches = []
+        for record in metadata.split('\n\n'):
+            values = dict(line.split(': ', 1) for line in record.splitlines() if ': ' in line and not line.startswith(' '))
+            if (unquote(values.get('Filename', '')).rsplit('/', 1)[-1] == unquote(urlsplit(url).path).rsplit('/', 1)[-1]
+                    and values.get('Size') == size and re.fullmatch(r'[a-f0-9]{64}', values.get('SHA256', ''))):
+                matches.append(values)
+        identities={tuple(m.get(k) for k in ('Package','Version','SHA256','Size','Filename')) for m in matches}
+        if len(identities) != 1: raise ToolError('installation_failed', 'Cannot bind APT archive to one SHA256 metadata record')
+        values = matches[0]
+        if (urlsplit(url).scheme not in ('http', 'https') or urlsplit(url).username or urlsplit(url).password
+                or any(re.search(r'token|api.?key|auth|password|secret|signature|cookie', key, re.I)
+                       for key,_ in parse_qsl(urlsplit(url).query))):
+            raise ToolError('network_denied', 'Only exact HTTP(S) APT archive resources are supported')
+        archives.append({'url': url, 'filename': filename, 'bytes': int(size), 'sha256': values['SHA256'],
+                         'package': values['Package'], 'version': values['Version']})
+    if len(archives) > 32 or sum(a['bytes'] for a in archives) > 256 * 1024 * 1024:
+        raise ToolError('installation_failed', 'Package acquisition exceeds bounded transaction; ask operator for another approach')
+    return {'package': name, 'version': version, 'archives': archives}
+
+
+def tool_prepare(task, raw):
+    ensure_root(); _, config = owned_config(task)
+    if os.environ.get('SUDO_UID') and int(os.environ['SUDO_UID']) != config['uid']:
+        raise ToolError('permission_denied', 'Invoker is not the configured task owner')
+    spec = tool_spec(raw)
+    manifest = {'spec': spec, 'task_id': task, 'owner_uid': config['uid'], 'protocol': TOOL_PROTOCOL}
+    if spec['kind'] == 'system_package':
+        manifest['package_plan'] = tool_package_plan(spec['name'], spec['version'])
+        manifest.update(destination=SYSTEM_TOOLS[spec['name']], invocation=[SYSTEM_TOOLS[spec['name']]],
+            privileges='root: configured APT package and listed dependencies, including package scripts; no arbitrary PoC',
+            actions=['download listed archives, verify SHA256', 'APT install exact version with --no-download in a networkless namespace'])
+    else:
+        relative = ('docs' if spec['kind'] == 'documentation' else 'tools')+'/'+spec['name']+'/'+spec['filename']
+        invocation = [] if spec['kind'] == 'documentation' else (
+            ['/work/'+relative] if spec['interpreter'] == 'direct' else ['/usr/bin/'+spec['interpreter'], '/work/'+relative])
+        manifest.update(destination='/work/'+relative, host_destination=str(WORK_BASE / str(task) / relative),
+            invocation=invocation, privileges='task user; broker writes one file, never runs downloaded code as root',
+            actions=['read exact source without redirects', 'verify optional SHA256; atomic non-overwriting workspace write'])
+        if spec['channel'] == 'local_file':
+            data = tool_read_local(spec['source'], config['uid'])
+            manifest['local_sha256'] = hashlib.sha256(data).hexdigest()
+    request_id = tool_digest(manifest); path = tool_receipt_path(task, request_id)
+    if path.exists(): return tool_load(path)
+    receipt = {'request_id': request_id, 'manifest': manifest, 'status': 'prepared', 'result': None}
+    tool_store(path, receipt)
+    return receipt
+
+
+def tool_read_local(source, uid):
+    # No root read of arbitrary user-chosen paths, symlink traversal or devices.
+    path = Path(unquote(urlsplit(source).path))
+    current = Path('/')
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink(): raise ToolError('permission_denied', 'Local source must not traverse symlinks')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if info.st_uid != uid or not stat.S_ISREG(info.st_mode):
+            raise ToolError('permission_denied', 'Local source must be a regular file owned by the task user')
+        data = stream.read(TOOL_MAX_BYTES + 1)
+    if len(data) > TOOL_MAX_BYTES: raise ToolError('download_failed', 'Source exceeds size limit')
+    return data
+
+
+def tool_download(url, channel, config, limit=TOOL_MAX_BYTES):
+    """Normal Kali route, exact pinned URL only. Never used for laboratory traffic."""
+    parsed = urlsplit(url); host = parsed.hostname; port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    ips = sorted({item[4][0] for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
+    if not ips: raise ToolError('download_failed', 'Source DNS returned no address')
+    for value in ips:
+        ip = ipaddress.ip_address(value)
+        if channel == 'kali_local':
+            allowed = ip.is_loopback
+        else:
+            allowed = ip.is_global and not any(ip in ipaddress.ip_network(net) for net in config['allowed']
+                if ip.version == ipaddress.ip_network(net).version)
+        if not allowed: raise ToolError('network_denied', 'Source resolves outside the granted acquisition channel')
+    target = ips[0]; pinned = '['+target+']' if ':' in target else target
+    argv = ['/usr/bin/curl', '-q', '--globoff', '--path-as-is', '--silent', '--show-error', '--fail',
+        '--noproxy', '*', '--proto', '=https,http' if channel in ('kali_local', 'apt') else '=https',
+        '--max-redirs', '0', '--connect-timeout', '5', '--max-time', '45', '--include',
+        '--max-filesize', str(limit)]
+    try: ipaddress.ip_address(host)
+    except ValueError: argv += ['--resolve', f'{host}:{port}:{pinned}']
+    argv += ['--', url]
+    # curl reads no user config and receives no keys/cookies/proxy credentials.
+    result = capture_process(argv, limit, acquisition=True, process_env=TOOL_ENV)
+    if result.get('exit_code') != 0 or result.get('capture_truncated'):
+        raise ToolError('download_failed', 'Source transfer failed or exceeded the limit')
+    wire = base64.b64decode(result['response_b64'])
+    while True:
+        headers, separator, data = wire.partition(b'\r\n\r\n')
+        match = re.match(rb'HTTP/\S+ (\d{3})', headers)
+        if not separator or not match: raise ToolError('download_failed', 'Invalid HTTP response')
+        code = int(match[1])
+        if 100 <= code < 200: wire = data; continue
+        if not 200 <= code < 300: raise ToolError('download_failed', f'Source returned HTTP {code}; redirects need a separate request')
+        if len(data) > limit:raise ToolError('download_failed', 'Source exceeds approved size limit')
+        return data
+
+
+def tool_write_file(workdir, relative, data, config, executable=False):
+    """fd-relative writes: a task-user symlink can never redirect a root write."""
+    parts = relative.split('/')
+    if any(not POC_NAME.fullmatch(p) for p in parts): raise ToolError('invalid_request', 'Unsafe destination')
+    directory = os.open(workdir, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            created = False
+            try: os.mkdir(part, 0o700, dir_fd=directory); created = True
+            except FileExistsError: pass
+            child = os.open(part, os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            if created:os.fchown(child, config['uid'], config['gid'])
+            info = os.fstat(child)
+            if info.st_uid != config['uid'] or info.st_mode & 0o077:
+                os.close(child); raise ToolError('permission_denied', 'Unsafe workspace directory')
+            os.close(directory); directory = child
+        name = parts[-1]; temporary = '.'+name+'.install'
+        try:
+            existing = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError: existing = None
+        if existing is not None:
+            with os.fdopen(existing, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if (info.st_uid != config['uid'] or not stat.S_ISREG(info.st_mode)
+                        or stream.read(len(data)+1) != data):
+                    raise ToolError('integrity_error', 'Destination already contains different bytes; never overwritten')
+            return
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o700 if executable else 0o600, dir_fd=directory)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                os.fchown(stream.fileno(), config['uid'], config['gid'])
+            os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+        finally: os.unlink(temporary, dir_fd=directory)
+    finally: os.close(directory)
+
+
+def tool_action(task, action, request_id):
+    ensure_root(); _, config = owned_config(task)
+    if os.environ.get('SUDO_UID') and int(os.environ['SUDO_UID']) != config['uid']:
+        raise ToolError('permission_denied', 'Invoker is not the configured task owner')
+    path = tool_receipt_path(task, request_id)
+    # Serialize apply/authorize across CLI and MCP processes, not just SQLite.
+    import fcntl
+    lock = os.open(str(path)+'.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        receipt = tool_load(path); manifest = receipt['manifest']; spec = manifest['spec']
+        if manifest['task_id'] != task or manifest['owner_uid'] != config['uid'] or tool_digest(manifest) != request_id:
+            raise ToolError('permission_denied', 'Receipt does not match this task/owner')
+        if action == 'authorize':
+            if receipt['status'] == 'prepared':
+                receipt['status'] = 'approved'; tool_store(path, receipt)
+            return receipt
+        if action == 'status': return receipt
+        if action != 'apply': raise ToolError('invalid_request', 'Invalid tool action')
+        if receipt['status'] != 'approved':
+            return receipt # completed/failed/running are never automatically replayed
+        receipt['status'] = 'running'; tool_store(path, receipt)
+        try:
+            if spec['kind'] == 'system_package':
+                plan = manifest['package_plan']
+                if tool_package_plan(spec['name'], plan['version']) != plan:
+                    raise ToolError('conditions_changed', 'APT transaction changed; a new permission is required')
+                # Cache is root-owned; filename validated by the metadata planner.
+                cache = APT_CACHE
+                info = cache.stat()
+                if cache.is_symlink() or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                    raise ToolError('permission_denied', 'Unsafe APT archive cache')
+                for archive in plan['archives']:
+                    data = tool_download(archive['url'], 'apt', config, archive['bytes'])
+                    if len(data) != archive['bytes'] or hashlib.sha256(data).hexdigest() != archive['sha256']:
+                        raise ToolError('integrity_error', 'APT archive hash/size differs from approved metadata')
+                    destination = cache / archive['filename']
+                    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+                    with os.fdopen(fd, 'wb') as stream: stream.write(data)
+                # No network, arbitrary package arguments, scripts or repository changes supplied by the agent.
+                cmd('/usr/bin/unshare', '--net', '/usr/bin/apt-get', '--yes', '--no-download', '--no-remove',
+                    '--no-install-recommends', '-o', 'APT::Get::AllowUnauthenticated=false',
+                    '-o','Dpkg::Options::=--force-confdef','-o','Dpkg::Options::=--force-confold',
+                    'install', plan['package']+'='+plan['version'], timeout=180, env=TOOL_ENV)
+                version = cmd('/usr/bin/dpkg-query', '-W', '-f=${Version}', plan['package'], env=TOOL_ENV).stdout.strip()
+                if version != plan['version']: raise ToolError('installation_failed', 'Installed package version differs')
+                receipt['result'] = {'version': version, 'version_provenance': 'dpkg-query', 'invocation': manifest['invocation'],
+                    'source': {'archives':plan['archives'],'basis':'configured APT metadata and existing root cache',
+                               'original_repository_for_preexisting_packages':'unknown'}, 'working_directory': '/work'}
+            else:
+                data = (tool_read_local(spec['source'], config['uid']) if spec['channel'] == 'local_file'
+                        else tool_download(spec['source'], spec['channel'], config))
+                sha = hashlib.sha256(data).hexdigest()
+                if any(value and sha != value for value in (spec['sha256'], manifest.get('local_sha256'))):
+                    raise ToolError('integrity_error', 'Source differs from approved hash')
+                work = task_workdir(task, config)
+                tool_write_file(work, manifest['destination'].removeprefix('/work/'), data, config,
+                                spec['kind'] == 'user_tool' and spec['interpreter'] == 'direct')
+                receipt['result'] = {'version': spec['version'], 'version_provenance': 'declared; not executed to discover version',
+                    'sha256': sha, 'bytes': len(data), 'source': spec['source'], 'path': manifest['destination'],
+                    'invocation': manifest['invocation'], 'working_directory': '/work'}
+            receipt['status'] = 'completed'
+        except Exception as exc:
+            category = exc.category if isinstance(exc, ToolError) else 'permission_denied' if isinstance(exc, PermissionError) else (
+                'outcome_unknown' if isinstance(exc, subprocess.TimeoutExpired) else 'installation_failed')
+            receipt.update(status='unknown' if category == 'outcome_unknown' else 'failed',
+                           result={'reason_category': category,
+                                   'reason': str(exc)[:800] if isinstance(exc, ToolError) else type(exc).__name__+': installation failed; no automatic retry',
+                                   'exit_code': getattr(exc, 'returncode', None)})
+        tool_store(path, receipt)
+        return receipt
+    finally: os.close(lock)
+
 
 def output(data, fail=False):
     print(json.dumps(data, ensure_ascii=False, indent=2), flush=True)
@@ -88,9 +430,9 @@ def output(data, fail=False):
         raise SystemExit(1)
 
 
-def cmd(*args, input=None, timeout=20, check=True):
+def cmd(*args, input=None, timeout=20, check=True, env=None):
     p = subprocess.run(args, input=input, text=True, capture_output=True,
-                       timeout=timeout, check=False)
+                       timeout=timeout, check=False, **({'env':env} if env is not None else {}))
     if check and p.returncode:
         raise RuntimeError(f'{args[0]} failed ({p.returncode}): {p.stderr[-1200:]}')
     return p
@@ -991,6 +1333,13 @@ def tool_args(profile, target, port, ports, scheme, path="/", hostname="", captu
                     '--host-timeout', '25s', '-p', selected, target]
         return ['/usr/bin/nmap', *nmap6, '-sT', '-sV', '--version-light', '-Pn', '-n', '--open',
                 '--max-retries', '1', '--host-timeout', '30s', '-p', selected, target]
+    if profile in RAW_SCAN_PROFILES:
+        selected = valid_ports(ports)
+        if profile == 'nmap_udp' and len(selected.split(',')) > 8:
+            raise ValueError('UDP profile supports at most eight explicit ports')
+        flags = {'nmap_syn': ['-sS'], 'nmap_udp': ['-sU'], 'nmap_os': ['-sS', '-O', '--osscan-limit']}[profile]
+        return ['/usr/bin/nmap', '--datadir', '/usr/share/nmap', *nmap6, *flags, '-Pn', '-n',
+                '--open', '--max-retries', '1', '--host-timeout', '30s', '-p', selected, target]
     if profile not in ('http_headers', 'http_get', 'https_headers', 'http_path', 'http_document', 'http_capture'):
         raise ValueError('Unknown profile')
     selected = valid_port(port)
@@ -1055,6 +1404,29 @@ def isolated_command(name, user, uid, gid, args, extra=(), workdir=None,
             '--ro-bind-try', '/etc/hosts', '/etc/hosts',
             '--proc', '/proc', '--dev', '/dev', '--dir', '/tmp',
             *work_mount, *extra, '--chdir', '/work', '--', *args]
+
+
+def privileged_scan_command(name, args, workdir):
+    """Fixed Nmap profiles only. CAP_NET_RAW in the task netns, no user namespace.
+
+    The readonly workspace prevents root-owned agent output. DAC_OVERRIDE only
+    permits traversal of the owner's 0700 workspace; every host mount is readonly.
+    Generic exec, PoC and sessions keep their existing unprivileged builder.
+    """
+    if (args[0] != '/usr/bin/nmap' or '--datadir' not in args or
+            any(arg in args for arg in ('--script', '-iL', '-oN', '-oX', '-oA'))):
+        raise ValueError('Only fixed Nmap profiles support privileged execution')
+    return ['/usr/sbin/ip', 'netns', 'exec', name, '/usr/bin/bwrap',
+            '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try',
+            '--die-with-parent', '--new-session', '--cap-drop', 'ALL',
+            '--cap-add', 'CAP_NET_RAW', '--cap-add', 'CAP_DAC_OVERRIDE',
+            '--clearenv', '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'HOME', '/tmp',
+            '--setenv', 'LC_ALL', 'C', '--tmpfs', '/', '--ro-bind', '/usr', '/usr',
+            '--ro-bind-try', '/bin', '/bin', '--ro-bind-try', '/lib', '/lib',
+            '--ro-bind-try', '/lib64', '/lib64', '--dir', '/etc',
+            '--ro-bind-try', '/etc/ld.so.cache', '/etc/ld.so.cache',
+            '--proc', '/proc', '--remount-ro', '/proc', '--dev', '/dev', '--dir', '/tmp',
+            '--ro-bind', str(workdir), '/work', '--chdir', '/work', '--', *args]
 
 
 def task_workdir(task, config):
@@ -1329,7 +1701,7 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
             if not binary.is_file() or not os.access(binary, os.X_OK):
                 output({'operation': 'network_probe_isolated', 'task_id': task,
                         'profile': profile, 'target': target, 'status': 'error',
-                        'kind': 'broker', 'error': f'Executable unavailable: {args[0]}',
+                        'kind': 'tool_missing', 'reason_category': 'tool_missing', 'error': f'Executable unavailable: {args[0]}',
                         'exit_code': None, 'nonzero_exit': False})
                 return
         else:
@@ -1349,6 +1721,16 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
         args = tool_args(profile, target, port, ports, scheme, path, hostname, capture_limit)
         run_timeout = 250 if profile == 'tcp_full' else 48
         stdout_limit = 270336 if profile == 'http_document' else 24000
+    if profile not in ('exec', 'poc_run') and not Path(args[0]).is_file():
+        output({'status': 'error', 'kind': 'tool_missing', 'reason_category': 'tool_missing',
+                'error': f'Executable unavailable: {args[0]}', 'task_id': task,
+                'profile': profile, 'target': target, 'exit_code': None})
+        return
+    if profile in RAW_SCAN_PROFILES:
+        binary = Path(args[0]).stat()
+        if binary.st_uid != 0 or binary.st_mode & 0o022:
+            raise PermissionError('Privileged Nmap requires a root-owned non-writable binary')
+        workdir = task_workdir(task, config)
     if check_egress:
         config = ensure_target_egress(v, config, target)
         verify_target_egress(config, target)
@@ -1374,14 +1756,15 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
     timed_out = False
     try:
         process = subprocess.Popen(
-            isolated_command(v['name'], config['owner'], config['uid'], config['gid'],
-                             args, extra, workdir=workdir),
+            privileged_scan_command(v['name'], args, workdir) if profile in RAW_SCAN_PROFILES else
+            isolated_command(v['name'], config['owner'], config['uid'], config['gid'], args, extra, workdir=workdir),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, errors='replace', start_new_session=True)
     except OSError as exc:
         output({'operation': 'network_probe_isolated', 'task_id': task,
                 'profile': profile, 'target': target, 'status': 'error',
-                'kind': 'broker', 'error': str(exc), 'exit_code': None,
+                'kind': 'permission_denied' if isinstance(exc, PermissionError) else 'executor_unavailable',
+                'error': str(exc), 'exit_code': None,
                 'nonzero_exit': False})
         return
     try:
@@ -1412,6 +1795,7 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
             'profile': profile, 'target': target, 'sandbox': 'netns+nft+bubblewrap',
             'status': 'timeout' if timed_out else 'completed',
             'kind': 'timeout' if timed_out else None,
+            'reason_category': 'timeout' if timed_out else 'utility_failed' if code else None,
             'exit_code': code, 'nonzero_exit': code != 0,
             'stdout': stdout[:stdout_limit], 'stderr': stderr[:5000],
             'stdout_truncated': len(stdout) > stdout_limit,
@@ -1422,18 +1806,19 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
             **poc_result})
 
 
-def capture_process(argv, body_limit=None):
+def capture_process(argv, body_limit=None, *, acquisition=False, process_env=None):
     """Drain binary pipes with hard byte/time caps; never buffer unbounded output."""
     started = time.monotonic()
     if body_limit is None:
         body_limit,wire_limit = HTTP_CAPTURE_BODY_LIMIT,HTTP_CAPTURE_WIRE_LIMIT
     else:
-        if body_limit not in HTTP_CAPTURE_LIMITS:
+        if not (acquisition and type(body_limit) is int and 0 < body_limit <= 256 * 1024 * 1024) and body_limit not in HTTP_CAPTURE_LIMITS:
             raise ValueError('Unsupported HTTP capture limit')
         wire_limit = body_limit + 65536
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, start_new_session=True)
+                                   stderr=subprocess.PIPE, start_new_session=True,
+                                   **({'env':process_env} if process_env is not None else {}))
     except OSError as exc:
         return {'status': 'error', 'kind': 'broker', 'error': str(exc),
                 'exit_code': None, 'nonzero_exit': False}
@@ -2145,6 +2530,11 @@ def main():
     t.add_argument('--task-id', type=int, required=True)
     wi = sub.add_parser('workdir')
     wi.add_argument('--task-id', type=int, required=True)
+    ti = sub.add_parser('tool', help='Bounded, operator-approved acquisition; no generic root execution')
+    ti.add_argument('--task-id', type=int, required=True)
+    ti.add_argument('--action', choices=('prepare', 'authorize', 'apply', 'status'), required=True)
+    ti.add_argument('--spec-json', default='')
+    ti.add_argument('--request-id', default='')
     r = sub.add_parser('run')
     r.add_argument('--task-id', type=int, required=True)
     r.add_argument('--profile', required=True)
@@ -2192,8 +2582,9 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == 'capabilities':
-            output({'capture_protocol': 1,'resource_policy_protocol':1,'ipv6':True,
-                    'profiles': ['http_capture', 'exec', 'poc_run', 'research', 'session'],
+            output({'capture_protocol': 1,'resource_policy_protocol':1,'ipv6':True, 'tool_protocol': TOOL_PROTOCOL,
+                    'system_tools': SYSTEM_TOOLS, 'privileged_scan_profiles': list(RAW_SCAN_PROFILES),
+                    'profiles': ['http_capture', 'exec', 'poc_run', 'research', 'session', *RAW_SCAN_PROFILES],
                     'research_domains': list(RESEARCH_DOMAINS),
                     'session': {'max': SESSION_MAX, 'idle_default': SESSION_IDLE,
                                 'idle_max': SESSION_IDLE_MAX,
@@ -2208,6 +2599,9 @@ def main():
                                           json.loads(args.resource_policy) if args.resource_policy else None)
         elif args.command == 'teardown': teardown(args.task_id)
         elif args.command == 'workdir': output(workdir_init(args.task_id))
+        elif args.command == 'tool':
+            output(tool_prepare(args.task_id, json.loads(args.spec_json)) if args.action == 'prepare'
+                   else tool_action(args.task_id, args.action, args.request_id))
         elif args.command == 'run': run(args.task_id, args.profile, args.target,
                                         args.port, args.ports, args.scheme, args.path, args.hostname,args.capture_limit,
                                         argv=args.argv, poc_file=args.poc_file, poc_interp=args.poc_interp,
@@ -2250,6 +2644,10 @@ def main():
                     'host_veth_ip': config['host_ip'],
                     'docker_forward_managed': config.get('docker_forward_managed', False),
                     'hostnames': config.get('hostnames', [])})
+    except ToolError as e:
+        output({'status': 'blocked', 'kind': e.category, 'reason_category': e.category, 'error': str(e)}, fail=True)
+    except PermissionError as e:
+        output({'status': 'blocked', 'kind': 'permission_denied', 'reason_category': 'permission_denied', 'error': str(e)}, fail=True)
     except EgressError as e:
         output({'status': 'blocked', 'kind': 'egress', 'error': str(e)}, fail=True)
     except TimeoutError as e:

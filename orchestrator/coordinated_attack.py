@@ -142,7 +142,7 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
     captures = sorted({
         digest({'text':r['text'].replace('\r\n','\n'),'status':r['status'],'exit_code':r.get('exit_code')})
         for r in results if r.get('provenance')=='network'
-        and r['tool'] in ('net_exec','poc_run','session','network_probe',
+        and r['tool'] in ('net_exec','poc_run','session','network_probe','privileged_scan',
                           'http_get','http_headers','http_path','http_document','http_capture')
         and r['text'].strip()})
     proofs = [list(row) for row in db.execute(
@@ -160,6 +160,9 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
              for q in operator_questions.listing(db,task_id) if q['status']=='answered']
     proposals=[{'objective_key':p['objective_key'],'value_sha256':p['value_sha256'],'status':p['status']}
                for p in flag_review.listing(db,task_id)]
+    from orchestrator import tool_requests
+    tools=[{'spec':{k:v for k,v in i['spec'].items() if k!='purpose'},'status':i['status'],
+            'result':i['receipt'].get('result')} for i in tool_requests.listing(db,task_id)]
     from orchestrator import resources
     graph=resources.graph(db,task_id)
     def resource_semantics(row):
@@ -175,6 +178,7 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
         'relations':semantic_set({**{k:r[k] for k in ('source','relation','destination')},
                                  'data':{k:v for k,v in r['data'].items() if k!='sources'}} for r in graph['relations'])}}
     return {'version':2,**({'operator_answers':semantic_set(answers)} if answers else {}),
+            **({'tools':semantic_set(tools)} if tools else {}),
             **({'flag_reviews':semantic_set(proposals)} if proposals else {}),**resource_state,'intent':context['intent'],'target':context['target'],
             'goals':[{k:g.get(k) for k in ('key','title','role','weight','status')} for g in goals['objectives']],
             'goal_policy':{k:goals.get(k) for k in ('mode','exclusive','expected_flags')},
@@ -238,6 +242,9 @@ def snapshot(db, task_id, expect):
         refs[f"report:{item['role']}:{item['iteration']}"] = item
     for proposal in flag_review.listing(db,task_id):refs['flag_proposal:'+str(proposal['id'])]=proposal
     for question in operator_questions.listing(db,task_id):refs['operator_question:'+str(question['id'])]=question
+    from orchestrator import tool_requests
+    tools=[tool_requests.describe(item) for item in tool_requests.listing(db,task_id)]
+    for item in tools:refs['tool_request:'+str(item['id'])]=item
     recent = results[-20:]
     for item in results:
         if isinstance(item['result_id'], str) and item['result_id']:
@@ -263,6 +270,7 @@ def snapshot(db, task_id, expect):
             'state_sha256':digest(knowledge), 'confirmed_flags': confirmed,
             'operator_checkpoints':{**checkpoints.history(db,task_id,context['target']),'blocking':False},
             'operator_questions':operator_questions.listing(db,task_id),
+            'tool_requests':tools,
             'flag_candidates':flag_candidates, 'flag_proposals':flag_review.listing(db,task_id),
             'success_verified': success, 'verified_stop_reason': stop,
             'authorization_block': authorization(db, context, mapped)}
@@ -309,8 +317,14 @@ def parse_decision(value, state, roles):
         raise ValueError('invalid_branch')
     if decision['action']=='wait_operator':
         question=decision.get('operator_question')
-        if not isinstance(question,dict) or set(question)!={'kind'} or question['kind'] not in operator_questions.KINDS:
+        if (not isinstance(question,dict) or set(question) not in ({'kind'},{'kind','request'})
+                or question['kind'] not in operator_questions.KINDS):
             raise ValueError('invalid_operator_question')
+        if 'request' in question:
+            if question['kind']!='tool':raise ValueError('invalid_operator_question')
+            from executor.netguard_root import tool_spec
+            try:tool_spec(question['request'])
+            except ValueError:raise ValueError('invalid_operator_question')
         if question['kind']=='flag_confirmation' and len([ref for ref in refs if ref.startswith('flag:')])!=1:
             raise ValueError('invalid_operator_question')
         if operator_questions.blocked(decision,state):raise ValueError('branch_waiting_operator')
@@ -388,6 +402,10 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             "Pending questions block only their branch; continue useful independent service branches within budgets. "
             "Never evade a blocked branch by using task-wide boundaries. Answers do not grant new scope or increase budgets. "
             "Omit operator_question for run_role and stop; it is required only for wait_operator. "
+            "For an actionable tool/docs/package request use operator_question={kind:tool,request:spec}. "
+            "spec: kind=user_tool|documentation,name,purpose,version,source (one exact URL),channel=internet|kali_local|local_file,filename,sha256 (empty if unknown),interpreter=direct|python3|bash|perl|ruby (none for documentation). "
+            "For system_package use only kind,name,purpose,version (candidate or exact), supported nmap/curl/jq. "
+            "Use installed tools and saved documentation first. Prior refusals/install errors require another method, not a reworded permission. Acquisition grants no target scope. "
             "Use existing reference keys and a profile listed for that role in specialist_profiles. "
             "flag_candidates lists technical provenance and blockers; flag_proposals contains goal-bound platform decisions. "
             "PM automatically queues those proposals. Awaiting a platform answer needs no GET, capture or VERIFY; "
@@ -657,10 +675,15 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
             # A question step is an intent to ask, never an executed specialist.
             questions=operator_questions.listing(db,task_id)
             for waiting in [r for r in steps(db,task_id) if r['status']=='waiting_operator']:
-                question=next((q for q in questions if q['step_id']==waiting['id']),None)
-                if question:
-                    if question['status']!='pending':
-                        update_step(db,waiting['id'],'failed',error='operator_question_answered_no_action')
+                dependencies=[]
+                if waiting['error']=='tool_dependency_pending':
+                    saved=db.execute('SELECT report_json FROM pm_agent_action_reports WHERE task_id=? AND role=? AND iteration=?',
+                        (task_id,json.loads(waiting['decision_json'])['role'],waiting['report_iteration'])).fetchone()
+                    if saved:dependencies=json.loads(saved[0]).get('operator_dependencies',[])
+                related=[q for q in questions if q['step_id']==waiting['id'] or q['id'] in dependencies]
+                if related:
+                    if all(q['status']!='pending' for q in related):
+                        update_step(db,waiting['id'],'failed',error='tool_dependency_resolved_replan' if waiting['error']=='tool_dependency_pending' else 'operator_question_answered_no_action')
                 elif continue_run:
                     update_step(db,waiting['id'],'failed',error='operator_requested_replan')
                 else:
@@ -726,11 +749,18 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                                      question=decision['question'],reason=decision['reason'],
                                      references=decision['references'],expected_result=decision['expected_result'])
                 if decision['action']=='wait_operator':
-                    question=operator_questions.request(db,task_id,target,decision,step_id)
+                    try:
+                        question=operator_questions.request(db,task_id,target,decision,step_id)
+                    except (ValueError,RuntimeError,OSError) as exc:
+                        if decision.get('operator_question',{}).get('kind')!='tool':raise
+                        update_step(db,step_id,'failed',error=str(exc)[:180],outcome_uncertain=0)
+                        diagnostics.emit('coordinator.tool_request_failed',task_id=task_id,step_id=step_id,
+                            reason='tool_request_prepare_failed',reason_summary=str(exc)[:180])
+                        continue
                     update_step(db,step_id,'waiting_operator' if question['status']=='pending' else 'failed',
                                 error='operator_question_pending' if question['status']=='pending' else 'operator_question_already_answered')
                     state=snapshot(db,task_id,expect_flags)
-                    if question['branch_id']=='task' or not operator_questions.available(state):
+                    if (question['status']=='pending' or not question.get('tool_request')) and (question['branch_id']=='task' or not operator_questions.available(state)):
                         return finish('operator_questions_pending','waiting_operator')
                     continue
                 if decision['action']=='stop':
@@ -800,6 +830,17 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                                          reason='report_incomplete',report_path=report.get('report_path'),outcome_uncertain=unknown,
                                          reason_summary='Отчёт неполон или противоречив; требуется проверка оператором. Исход исполнения сохранён отдельно.')
                         return finish('role_report_incomplete_requires_review','waiting_operator')
+                    dependencies=[q for q in operator_questions.listing(db,task_id,pending=True)
+                        if q['id'] in report.get('operator_dependencies',[]) and q.get('tool_request')]
+                    if dependencies:
+                        with db:
+                            for question in dependencies:
+                                db.execute('UPDATE pm_operator_questions SET step_id=? WHERE id=? AND step_id IS NULL',(step_id,question['id']))
+                        state=snapshot(db,task_id,expect_flags)
+                        update_step(db,step_id,'waiting_operator',report_path=report.get('report_path'),
+                            error='tool_dependency_pending',outcome_uncertain=0,knowledge_after_sha256=state['knowledge_sha256'])
+                        if not operator_questions.available(state):return finish('operator_questions_pending','waiting_operator')
+                        continue
                     registry=flag_verify.scan(task_id,db=db)
                     objectives.process_report(db,task_id,report,registry)
                     flag_review.reconcile(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')

@@ -1195,7 +1195,7 @@ def progress_watcher(role, step_limit, stream=None, stats_path=None):
             label = tool_label(data.get('name'))
             stats = current_stats()
             charged = min(int(stats.get('calls') or 0), total)
-            if label in ('pm_capability_read','pm_evidence_index','pm_task_memory','pm_material_read'):
+            if label in ('pm_capability_read','pm_evidence_index','pm_task_memory','pm_material_read','pm_tool_status','pm_tool_read'):
                 reads.append(label)
                 emit(f'чтение {len(reads)} → '
                      f'{describe_call(data.get("name"), data.get("arguments"))}')
@@ -1708,7 +1708,7 @@ def report_probe_records(task_id):
                     'capture_record': {**{key:record.get(key) for key in
                                          ('id','task_id','tool','provenance')},
                                        'result':{key:result[key] for key in
-                                                 ('task_id','target','status','exit_code','artifact_id','error_type','server_outcome','status_code')
+                                                 ('task_id','target','status','exit_code','artifact_id','error_type','server_outcome','status_code','question_id')
                                                  if key in result}},
                 }
     except FileNotFoundError:
@@ -1720,7 +1720,7 @@ from orchestrator.evidence_claims import PROBE_DENIAL, NEGATIVE_CLAIM, POSITIVE_
 from orchestrator.evidence_claims import polarity as probe_polarity
 
 
-def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *, db=None):
+def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *, db=None, dependency_ids=()):
     """Check traceability and polarity heuristically; operator decides truth."""
     from orchestrator import flag_evidence
     all_records = report_probe_records(task_id) if records is None else records
@@ -1805,9 +1805,9 @@ def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *,
                 audited=any(item['result_id']==result_id and probe.get('artifact_ref') in
                             (None,'',item['artifact_ref']) for item in local_audits)
         direct=bool(record and not readback_record(record) and record['status'] in ('completed', 'ok') and record['text'].strip() and record['tool'] in (
-                'net_exec', 'poc_run', 'session', 'network_probe',
+                'net_exec', 'poc_run', 'session', 'network_probe', 'privileged_scan',
                 'http_capture', 'http_get', 'http_path', 'http_document', 'http_headers'))
-        if not direct and not audited:
+        if not direct and not audited and not dependency_ids:
             report['report_incomplete'] = True
             report['report_warning'] = (report.get('report_warning', '') +
                 '; verify: нет прямого зонда или допустимого локального аудита сохранённого capture').strip('; ')
@@ -2155,6 +2155,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
     prior_probe_ids = set(report_probe_records(task_id))
     db = connect()
     try:
+        from orchestrator import operator_questions
         fact_state.import_capability_assets(
             db, task_id, CAPABILITY_LOG / f'task_{task_id}.jsonl')
         db.commit()
@@ -2334,9 +2335,19 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                     report['report_quality'].update(status='damaged',reason=error,format_attempts=1)
             assertions=copy.deepcopy({key:report.get(key) for key in
                 ('summary','findings','hypotheses','access_level','access_signal','access_probe_result_id','access_quote')})
+            # A saved dependency is an operational outcome, not a missing probe.
+            # The model cannot manufacture this field to bypass VERIFY validation.
+            report.pop('operator_dependencies',None)
             probe_records=report_probe_records(task_id)
+            requested={r['capture_record']['result'].get('question_id') for rid,r in probe_records.items()
+                       if rid not in prior_probe_ids and r['tool']=='tool_request' and r['status']=='waiting_operator'}
+            dependencies=[q['id'] for q in operator_questions.listing(db,task_id)
+                if q['id'] in requested and q['status']=='pending' and q.get('tool_request')]
+            if dependencies and not (report.get('findings') or report.get('hypotheses')) and execution['status']=='not_started':
+                report['operator_dependencies']=dependencies
+            else:dependencies=[]
             report = validate_report_probes(report, task_id, role, records=probe_records,
-                                             prior_ids=prior_probe_ids, db=db)
+                                             prior_ids=prior_probe_ids, db=db,dependency_ids=dependencies)
             # A fresh readback wrapper is not a new probe either. Keep the
             # original IDs excluded from hypothesis/access closure validation.
             closure_prior_ids=prior_probe_ids | ({rid for rid,record in probe_records.items()

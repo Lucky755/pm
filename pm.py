@@ -1341,6 +1341,24 @@ def render_flag_candidate(question):
     elif candidate['status']=='rejected':line(f"    Отклонён. Явный пересмотр: questions {candidate['task_id']} --reconsider {candidate['id']} --note-file PATH")
 
 
+def render_tool_request(question):
+    tool=question.get('tool_request')
+    if not tool:return
+    manifest=tool['manifest'];spec=tool['spec']
+    line('    Назначение: '+safe_display(spec['purpose']))
+    line('    Зависимые ветки: '+safe_display(', '.join(tool.get('dependent_branches',[]))))
+    line('    Источник: '+safe_display(spec.get('source','настроенные APT-репозитории')))
+    version=(tool.get('result') or {}).get('version') or manifest.get('package_plan',{}).get('version') or spec['version']
+    line('    Версия: '+safe_display(version)+' · установка: '+safe_display(tool['status']))
+    line('    Действия: '+safe_display(json.dumps(manifest.get('actions',[]),ensure_ascii=False)))
+    line('    Место: '+safe_display(manifest.get('host_destination',manifest.get('destination',''))))
+    line('    Права: '+safe_display(manifest.get('privileges','')))
+    if manifest.get('package_plan'):line('    Пакеты/источники: '+safe_display(json.dumps(manifest['package_plan'],ensure_ascii=False)))
+    line('    Вызов: '+safe_display(json.dumps(manifest.get('invocation',[]),ensure_ascii=False))+' · cwd /work')
+    if tool.get('result'):line('    Результат: '+safe_display(json.dumps(tool['result'],ensure_ascii=False)))
+    if tool.get('error'):line('    Ошибка: '+safe_display(tool['error']))
+
+
 def render_coordinator_result(result, args):
     if getattr(args,'json',False):
         line(json.dumps(result,ensure_ascii=False,indent=2))
@@ -1359,6 +1377,7 @@ def render_coordinator_result(result, args):
         line('    '+safe_display(question['question']))
         if question.get('resource'):line('    Ресурс: '+diagnostics.clean(question['resource']['value'],limit=None)+' · контекст '+safe_display(question['resource']['context']))
         render_flag_candidate(question)
+        render_tool_request(question)
         line('    Причина: '+safe_display(question['reason']))
         line('    Границы: '+safe_display(json.dumps(question['boundaries'],ensure_ascii=False)))
         line('    Ссылки: '+', '.join(safe_display(ref) for ref in question['references']))
@@ -2668,9 +2687,11 @@ def op_status(args):
 
 
 def op_questions(args):
-    from orchestrator import coordinated_attack, operator_questions, agent_actions, flag_review
+    from orchestrator import coordinated_attack, operator_questions, agent_actions, flag_review, tool_requests
     if getattr(args,'answer',None) is not None and getattr(args,'reconsider',None) is not None:
         raise OperatorError('Выберите ответ на вопрос либо пересмотр кандидата')
+    if getattr(args,'apply_tool',None) is not None and (getattr(args,'answer',None) is not None or getattr(args,'reconsider',None) is not None):
+        raise OperatorError('--apply-tool используется отдельно от ответа и пересмотра')
     if getattr(args,'decision',None) and getattr(args,'answer',None) is None:
         raise OperatorError('--decision используется вместе с --answer')
     with coordinated_attack.task_lock(args.task_id), connect() as db:
@@ -2685,8 +2706,13 @@ def op_questions(args):
             if not getattr(args,'decision',None):raise OperatorError('Для ответа нужен --decision')
             text=getattr(args,'answer_text','')
             if getattr(args,'note_file',None):text=Path(args.note_file).read_text(encoding='utf-8')
-            operator_questions.answer(db,args.task_id,args.answer,args.decision,text,
+            answered=operator_questions.answer(db,args.task_id,args.answer,args.decision,text,
                 capability_log=log)
+            db.commit()  # Permission is durable before external installation starts.
+            if answered.get('tool_request') and args.decision=='approve':
+                tool_requests.acquire(db,args.task_id,answered['tool_request']['id'],authorize=True)
+        if getattr(args,'apply_tool',None) is not None:
+            tool_requests.acquire(db,args.task_id,args.apply_tool,authorize=True)
         rows=operator_questions.listing(db,args.task_id)
         if getattr(args,'json',False):line(json.dumps(rows,ensure_ascii=False,indent=2))
         else:
@@ -2695,10 +2721,11 @@ def op_questions(args):
                 line('    '+safe_display(item['question'])+' · '+safe_display(item['reason']))
                 if item.get('resource'):line('    Ресурс: '+diagnostics.clean(item['resource']['value'],limit=None))
                 render_flag_candidate(item)
+                render_tool_request(item)
                 line('    Границы: '+safe_display(json.dumps(item['boundaries'],ensure_ascii=False)))
                 line('    Ссылки: '+', '.join(safe_display(ref) for ref in item['references']))
             if not rows:line('  Ожидающих или сохранённых вопросов нет.')
-            line('  Ответ не расширяет scope и бюджеты. Продолжение — обычный resume.')
+            line('  Scope и бюджеты прежние. Одобрение tool разрешает только показанную установку. Продолжение — resume.')
         solved=flag_review.completed_result(db,args.task_id)
         if solved and not getattr(args,'json',False):render_coordinator_result(solved,args)
         return rows
@@ -3129,9 +3156,10 @@ def parser_main():
     resume = sub.add_parser('resume', help='Продолжить существующую задачу')
     resume.add_argument('task_id', type=int)
     resume.add_argument('--reprobe', help='Однократно перепроверить 1..32 порта после ремонта сети, напр. 22,80')
-    questions = sub.add_parser('questions', help='Очередь вопросов оператору; без API и сети')
+    questions = sub.add_parser('questions', help='Очередь: просмотр без сети; установка только после явного одобрения tool')
     questions.add_argument('task_id',type=int)
     questions.add_argument('--answer',type=int,help='ID ожидающего вопроса')
+    questions.add_argument('--apply-tool',type=int,help='Явно применить уже одобренный запрос инструмента после прерывания выдачи разрешения')
     questions.add_argument('--reconsider',type=int,help='ID отклонённого кандидата для явного пересмотра; нужна причина в --note-file')
     questions.add_argument('--decision',choices=('approve','decline','information'))
     questions.add_argument('--note-file',help='Файл пояснения UTF-8; ответ не передаётся модели до продолжения')

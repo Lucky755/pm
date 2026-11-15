@@ -243,6 +243,19 @@ def exception_status(exc):
 def failure_details(payload=None, exc=None):
     """Classify failure without copying stdout, stderr, commands or environments."""
     payload = payload if isinstance(payload, dict) else {}
+    acquisition_reasons = {
+        'tool_missing': 'Required executable/package is unavailable; request a bounded tool acquisition.',
+        'permission_denied': 'Required execution/installation rights were denied.',
+        'network_denied': 'The resource is outside the granted network channel or exact source permission.',
+        'download_failed': 'The permitted source transfer failed; no automatic retry.',
+        'installation_failed': 'Tool installation failed; inspect the saved installation result.',
+        'utility_failed': 'The utility ran and returned a nonzero exit code; research success is not implied.',
+        'conditions_changed': 'Installation conditions changed; the prior permission does not apply.',
+        'integrity_error': 'Saved/downloaded bytes differ from the approved source or destination.',
+        'outcome_unknown': 'Execution outcome is unknown; automatic repetition is blocked.'}
+    category = payload.get('reason_category') or payload.get('kind')
+    if exc is None and category in acquisition_reasons:
+        return {'reason_category': category, 'reason_summary': acquisition_reasons[category]}
     if payload.get('failure_domain') == 'coordinator_decision' and exc is None:
         return {'reason_category':'coordinator_decision',
                 'reason_summary':'Coordinator decision validation failed; inspect coordinator.decision_rejected events.'}

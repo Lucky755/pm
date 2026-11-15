@@ -1,4 +1,4 @@
-"""Durable operator inbox. Answers are input, never an execution permission."""
+"""Durable operator inbox. Only typed tool requests have a bounded broker grant."""
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -45,6 +45,10 @@ def listing(db,task_id,*,pending=False):
             from orchestrator import flag_review
             proposal=flag_review.for_question(db,task_id,item)
             if proposal:item['flag_candidate']=proposal
+        if item['kind']=='tool':
+            from orchestrator import tool_requests
+            tool=tool_requests.for_question(db,task_id,item['id'])
+            if tool:item['tool_request']=tool_requests.describe(tool)
         if item['branch_id'].startswith('resource:') and task_memory.exists(db,'pm_resources'):
             resource=db.execute('SELECT kind,value,context FROM pm_resources WHERE task_id=? AND id=?',(task_id,item['branch_id'])).fetchone()
             if resource:item['resource']={'kind':resource[0],'value':resource[1],'context':resource[2]}
@@ -55,23 +59,30 @@ def listing(db,task_id,*,pending=False):
 def branch(decision):return decision.get('branch_id','task')
 
 
+def dependent_branches(question):
+    return (question.get('tool_request') or {}).get('dependent_branches') or [question['branch_id']]
+
+
 def available(state):
     pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending' and q['kind']!='flag_confirmation']
     if not pending:return state['known_resources']
-    if any(q['branch_id']=='task' for q in pending):return []
-    blocked={q['branch_id'] for q in pending}
+    blocked={b for q in pending for b in dependent_branches(q)}
+    if 'task' in blocked:return []
     return [r for r in state['known_resources'] if r.startswith(('service:','resource:')) and r not in blocked]
 
 
 def blocked(decision,state):
     pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending' and q['kind']!='flag_confirmation']
     return bool(pending and (branch(decision)=='task' or any(
-        q['branch_id']=='task' or q['branch_id']==branch(decision) for q in pending)))
+        'task' in dependent_branches(q) or branch(decision) in dependent_branches(q) for q in pending)))
 
 
 def request(db,task_id,target,decision,step_id,*,_flag_proposal=None):
     kind=decision['operator_question']['kind']
     if kind not in KINDS:raise ValueError('invalid_operator_question')
+    if kind=='tool' and 'request' in decision['operator_question']:
+        from orchestrator import tool_requests
+        return tool_requests.request(db,task_id,target,decision,step_id)
     if kind=='flag_confirmation' and _flag_proposal is None:
         from orchestrator import flag_review
         flag_review.activate(db,task_id)
@@ -125,6 +136,10 @@ def answer(db,task_id,question_id,decision,text='',*,capability_log=None):
         item=next((q for q in listing(db,task_id) if q['id']==question_id),None)
         if not item or item['status']!='pending':raise ValueError('No matching pending question')
         payload={'decision':decision,'text':text,'permission_effect':'none; saved scope and budgets remain authoritative'}
+        if item['kind']=='tool':
+            from orchestrator import tool_requests
+            if tool_requests.answered(db,item,decision):
+                payload['permission_effect']='one immutable tool receipt only; task scope and budgets unchanged'
         if item['kind']=='flag_confirmation':
             from orchestrator import flag_review
             proposal=flag_review.for_question(db,task_id,item)
@@ -147,6 +162,7 @@ def retire_legacy(db,task_id,steps):
         for row in steps:
             decision=json.loads(row['decision_json'])
             if row['status']!='waiting_operator' or decision.get('action')!='run_role':continue
+            if row['error']=='tool_dependency_pending':continue
             if decision.get('role')!='access':continue
             uncertain=bool(row['outcome_uncertain'] or row.get('report_path') or row.get('report_quality') or row.get('approved_at')
                 or row.get('execution_outcome',{}).get('results')

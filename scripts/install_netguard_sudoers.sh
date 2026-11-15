@@ -12,8 +12,9 @@
 # The rule grants passwordless root ONLY for /usr/local/sbin/pm-netguard.
 # The broker itself enforces task scope (nftables in the root netns), profile
 # allowlists, argv restrictions and timeouts, so it is not a general root shell
-# for arbitrary paths — but it does run agent-supplied commands as root inside
-# the task namespace, which is the documented design of this project.
+# for arbitrary paths. Generic agent argv/PoC/session commands drop UID and all
+# capabilities. Only fixed scan profiles retain CAP_NET_RAW in the task netns;
+# bounded package installation requires a separate operator-approved receipt.
 #
 # Usage:
 #   scripts/install_netguard_sudoers.sh           # install (asks for sudo password once)

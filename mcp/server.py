@@ -749,10 +749,10 @@ def capability_provenance(tool, payload, command):
     if tool=='callback' and '--action' in command:
         action=list(command)[list(command).index('--action')+1]
         if action=='read':return 'local'
-    if tool in ('session', 'network_probe', 'http_get', 'http_headers',
+    if tool in ('session', 'network_probe', 'privileged_scan', 'http_get', 'http_headers',
                 'http_path', 'http_document', 'http_capture'):
         return 'network'
-    if tool in ('write_poc', 'read_file', 'grep', 'unpack', 'capability_read'):
+    if tool in ('write_poc', 'read_file', 'grep', 'unpack', 'capability_read', 'tool_request', 'tool_acquire'):
         return 'local'
     return 'unknown'
 
@@ -1401,6 +1401,110 @@ def pm_poc_run(
     ]
 
     return run_capability(command, timeout + 40, tool="poc_run", task_id=task_id)
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_tool_request(task_id: int, spec_json: str, branch_id: str = 'task') -> str:
+    """Request one bounded tool/doc/package acquisition; never approve it for the operator.
+
+    spec_json: kind=user_tool|documentation with name,purpose,version,source,
+    channel=internet|kali_local|local_file,filename,sha256,interpreter;
+    or kind=system_package with name,purpose,version (exact or candidate).
+    Read the returned source/actions/destination/rights and wait for that branch.
+    """
+    from orchestrator import tool_requests, service_inventory, resources
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id)) != str(task_id):
+        return tool_response({'status':'blocked','reason_category':'scope_denied','error':'Tool task differs from active SDK task'})
+    try:
+        spec=tool_requests.tool_spec(json.loads(spec_json))
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            row=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()
+            if not row:raise ValueError('Unknown task')
+            target=row[0];scope='scope:'+target
+            allowed={scope}|{f"service:{target}:{e['protocol']}:{e['port']}" for e in service_inventory.collect_full(db,task_id)['entries']}
+            graph=resources.graph(db,task_id)
+            allowed.update(graph.get('authorized_resources',[]))
+            if branch_id!='task' and branch_id not in allowed:raise ValueError('Unknown or unauthorized dependent branch')
+            decision={'operator_question':{'kind':'tool','request':spec},'question':spec['purpose'],'reason':spec['purpose'],
+                'branch_id':branch_id,'references':['intent'],
+                'boundaries':{'task_id':task_id,'target':target,'intent_ref':'intent','resource_refs':[scope if branch_id=='task' else branch_id]}}
+            question=tool_requests.request(db,task_id,target,decision)
+            task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='tool_request')
+            db.commit()
+        item=question['tool_request']
+        payload={'status':'waiting_operator' if question['status']=='pending' else item['status'],
+                 'question_id':question['id'],'task_id':task_id,'tool_request':item,
+                 'execution_started':False,'provenance':'local'}
+    except (ValueError,OSError,sqlite3.Error) as exc:
+        payload={'status':'blocked','reason_category':getattr(exc,'category','invalid_request'),'error':str(exc)}
+    rid=log_capability('tool_request',task_id,payload,0)
+    return tool_response({**payload,'result_id':rid})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_tool_status(task_id: int) -> str:
+    """Local saved installation state, source/version/invocation and failures; no network or sudo."""
+    from orchestrator import tool_requests
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id)) != str(task_id):
+        return tool_response({'status':'blocked','reason_category':'scope_denied'})
+    with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True,timeout=10)) as db:
+        return tool_response({'status':'completed','task_id':task_id,'provenance':'local_read',
+            'tools':[tool_requests.describe(item) for item in tool_requests.listing(db,task_id)]})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_tool_read(task_id: int, request_id: int, offset: int = 0, limit: int = 4096) -> str:
+    """Read a bounded, hash-verified saved tool/doc range without network/sudo; not new target evidence."""
+    from orchestrator import tool_requests
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id)) != str(task_id):
+        return tool_response({'status':'blocked','reason_category':'scope_denied'})
+    try:
+        with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True,timeout=10)) as db:
+            return tool_response(tool_requests.read_material(db,task_id,request_id,offset,limit))
+    except (ValueError,sqlite3.Error,OSError) as exc:
+        return tool_response({'status':'blocked','error':str(exc),'reason_category':'integrity_error'})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_tool_acquire(task_id: int, request_id: int) -> str:
+    """Apply an operator-authorized receipt. Cannot authorize; failed/unknown installs are not replayed."""
+    from orchestrator import tool_requests
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id)) != str(task_id):
+        return tool_response({'status':'blocked','reason_category':'scope_denied'})
+    try:
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            item=tool_requests.acquire(db,task_id,request_id)
+            task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='tool_acquire')
+            db.commit()
+        payload={'status':item['status'],'task_id':task_id,'tool_request':tool_requests.describe(item),
+                 'provenance':'local','reason':item.get('reason'),
+                 'reason_category':(item['receipt'].get('result') or {}).get('reason_category',item['receipt'].get('reason_category'))}
+    except (ValueError,sqlite3.Error,OSError) as exc:
+        payload={'status':'error','reason_category':getattr(exc,'category','installation_failed'),'error':str(exc)}
+    rid=log_capability('tool_acquire',task_id,payload,0)
+    return tool_response({**payload,'result_id':rid})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_privileged_scan(task_id: int, target: str, profile: str, ports: str) -> str:
+    """Fixed nmap_syn/nmap_udp/nmap_os through broker; scope/NetGuard/repeat budgets still apply.
+
+    1..32 explicit ports (UDP <=8), bounded runtime, no NSE/custom arguments or root PoC.
+    """
+    from executor.netguard_root import RAW_SCAN_PROFILES, tool_args
+    try:
+        if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id)) != str(task_id):raise ValueError('Invalid task')
+        address=str(ipaddress.ip_address(target))
+        if profile not in RAW_SCAN_PROFILES:raise ValueError('Unsupported privileged profile')
+        tool_args(profile,address,80,ports,'http')
+    except ValueError as exc:return tool_response({'status':'blocked','error':str(exc),'execution_started':False})
+    return run_capability(['sudo','-n','/usr/local/sbin/pm-netguard','run','--task-id',str(task_id),
+        '--profile',profile,'--target',address,'--ports',ports],60,tool='privileged_scan',task_id=task_id)
 
 
 @mcp.tool()

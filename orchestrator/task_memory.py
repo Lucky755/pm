@@ -187,6 +187,9 @@ def source_state(db,task_id,capability_log):
         put('goals','flag_proposal:'+str(proposal['id']),proposal)
     for question in operator_questions.listing(db,task_id):
         put('questions','operator_question:'+str(question['id']),question)
+    from orchestrator import tool_requests
+    for tool in tool_requests.listing(db,task_id):
+        put('resources','tool_request:'+str(tool['id']),tool_requests.describe(tool))
     for event in rows(db,'pm_operator_policy_events',task_id):
         put('corrections','retired_policy:'+str(event['id']),{**event,'supersedes':event['object_ref']})
     from orchestrator import service_inventory

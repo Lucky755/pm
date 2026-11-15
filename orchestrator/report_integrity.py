@@ -34,8 +34,10 @@ def quality(report):
 
 def execution(records, prior_ids, calls=None):
     rows=[]
+    fresh=[record for rid,record in records.items() if rid not in prior_ids]
+    dependency_only=bool(fresh and calls==len(fresh) and all(r['tool']=='tool_request' for r in fresh))
     for rid,record in records.items():
-        if rid in prior_ids or record['tool'] in ('write_poc','read_file','capability_read','grep','unpack'):
+        if rid in prior_ids or record['tool'] in ('write_poc','read_file','capability_read','grep','unpack','tool_request'):
             continue
         payload=(record.get('capture_record') or {}).get('result') or {}
         status=record.get('status');code=payload.get('exit_code')
@@ -68,7 +70,7 @@ def execution(records, prior_ids, calls=None):
                      'omitted_server_responses':max(0,len(responses)-20)})
     statuses={r['outcome'] for r in rows}
     status=('unknown' if 'unknown' in statuses else next(iter(statuses)) if len(statuses)==1 else
-            'mixed' if rows else 'not_started' if calls==0 else 'unknown')
+            'mixed' if rows else 'not_started' if calls==0 or dependency_only else 'unknown')
     return {'status':status,'results':rows[:30],'omitted':max(0,len(rows)-30)}
 
 
