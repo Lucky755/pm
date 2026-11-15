@@ -221,7 +221,13 @@ def graph(db,task_id):
     for item in result['resources']:
         allowed=False
         if item['kind']=='machine':allowed=item['value']==state['policy']['machine'] or item['data'].get('configured',False)
-        elif item['kind']=='address':allowed=item['value'] in state['policy']['addresses']
+        elif item['kind']=='address':
+            allowed=item['value'] in state['policy']['addresses'] or (state['policy']['area']=='lab' and any(
+                ipaddress.ip_address(item['value']) in ipaddress.ip_network(n) for n in state['policy']['networks']
+                if ipaddress.ip_address(item['value']).version==ipaddress.ip_network(n).version))
+            if allowed:
+                from executor.netguard_root import resource_denied
+                allowed=not resource_denied(state['policy'],{'host':item['value'],'origin':'','path':'/'})
         elif item['kind']=='domain':allowed=item['value'] in state['entry'].get('bindings',{})
         elif item['kind']=='origin':allowed=item['value'] in [o['origin'] for o in state['policy']['origins']]
         elif item['kind']=='service':allowed=item['data'].get('target') in state['policy']['addresses']

@@ -51,11 +51,27 @@ For supported SSRF, use pm_http_ssrf with the authorized source application,
 destination and target-machine context. Remote loopback belongs to that target;
 it is never Kali loopback. The application response alone does not prove that
 the inner destination was contacted. Ask a pivoting question linked to the
-resource when a route or scope is missing. An answer is not an automatic grant.
+resource when a route or scope is missing. A typed SSH-forward approval grants
+only that saved source/destination/port/probe, never additional task scope.
 After an explicit same-machine address change, keep prior files, goals, results
 and plans as saved information. Access/session liveness is unknown until checked.
 Reuse the saved services for necessary connection checks; do not repeat full
 discovery solely because the IP changed.
+
+Use the shared task session manager. Reuse useful sessions across roles; mark
+retain=false or close sessions no longer needed. At most ten live sessions;
+active route dependencies keep their source. One agent owns a terminal at a time.
+Read after handoff before typing; a PID, stored DB row or configured username
+does not prove a working connection or authenticated identity. Unknown previous
+input is not permission to send it again. A new role/owner is not a new check.
+Managed SSH supports an operator-approved scoped local TCP forward, not arbitrary
+route changes. Inspect source/route health; broken/unknown tunnels are not
+recreated on resume. Callback addresses come from the current laboratory route,
+usually tun0; ask for explicit operator correction rather than guessing NAT or
+an old VPN address. Diagnose the listener/address/network before changing a
+callback variant; silence alone does not prove target egress filtering. Use
+pm_transfer for streamed files with expected size/hash and disk/byte budgets,
+not an interactive terminal. Preserve partial files and report completeness.
 A service hint is not a verified product. A new result_id, timestamp, report or
 readback is not new knowledge. Reuse relevant facts with their original evidence
 references; do not repeat completed checks without a new reason. Mark corrected

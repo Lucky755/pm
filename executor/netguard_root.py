@@ -24,6 +24,7 @@ import shlex
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 
 BASE = Path('/etc/pentest-master/netguard')
 STATE = Path('/run/pentest-master-netguard')
@@ -71,15 +72,20 @@ POC_SUFFIXES = ('.sh', '.py', '.pl', '.rb', '.txt')
 # a 0700 leaf owned by the task user.
 WORK_BASE = Path('/var/lib/pentest-master/work')
 SESSIONS_BASE = BASE / 'sessions'
-SESSION_MAX = 6
+SESSION_MAX = 10
 SESSION_IDLE = 1800
 SESSION_IDLE_MAX = 7200
 SESSION_OUTPUT_KEEP = 1024 * 1024
+SESSION_REPLY_BYTES = 64 * 1024
+SESSION_LOG_BYTES = 32 * 1024 * 1024
 SESSION_DATA_MAX = 65536
 
 # Local callback sink for blind execution results (reverse shells / exfil).
 CALLBACK_PORTS = range(1024, 65536)
 CALLBACK_MAX_BYTES = 4 * 1024 * 1024
+TRANSFER_MAX_BYTES = 1024 * 1024 * 1024
+TRANSFER_DEFAULT_BYTES = 512 * 1024 * 1024
+TRANSFER_RESERVE_BYTES = 64 * 1024 * 1024
 CALLBACK_DIR = Path('/var/lib/pentest-master/callbacks')
 
 # Acquisition is a separate operator-granted capability, never generic root exec.
@@ -430,9 +436,10 @@ def output(data, fail=False):
         raise SystemExit(1)
 
 
-def cmd(*args, input=None, timeout=20, check=True, env=None):
+def cmd(*args, input=None, timeout=20, check=True, env=None,pass_fds=()):
     p = subprocess.run(args, input=input, text=True, capture_output=True,
-                       timeout=timeout, check=False, **({'env':env} if env is not None else {}))
+                       timeout=timeout, check=False, **({'env':env} if env is not None else {}),
+                       **({'pass_fds':pass_fds} if pass_fds else {}))
     if check and p.returncode:
         raise RuntimeError(f'{args[0]} failed ({p.returncode}): {p.stderr[-1200:]}')
     return p
@@ -1898,6 +1905,17 @@ def callback_paths(task):
     return out, pid
 
 
+def callback_alive(info,task,port):
+    pid=info.get('pid',0)
+    try:
+        if Path(f'/proc/{pid}').stat().st_uid!=os.geteuid():return False
+        parts=Path(f'/proc/{pid}/cmdline').read_bytes().decode().split('\0')
+        if 'callback' not in parts:return False
+        if parts[parts.index('--task-id')+1]!=str(task) or parts[parts.index('--port')+1]!=str(port):return False
+        return bool(not info.get('process_birth') or process_birth(pid)==info['process_birth'])
+    except (OSError,ValueError,IndexError,UnicodeError):return False
+
+
 def read_stream(conn, deadline, cap=CALLBACK_MAX_BYTES):
     buffer = bytearray()
     conn.settimeout(10)
@@ -1920,7 +1938,7 @@ def log_callback_event(outdir, event):
     The listener runs detached and may be killed before it can report totals,
     so every accept/reject is written as it happens instead of only at exit.
     """
-    entry = dict(event, at=time.strftime('%Y-%m-%dT%H:%M:%S'))
+    entry = dict(event, at=time.strftime('%Y-%m-%dT%H:%M:%S'),listener_pid=os.getpid(),listener_birth=process_birth(os.getpid()))
     try:
         with (outdir / 'events.jsonl').open('a', encoding='utf-8') as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
@@ -1928,7 +1946,133 @@ def log_callback_event(outdir, event):
         pass
 
 
-def callback_listen(task, port, bind, timeout):
+def callback_selection(task,bind=''):
+    if bind:bind=str(ipaddress.ip_address(bind))
+    _,config=owned_config(task)
+    target=(config.get('resource_policy') or {}).get('addresses',[str(ipaddress.ip_network(config['allowed'][0]).network_address)])[0]
+    route=json.loads(cmd('/usr/sbin/ip','-j','route','get',target).stdout)[0]
+    override=config.get('callback_override')
+    if override:
+        address=override['bind'];interface=override['interface'];advertise=override['advertise'];source='operator'
+    else:
+        interface=route.get('dev','');address=route.get('prefsrc') or route.get('src','');advertise=address;source='route'
+        if not re.match(r'^(tun|tap|wg|ppp|vpn)',interface):
+            raise ToolError('callback_address_invalid','No unambiguous laboratory VPN route; configure callback address/interface explicitly, never guess NAT/VMware')
+    if not address or ipaddress.ip_address(address).is_unspecified:raise ToolError('callback_address_invalid','Current route has no callback source address')
+    configured=json.loads(cmd('/usr/sbin/ip','-j','address','show','dev',interface).stdout)
+    addresses={entry['local'] for item in configured for entry in item.get('addr_info',[]) if 'local' in entry}
+    if address not in addresses:raise ToolError('callback_address_invalid','Callback address is no longer configured; VPN/route changed')
+    if bind and bind!=address:raise ToolError('callback_address_invalid','Requested callback address differs from current route/operator override; use callback-config')
+    return {'target':target,'bind':address,'advertise':advertise,'interface':interface,'source':source,
+            'route_fingerprint':tool_digest({'target':target,'dev':route.get('dev'),'src':route.get('prefsrc') or route.get('src'),
+                                           'bind':address,'advertise':advertise})}
+
+
+def callback_configure(task,address,interface,advertise,reason,variant_limit=None):
+    config,_,_=session_invoker(task)
+    if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,32}',interface) or not reason.strip():raise ValueError('Interface and operator reason required')
+    address=str(ipaddress.ip_address(address));advertise=str(ipaddress.ip_address(advertise or address))
+    if ipaddress.ip_address(address).is_unspecified or ipaddress.ip_address(advertise).is_unspecified:raise ValueError('Unspecified callback address is not usable')
+    v,_=owned_config(task)
+    previous=config.get('callback_override')
+    limit=variant_limit if variant_limit is not None else (previous or {}).get('variant_limit',3)
+    if type(limit) is not int or not 1<=limit<=10:raise ValueError('Callback variant limit must be 1..10')
+    config['callback_override']={'bind':address,'interface':interface,'advertise':advertise,'reason':reason[:1000],'variant_limit':limit}
+    # Validate local ownership before persisting, while keeping the saved config unchanged on failure.
+    local=json.loads(cmd('/usr/sbin/ip','-j','address','show','dev',interface).stdout)
+    if address not in {a['local'] for item in local for a in item.get('addr_info',[])}:raise ValueError('Bind address is absent from the selected interface')
+    config.setdefault('callback_override_history',[]).append({'previous':previous,'at':int(time.time()),'reason':reason[:1000]})
+    replace_config(v,config)
+    return {'status':'configured','callback_override':config['callback_override']}
+
+
+def stream_transfer(conn,task,config,deadline,*,expected_bytes=None,expected_sha256='',max_bytes=TRANSFER_DEFAULT_BYTES):
+    """Bounded memory, measured disk capacity, original file retained on failure."""
+    if type(max_bytes) is not int or not 1<=max_bytes<=TRANSFER_MAX_BYTES:raise ValueError('Invalid transfer byte budget')
+    if expected_bytes is not None and (type(expected_bytes) is not int or not 0<=expected_bytes<=max_bytes):raise ValueError('Invalid expected size')
+    if expected_sha256 and not re.fullmatch(r'[a-f0-9]{64}',expected_sha256):raise ValueError('Invalid transfer SHA256')
+    work=task_workdir(task,config);folder=os.open(work,os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        created=False
+        try:os.mkdir('transfers',0o700,dir_fd=folder);created=True
+        except FileExistsError:pass
+        directory=os.open('transfers',os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=folder)
+        if created:os.fchown(directory,config['uid'],config['gid'])
+        try:os.mkdir('.transfer-staging',0o700,dir_fd=folder)
+        except FileExistsError:pass
+        staging=os.open('.transfer-staging',os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=folder)
+    finally:os.close(folder)
+    identifier=os.urandom(12).hex();name=identifier+'.part';total=0;digest=hashlib.sha256();eof=False;reason='timeout'
+    try:
+        info=os.fstat(directory)
+        if info.st_uid!=config['uid'] or info.st_mode&0o077:raise PermissionError('Unsafe transfer directory')
+        info=os.fstat(staging)
+        if info.st_uid!=os.geteuid() or info.st_mode&0o077:raise PermissionError('Unsafe private transfer staging')
+        fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=staging)
+        with os.fdopen(fd,'wb',buffering=0) as stream:
+            try:
+                while time.monotonic()<deadline:
+                    conn.settimeout(min(10,max(0.01,deadline-time.monotonic())))
+                    chunk=conn.recv(min(65536,max_bytes-total+1))
+                    if not chunk:eof=True;reason='eof';break
+                    if total+len(chunk)>max_bytes:reason='byte_budget_exhausted';break
+                    capacity=os.fstatvfs(stream.fileno())
+                    if capacity.f_bavail*capacity.f_frsize<len(chunk)+TRANSFER_RESERVE_BYTES:reason='insufficient_disk_space';break
+                    written=stream.write(chunk) or 0;digest.update(chunk[:written]);total+=written
+                    if written!=len(chunk):reason='partial_write';break
+                stream.flush();os.fsync(stream.fileno())
+            except socket.timeout:reason='receive_timeout'
+            except OSError as exc:reason='insufficient_disk_space' if exc.errno==28 else 'receive_io_error'
+            os.fchown(stream.fileno(),config['uid'],config['gid'])
+        actual=digest.hexdigest()
+        complete=bool(eof and reason=='eof' and expected_bytes is not None and total==expected_bytes and (not expected_sha256 or actual==expected_sha256))
+        if eof and expected_bytes is not None and total!=expected_bytes:reason='size_mismatch'
+        elif eof and expected_sha256 and actual!=expected_sha256:reason='hash_mismatch'
+        final=identifier+('.bin' if complete else '.part')
+        # Publish only after receiving/fsync/hash checks. No agent can alter an
+        # in-progress user-owned .part and invalidate the measured stream hash.
+        os.link(name,final,src_dir_fd=staging,dst_dir_fd=directory,follow_symlinks=False)
+        os.unlink(name,dir_fd=staging);name=final
+        return {'transfer_id':identifier,'file':'/work/transfers/'+name,'bytes':total,'sha256':actual,
+            'expected_bytes':expected_bytes,'expected_sha256':expected_sha256,'eof':eof,'complete':complete,
+            'completeness':'verified_hash_and_size' if complete and expected_sha256 else 'verified_size' if complete else
+                           'eof_unverified_size' if eof and expected_bytes is None else 'incomplete','reason':reason}
+    finally:os.close(directory);os.close(staging)
+
+
+def callback_diagnose(task,port):
+    session_invoker(task);port=callback_port(port);_,directory=callback_paths(task)
+    try:meta=json.loads((directory/f'{port}.pid').read_text())
+    except (OSError,ValueError):return {'status':'not_listening','diagnosis':'receiver_unavailable','outbound_restrictions':'unknown'}
+    pid=meta.get('pid',0)
+    live=callback_alive(meta,task,port)
+    try:selection=callback_selection(task)
+    except (OSError,ValueError,RuntimeError):selection=None
+    if not selection or selection['bind']!=meta.get('bind') or selection['advertise']!=meta.get('advertise'):
+        diagnosis='wrong_or_stale_callback_address'
+    elif not live:diagnosis='receiver_unavailable'
+    else:diagnosis='waiting_no_callback; target_egress_restrictions_possible_not_proven'
+    ready=directory/f'{port}.ready'
+    try:listening=json.loads(ready.read_text()).get('pid')==pid
+    except (OSError,ValueError):listening=False
+    if diagnosis.startswith('waiting') and not listening:diagnosis='receiver_not_ready'
+    received=[];outdir,_=callback_paths(task)
+    try:
+        for line in (outdir/'index.jsonl').read_text().splitlines():
+            entry=json.loads(line)
+            if entry.get('port')==port and entry.get('listener_pid')==pid and entry.get('listener_birth')==meta.get('process_birth'):received.append(entry)
+    except (OSError,ValueError):pass
+    if diagnosis.startswith('waiting') and received:
+        last=received[-1]
+        diagnosis=('receiver_session_limit' if last.get('reason')=='session_limit' else
+                   'transfer_received_complete' if last.get('complete') else 'transfer_received_unverified_or_incomplete'
+                   if last.get('mode')=='transfer' else 'callback_received')
+    return {'status':'listening' if live and listening else 'not_listening','selection':selection,
+        'diagnosis':diagnosis,'target_network_reachability':'unknown; use saved/current scoped preflight',
+        'outbound_restrictions':'possible, not established by silence','listener':meta}
+
+
+def callback_listen(task, port, bind, timeout,mode='interactive',expected_bytes=None,expected_sha256='',max_bytes=TRANSFER_DEFAULT_BYTES):
     """Detached worker: accepts connections only from the task's own scope."""
     ensure_root()
     v, config = owned_config(task)
@@ -1938,11 +2082,12 @@ def callback_listen(task, port, bind, timeout):
     piddir.mkdir(parents=True, exist_ok=True, mode=0o700)
     deadline = time.monotonic() + max(10, min(int(timeout), 3600))
     accepted = rejected = 0
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = socket.socket(socket.AF_INET6 if ':' in bind else socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((bind or '0.0.0.0', port))
         sock.listen(8)
+        tool_store(piddir/f'{port}.ready',{'pid':os.getpid(),'bind':bind,'port':port})
         sock.settimeout(1.0)
         while time.monotonic() < deadline:
             try:
@@ -1951,7 +2096,8 @@ def callback_listen(task, port, bind, timeout):
                 continue
             with conn:
                 ip = peer[0]
-                if not ip_in_allowed(ip, config['allowed']):
+                _,current=owned_config(task)
+                if (current.get('resource_policy') or {}).get('area')=='web' or not ip_in_allowed(ip, current['allowed']):
                     rejected += 1
                     log_callback_event(outdir, {'peer': ip, 'port': port,
                                                 'decision': 'rejected'})
@@ -1959,16 +2105,16 @@ def callback_listen(task, port, bind, timeout):
                 accepted += 1
                 log_callback_event(outdir, {'peer': ip, 'port': port,
                                             'decision': 'accepted'})
-                data = read_stream(conn, deadline)
-                name = f'{time.strftime("%Y%m%dT%H%M%S")}_{port}_{ip}.bin'
-                (outdir / name).write_bytes(data)
-                entry = {'file': name, 'peer': ip, 'port': port, 'bytes': len(data),
-                         'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-                         'preview': data[:2048].decode('utf-8', errors='replace')}
+                if mode=='transfer':entry=stream_transfer(conn,task,config,deadline,expected_bytes=expected_bytes,expected_sha256=expected_sha256,max_bytes=max_bytes)
+                elif mode=='interactive':entry=session_accept(task,conn,ip,port,config)
+                else:raise ValueError('Unknown callback mode')
+                entry.update(peer=ip,port=port,mode=mode,at=time.strftime('%Y-%m-%dT%H:%M:%S'),
+                             listener_pid=os.getpid(),listener_birth=process_birth(os.getpid()))
                 with (outdir / 'index.jsonl').open('a', encoding='utf-8') as handle:
                     handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
     finally:
         sock.close()
+        (piddir/f'{port}.ready').unlink(missing_ok=True)
         try:
             (piddir / f'{port}.pid').unlink()
         except FileNotFoundError:
@@ -1977,18 +2123,22 @@ def callback_listen(task, port, bind, timeout):
             'accepted': accepted, 'rejected_peers': rejected}
 
 
-def callback_open(task, port, bind, timeout):
+def callback_open(task, port, bind, timeout,mode='interactive',expected_bytes=None,expected_sha256='',max_bytes=TRANSFER_DEFAULT_BYTES):
     ensure_root()
     v, config = owned_config(task)
-    if config.get('resource_policy',{}).get('area')=='web':raise ValueError('Web scope does not authorize a host callback listener')
+    session_invoker(task)
+    if (config.get('resource_policy') or {}).get('area')=='web':raise ValueError('Web scope does not authorize a host callback listener')
     port = callback_port(port)
+    if mode not in ('interactive','transfer'):raise ValueError('Unsupported callback mode')
+    if mode=='transfer':
+        if type(max_bytes) is not int or not 1<=max_bytes<=TRANSFER_MAX_BYTES:raise ValueError('Invalid transfer budget')
+        if expected_bytes is not None and (type(expected_bytes) is not int or not 0<=expected_bytes<=max_bytes):raise ValueError('Invalid expected file size')
+        if expected_sha256 and not re.fullmatch(r'[a-f0-9]{64}',expected_sha256):raise ValueError('Invalid expected file hash')
+    selection=callback_selection(task,bind);bind=selection['bind']
     if bind:
         addr = ipaddress.ip_address(bind)
-        if addr.version != 4 or addr.is_multicast or addr.is_unspecified:
+        if addr.is_multicast or addr.is_unspecified:
             raise ValueError('Invalid bind address')
-        local = cmd('/usr/sbin/ip', '-4', '-o', 'addr', 'show').stdout
-        if not re.search(rf'\binet\s+{re.escape(str(addr))}/', local):
-            raise ValueError('Bind address is not configured on this host')
     if not config['allowed']:
         raise ValueError('Task has no allowed scope')
     self_path = os.path.realpath(sys.argv[0])
@@ -2000,26 +2150,50 @@ def callback_open(task, port, bind, timeout):
     pidfile = piddir / f'{port}.pid'
     if pidfile.exists():
         try:
-            old = int(json.loads(pidfile.read_text()).get('pid'))
-        except (ValueError, OSError, TypeError):
-            old = 0
-        if old and Path(f'/proc/{old}').exists():
-            raise ValueError(f'Callback listener already running on port {port}')
+            info=json.loads(pidfile.read_text());old = int(info.get('pid'))
+        except (ValueError, OSError, TypeError,AttributeError):
+            raise ToolError('outcome_unknown','Callback listener state is unreadable; inspect it before reopening')
+        if callback_alive(info,task,port):
+            current=json.loads(pidfile.read_text())
+            if (current.get('bind')==bind and current.get('mode')==mode and current.get('advertise')==selection['advertise']
+                    and (mode!='transfer' or (current.get('expected_bytes'),current.get('expected_sha256'),current.get('max_bytes'))==
+                         (expected_bytes,expected_sha256,max_bytes))):return {'status':'listening','already_running':True,**current}
+            raise ValueError('Existing callback has different conditions; close it explicitly')
         pidfile.unlink(missing_ok=True)
+    attempts=outdir/'open_attempts.jsonl'
+    if mode=='interactive':
+        previous=[]
+        if attempts.exists():
+            for line in attempts.read_text().splitlines():
+                try:previous.append(json.loads(line))
+                except ValueError:raise ValueError('Callback attempt journal is damaged; operator review required')
+        if sum(a['route_fingerprint']==selection['route_fingerprint'] for a in previous)>=config.get('callback_override',{}).get('variant_limit',3):
+            raise ToolError('callback_budget_exhausted','callback_variant_budget_exhausted: diagnose routing/listener/network before another attempt')
+        with attempts.open('a') as stream:stream.write(json.dumps({**selection,'port':port,'at':int(time.time())})+'\n')
     argv = [self_path, 'callback', '--action', 'listen', '--task-id', str(task),
-            '--port', str(port), '--timeout', str(int(timeout))]
+            '--port', str(port), '--timeout', str(int(timeout)),'--mode',mode,'--max-bytes',str(max_bytes)]
+    if expected_bytes is not None:argv+=['--expected-bytes',str(expected_bytes)]
+    if expected_sha256:argv+=['--expected-sha256',expected_sha256]
     if bind:
         argv += ['--bind', bind]
+    ready=piddir/f'{port}.ready';ready.unlink(missing_ok=True)
     with (outdir / 'listener.log').open('ab') as log:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,
                                   stderr=log, start_new_session=True,
                                   env={'PATH': '/usr/bin:/bin', 'HOME': '/root', 'LC_ALL': 'C'})
-    pidfile.write_text(json.dumps({'pid': process.pid, 'port': port,
-                                   'bind': bind or '0.0.0.0',
+    pidfile.write_text(json.dumps({'pid': process.pid, 'process_birth':process_birth(process.pid),'port': port,**selection,'mode':mode,
+                                   'expected_bytes':expected_bytes,'expected_sha256':expected_sha256,'max_bytes':max_bytes,
                                    'scope': config['allowed'],
                                    'expires': int(time.time() + int(timeout))}))
+    def is_ready():
+        try:return json.loads(ready.read_text()).get('pid')==process.pid
+        except (OSError,ValueError):return False
+    for _ in range(60):
+        if is_ready() or process.poll() is not None:break
+        time.sleep(0.05)
+    if not is_ready():return {'status':'error','reason_category':'receiver_unavailable','error':'Callback worker did not bind its socket','selection':selection}
     return {'status': 'listening', 'task_id': task, 'port': port,
-            'bind': bind or '0.0.0.0', 'pid': process.pid,
+            **selection,'mode':mode, 'pid': process.pid,
             'accepts_from': config['allowed'], 'timeout': int(timeout),
             'output_dir': str(outdir)}
 
@@ -2054,6 +2228,7 @@ def callback_read(task, since=None, limit=50):
             events.append(event)
     return {'status': 'ok', 'task_id': task, 'entries': entries,
             'count': len(entries), 'events': events, 'event_count': len(events),
+            'sessions':session_list(task)['sessions'],
             'output_dir': str(outdir)}
 
 
@@ -2075,7 +2250,7 @@ def callback_close(task, port=None):
                 cmdline = Path(f'/proc/{pid}/cmdline').read_bytes().decode('utf-8', 'replace')
             except OSError:
                 cmdline = ''
-            if 'callback' in cmdline and str(task) in cmdline:
+            if callback_alive(info,task,path.stem):
                 try:
                     os.kill(pid, signal.SIGTERM)
                     killed.append(pid)
@@ -2104,6 +2279,14 @@ def session_id_valid(raw):
     return str(raw)
 
 
+def new_session_id(directory):
+    # Callers hold the task lock. Never reuse an ID whose original log survives.
+    for _ in range(32):
+        sid=os.urandom(4).hex()
+        if not any((directory/(sid+suffix)).exists() for suffix in ('.json','.log','.sock','-control')):return sid
+    raise RuntimeError('Cannot allocate a unique session ID')
+
+
 def session_meta(task, session_id):
     path = session_dir(task) / f'{session_id_valid(session_id)}.json'
     if not path.is_file() or path.is_symlink():
@@ -2114,6 +2297,15 @@ def session_meta(task, session_id):
         raise ValueError('Session metadata is unreadable')
     if int(meta.get('task_id') or 0) != int(task):
         raise ValueError('Session does not belong to this task')
+    # A parent can die after spawning the worker but before publishing its PID.
+    # Recover from the existing private control socket, never by spawning again.
+    if not meta.get('pid') and Path(meta.get('socket','')).is_socket():
+        try:
+            health=session_request(meta,{'op':'status'},timeout=2)
+            candidate={**meta,'pid':health.get('worker_pid',0),'process_birth':health.get('worker_birth','')}
+            if candidate['pid'] and session_alive(candidate):
+                meta=candidate;tool_store(path,meta)
+        except (OSError,ValueError,RuntimeError):pass
     return meta
 
 
@@ -2125,7 +2317,80 @@ def session_alive(meta):
         cmdline = Path(f'/proc/{pid}/cmdline').read_bytes().decode('utf-8', 'replace')
     except OSError:
         return False
-    return 'session-worker' in cmdline
+    return ('session-worker' in cmdline and str(meta.get('session_id','')) in cmdline
+            and (not meta.get('process_birth') or meta['process_birth']==process_birth(pid)))
+
+
+def process_birth(pid):
+    try:return Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')',1)[1].split()[19]
+    except (OSError,ValueError,IndexError):return ''
+
+
+@contextmanager
+def session_lock(task):
+    import fcntl
+    fd=os.open(session_dir(task)/'.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX);yield
+    finally:os.close(fd)
+
+
+def session_invoker(task,owner='',owner_pid=0):
+    ensure_root();_,config=owned_config(task)
+    if os.environ.get('SUDO_UID') and int(os.environ['SUDO_UID'])!=config['uid']:raise PermissionError('Wrong task owner')
+    owner=owner or 'operator:'+str(config['uid'])
+    if not re.fullmatch(r'[A-Za-z0-9:_-]{1,100}',owner):raise ValueError('Invalid session owner')
+    pid=int(owner_pid or 0)
+    if pid and Path(f'/proc/{pid}').stat().st_uid!=config['uid']:raise PermissionError('Owner process has a different uid')
+    return config,owner,pid
+
+
+def session_access(task,sid,action,*,owner='',owner_pid=0,data='',wait=0):
+    config,owner,pid=session_invoker(task,owner,owner_pid)
+    with session_lock(task):
+        meta=session_meta(task,sid)
+        other=meta.get('owner','')
+        birth=process_birth(meta['owner_pid']) if meta.get('owner_pid') else ''
+        owner_live=bool(other and (not meta.get('owner_pid') or birth and birth==meta.get('owner_birth')))
+        if other and other!=owner and owner_live:
+            return {'status':'blocked','kind':'session_busy','error':'Terminal is owned by another live agent',
+                    'execution_started':False,'session_id':sid,'owner':other}
+        if action=='release':
+            meta.update(last_owner=other or meta.get('last_owner',''),owner='',owner_pid=0,owner_birth='')
+            tool_store(session_dir(task)/f'{sid}.json',meta)
+            return {'status':'released','session_id':sid,'running':session_alive(meta),'owner':''}
+        if not session_alive(meta):return {'status':'disconnected','session_id':sid,'running':False,'reason':'worker_not_alive'}
+        if action in ('send','interrupt') and meta.get('transport') in ('ssh','callback'):
+            peer=(meta.get('ssh') or {}).get('target') or meta['resource']
+            try:
+                if meta['transport']=='callback':
+                    if not ip_in_allowed(peer,config['allowed']):raise ValueError('Accepted peer no longer in scope')
+                else:check_target(peer,config['allowed'])
+                authorize_resource(config.get('resource_policy'),'session',peer)
+            except ValueError:return {'status':'blocked','kind':'scope','error':'Session peer is outside current task scope; read history or close it',
+                                     'execution_started':False,'session_id':sid}
+        if action=='send' and other!=owner and (other or meta.get('last_owner') not in (None,'',owner)):
+            return {'status':'blocked','kind':'session_read_required','error':'Read the retained terminal after handoff before sending input',
+                    'execution_started':False,'session_id':sid}
+        if action=='send' and meta.get('pending_unknown'):
+            return {'status':'blocked','kind':'outcome_unknown','reason_category':'outcome_unknown',
+                    'error':'Previous input has unknown outcome; read/interrupt or operator review required',
+                    'execution_started':False,'session_id':sid}
+        meta.update(owner=owner,owner_pid=pid,owner_birth=process_birth(pid) if pid else '')
+        if action=='send':meta['pending_unknown']=True
+        tool_store(session_dir(task)/f'{sid}.json',meta)
+        try:
+            result=session_request(meta,{'op':action,'data':data,'wait':float(wait or 0)})
+        except (OSError,ValueError,RuntimeError) as exc:
+            return {'status':'unknown','running':None,'session_id':sid,'owner':owner,
+                    'reason_category':'outcome_unknown','error':type(exc).__name__}
+        if action=='send' or result.get('prompt_seen') is True:meta['pending_unknown']=False
+        tool_store(session_dir(task)/f'{sid}.json',meta)
+        transport=meta.get('transport','pty')
+        remote=transport=='callback' or transport=='ssh' and (Path(meta['ssh']['control_root'])/'control').is_socket()
+        return {**result,'session_id':sid,'owner':owner,'running':result.get('running',result.get('status')!='closed'),
+                'transport':transport,'task_id':task,'target':(meta.get('ssh') or {}).get('target') or meta.get('resource'),
+                'network_contact':True if action=='send' and remote else None}
 
 
 def session_request(meta, payload, timeout=20):
@@ -2149,10 +2414,17 @@ def session_request(meta, payload, timeout=20):
     return json.loads(line)
 
 
-def session_open(task, argv, idle):
+def session_open(task,*args,**kwargs):
+    ensure_root();_,config=owned_config(task)
+    if config.get('resource_policy'):authorize_resource(config['resource_policy'],'session',config['resource_policy']['addresses'][0])
+    with session_lock(task):return _session_open(task,*args,**kwargs)
+
+
+def _session_open(task, argv, idle,owner='',owner_pid=0,ssh_spec=None,resource='',username='',purpose=''):
     """Start a long-lived interactive session inside the task namespace."""
     ensure_root()
     v, config = owned_config(task)
+    config,owner,owner_pid=session_invoker(task,owner,owner_pid)
     policy=config.get('resource_policy')
     if policy:authorize_resource(policy,'session',policy['addresses'][0])
     if not config['allowed']:
@@ -2161,14 +2433,15 @@ def session_open(task, argv, idle):
     live = 0
     for path in sorted(directory.glob('*.json')):
         try:
-            meta = json.loads(path.read_text())
+            meta = session_meta(task,path.stem)
         except (ValueError, OSError):
-            path.unlink(missing_ok=True)
+            live+=1 # Unknown occupied slot; do not erase possibly live state.
             continue
         if session_alive(meta):
             live += 1
-        else:
+        elif meta.get('pid'):
             path.unlink(missing_ok=True)
+        else:live+=1
     if live >= SESSION_MAX:
         raise ValueError(f'Too many open sessions (max {SESSION_MAX}); close one first')
     shell = [str(item) for item in (argv or ['/bin/bash', '--noprofile', '--norc', '-i'])]
@@ -2183,7 +2456,12 @@ def session_open(task, argv, idle):
     if not self_path.startswith(('/usr/local/sbin/', '/usr/sbin/')):
         raise RuntimeError('Sessions must be started from the installed broker')
     workdir = task_workdir(task, config)
-    session_id = os.urandom(4).hex()
+    session_id = new_session_id(directory)
+    ssh=None
+    if ssh_spec is not None:
+        if argv:raise ValueError('Choose generic argv or managed SSH, not both')
+        ssh=managed_ssh(task,session_id,ssh_spec,config)
+        shell=ssh['argv']
     socket_path = directory / f'{session_id}.sock'
     log_path = directory / f'{session_id}.log'
     idle = max(60, min(int(idle or SESSION_IDLE), SESSION_IDLE_MAX))
@@ -2191,6 +2469,10 @@ def session_open(task, argv, idle):
             'socket': str(socket_path), 'log': str(log_path),
             'workdir': str(workdir), 'argv': shell, 'idle': idle,
             'created': int(time.time()), 'scope': config['allowed']}
+    meta.update(owner=owner,owner_pid=owner_pid,owner_birth=process_birth(owner_pid) if owner_pid else '',
+                resource=ssh['target'] if ssh else resource or 'task',username=ssh['user'] if ssh else username or 'unknown',
+                purpose=purpose[:1000],transport='ssh' if ssh else 'pty',ssh=ssh)
+    meta['username_provenance']='configured login; not verified identity' if ssh else 'declared; not verified identity'
     meta_path = directory / f'{session_id}.json'
     fd = os.open(meta_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'w') as handle:
@@ -2203,24 +2485,202 @@ def session_open(task, argv, idle):
             start_new_session=True,
             env={'PATH': '/usr/bin:/bin', 'HOME': '/root', 'LC_ALL': 'C'})
     meta['pid'] = process.pid
-    fd = os.open(meta_path, os.O_WRONLY | os.O_TRUNC)
-    with os.fdopen(fd, 'w') as handle:
-        json.dump(meta, handle)
+    meta['process_birth']=process_birth(process.pid)
+    tool_store(meta_path,meta)
     for _ in range(120):
         if socket_path.exists() or process.poll() is not None:
             break
         time.sleep(0.05)
     if not socket_path.exists():
         process.kill()
-        meta_path.unlink(missing_ok=True)
-        raise RuntimeError(f'Session did not start; see {log_path}')
+        return {'status':'unknown','running':None,'reason_category':'outcome_unknown','session_id':session_id,
+                'execution_started':True,'error':'Session worker did not become ready; inspect its log before retrying','log':str(log_path)}
     return {'status': 'opened', 'task_id': task, 'session_id': session_id,
             'pid': process.pid, 'argv': shell, 'workdir': str(workdir),
             'idle_timeout': idle, 'accepts_from': config['allowed'],
+            'owner':owner,'transport':meta['transport'],'resource':meta['resource'],'username':meta['username'],
+            'username_provenance':meta['username_provenance'],'purpose':purpose,
             'note': 'state persists: send input, then read output; /work keeps files'}
 
 
-def session_worker(task, session_id):
+def managed_ssh(task,sid,raw,config):
+    binary=Path('/usr/bin/ssh')
+    if not binary.is_file() or not os.access(binary,os.X_OK):raise ToolError('tool_missing','OpenSSH client is unavailable')
+    if not isinstance(raw,dict) or set(raw)!={'target','user','port','identity'}:raise ValueError('Invalid managed SSH spec')
+    target=check_target(raw['target'],config['allowed'])
+    authorize_resource(config.get('resource_policy'),'session',target)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}',raw['user']):raise ValueError('Invalid SSH user')
+    port=raw['port']
+    if type(port) is not int or not 1<=port<=65535:raise ValueError('Invalid SSH port')
+    identity=raw['identity']
+    if identity and (not isinstance(identity,str) or not re.fullmatch(r'/work/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+',identity)
+                     or '..' in identity.split('/')):raise ValueError('SSH identity must be a task workspace file')
+    work=task_workdir(task,config)
+    tool_write_file(work,f'ssh/{sid}/metadata.json',b'{}',config)
+    # Root-private parent: other task PoCs cannot access the multiplex socket.
+    control_root=session_dir(task)/(sid+'-control');control_root.mkdir(mode=0o700)
+    os.chown(control_root,config['uid'],config['gid'])
+    control='/run/pm-control/control'
+    args=['/usr/bin/ssh','-F','/dev/null','-o','ControlMaster=yes','-o','ControlPersist=no',
+          '-o','ControlPath='+control,'-o','ServerAliveInterval=15','-o','ServerAliveCountMax=2',
+          '-o','UserKnownHostsFile=/work/ssh/'+sid+'/known_hosts','-o','StrictHostKeyChecking=accept-new',
+          '-o','PermitLocalCommand=no','-o','EscapeChar=none','-o','ForwardAgent=no','-p',str(port),'-tt']
+    if identity:args+=['-i',identity]
+    args+=['--',raw['user']+'@'+target]
+    return {'target':target,'user':raw['user'],'port':port,'control':control,'control_root':str(control_root),'argv':args}
+
+
+def pivot_spec(raw):
+    fields={'source_session','resource_ref','destination','port','local_port','probe','purpose'}
+    if not isinstance(raw,dict) or set(raw)!=fields:raise ValueError('Invalid SSH-forward specification')
+    if not isinstance(raw['source_session'],str):raise ValueError('Source session ID must be a string')
+    session_id_valid(raw['source_session'])
+    if not re.fullmatch(r'resource:[A-Za-z0-9:_-]+',str(raw['resource_ref'])):raise ValueError('Pivot needs a saved resource reference')
+    target=str(ipaddress.ip_address(raw['destination']))
+    if ipaddress.ip_address(target).is_loopback or ipaddress.ip_address(target).is_unspecified:
+        raise ValueError('This forward profile requires an explicitly scoped internal address, not ambiguous loopback')
+    if type(raw['port']) is not int or not 1<=raw['port']<=65535:raise ValueError('Invalid destination port')
+    local_port=callback_port(raw['local_port'])
+    if raw['probe'] not in ('http_headers','banner'):raise ValueError('Supported route probes: http_headers or banner')
+    if not isinstance(raw['purpose'],str) or not raw['purpose'].strip() or len(raw['purpose'])>1000:raise ValueError('Invalid pivot purpose')
+    return {**raw,'destination':target,'local_port':local_port}
+
+
+def pivot_prepare(task,raw):
+    config,_,_=session_invoker(task)
+    spec=pivot_spec(raw);check_target(spec['destination'],config['allowed'])
+    authorize_resource(config.get('resource_policy'),'session',spec['destination'])
+    if spec['probe']=='http_headers':authorize_resource(config.get('resource_policy'),'http',spec['destination'],port=spec['port'])
+    source=session_meta(task,spec['source_session'])
+    if source.get('transport')!='ssh' or not source.get('ssh') or not session_alive(source):
+        raise ValueError('Pivot requires a live managed SSH ControlMaster session')
+    check_target(source['ssh']['target'],config['allowed']);authorize_resource(config.get('resource_policy'),'session',source['ssh']['target'])
+    if not (Path(source['ssh']['control_root'])/'control').is_socket():raise ValueError('SSH is not authenticated/connected: no ControlMaster socket')
+    health=session_request(source,{'op':'status'},timeout=3)
+    if not health.get('running'):raise ValueError('Source terminal did not pass its health check')
+    manifest={'task_id':task,'owner_uid':config['uid'],'protocol':1,'spec':spec,
+        'source_ssh':source['ssh'],'listener':'127.0.0.1:'+str(spec['local_port']),
+        'listener_context':'task_namespace','rights':'task user, fixed SSH forward through existing ControlMaster',
+        'actions':['one local TCP forward to the specified internal address/port','one bounded destination probe']}
+    rid=tool_digest(manifest);path=BASE/f'pivot-{task}-{rid}.json'
+    if path.exists():return tool_load(path)
+    result={'request_id':rid,'manifest':manifest,'status':'prepared'};tool_store(path,result);return result
+
+
+def pivot_control(task,receipt,operation):
+    v,config=owned_config(task);ssh=receipt['manifest']['source_ssh'];spec=receipt['manifest']['spec']
+    destination='['+spec['destination']+']' if ':' in spec['destination'] else spec['destination']
+    args=['/usr/bin/ssh','-F','/dev/null','-S',ssh['control'],'-o','ExitOnForwardFailure=yes',
+        '-o','ProxyCommand=/usr/bin/false','-o','BatchMode=yes',
+        '-O',operation,'-L',f"127.0.0.1:{spec['local_port']}:{destination}:{spec['port']}",
+        '-p',str(ssh['port']),'--',ssh['user']+'@'+ssh['target']]
+    control=os.open(ssh['control_root'],os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        extra=['--dir','/run','--bind',f'/proc/self/fd/{control}','/run/pm-control']
+        return cmd(*isolated_command(v['name'],config['owner'],config['uid'],config['gid'],args,extra,
+                    workdir=task_workdir(task,config)),timeout=15,check=False,pass_fds=(control,))
+    finally:os.close(control)
+
+
+def pivot_probe(task,receipt):
+    v,config=owned_config(task);spec=receipt['manifest']['spec'];port=spec['local_port']
+    if spec['probe']=='http_headers':
+        host='['+spec['destination']+']' if ':' in spec['destination'] else spec['destination']
+        args=['/usr/bin/curl','-q','--noproxy','*','--silent','--show-error','--head',
+            '--max-redirs','0','--connect-timeout','3','--max-time','5','--max-filesize','8192',
+            '--connect-to',f'{host}:{spec["port"]}:127.0.0.1:{port}','--',f'http://{host}:{spec["port"]}/']
+    else:
+        # Fixed program, no user code/argv. Bytes from the remote end are required:
+        # a connect to a local SSH listener alone cannot prove destination access.
+        code='import socket,sys;s=socket.create_connection(("127.0.0.1",int(sys.argv[1])),3);s.settimeout(3);sys.stdout.buffer.write(s.recv(1024));s.close()'
+        args=['/usr/bin/python3','-c',code,str(port)]
+    result=cmd(*isolated_command(v['name'],config['owner'],config['uid'],config['gid'],args,
+                               workdir=task_workdir(task,config)),timeout=8,check=False)
+    text=result.stdout[:4096]
+    verified=bool(result.returncode==0 and (re.match(r'HTTP/\S+ \d{3}',text) if spec['probe']=='http_headers' else text))
+    return {'status':'responded' if verified else 'not_verified','exit_code':result.returncode,
+        'output':text,'reason':'destination_bytes_received' if verified else 'no_destination_evidence',
+        'observed_at':int(time.time()),'local_connect_alone_is_evidence':False}
+
+
+def pivot_action(task,action,rid):
+    config,_,_=session_invoker(task)
+    if not re.fullmatch(r'[a-f0-9]{64}',rid):raise ValueError('Invalid pivot receipt ID')
+    path=BASE/f'pivot-{task}-{rid}.json'
+    import fcntl
+    fd=os.open(str(path)+'.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX)
+        receipt=tool_load(path);manifest=receipt['manifest'];spec=manifest['spec']
+        if manifest['task_id']!=task or manifest['owner_uid']!=config['uid'] or tool_digest(manifest)!=rid:raise ValueError('Wrong pivot receipt owner/task')
+        if action!='close':
+            check_target(spec['destination'],config['allowed']);authorize_resource(config.get('resource_policy'),'session',spec['destination'])
+            check_target(manifest['source_ssh']['target'],config['allowed'])
+            authorize_resource(config.get('resource_policy'),'session',manifest['source_ssh']['target'])
+        if action=='authorize':
+            if receipt['status']=='prepared':receipt['status']='approved';tool_store(path,receipt)
+            return receipt
+        if receipt['status']=='prepared':return receipt
+        try:source=session_meta(task,spec['source_session']);alive=session_alive(source) and session_request(source,{'op':'status'},timeout=2).get('running')
+        except (OSError,ValueError,RuntimeError):alive=False
+        if not alive:
+            receipt.update(status='broken_source',reason='source_session_unavailable');tool_store(path,receipt);return receipt
+        if source.get('ssh')!=manifest['source_ssh']:raise ValueError('Source session changed; new permission required')
+        probed=False
+        if action=='close':
+            result=pivot_control(task,receipt,'cancel')
+            receipt.update(status='closed' if result.returncode==0 else 'unknown',exit_code=result.returncode)
+        elif action=='apply' and receipt['status']=='approved':
+            receipt['status']='creating';tool_store(path,receipt)
+            try:
+                result=pivot_control(task,receipt,'forward')
+                if result.returncode:receipt.update(status='failed',reason='ssh_forward_refused',exit_code=result.returncode)
+                else:
+                    receipt['probe']=pivot_probe(task,receipt);probed=True
+                    receipt['status']='active' if receipt['probe']['status']=='responded' else 'established_unverified'
+            except (OSError,RuntimeError,subprocess.TimeoutExpired):receipt.update(status='unknown',reason='forward_outcome_unknown_no_replay')
+        elif action=='probe' and receipt['status'] in ('active','established_unverified'):
+            receipt['probe']=pivot_probe(task,receipt);probed=True
+            receipt['status']='active' if receipt['probe']['status']=='responded' else 'established_unverified'
+        # status and repeated apply never create another forward or probe.
+        tool_store(path,receipt)
+        if probed:return {**receipt,'route_state':receipt['status'],'status':'completed',
+            'probe_performed':True,'task_id':task,'target':spec['destination'],
+            'stdout':receipt['probe']['output'],'exit_code':receipt['probe']['exit_code']}
+        return receipt
+    finally:os.close(fd)
+
+
+def session_accept(task,connection,peer,port,config):
+    """Adopt an already scoped incoming socket as an interactive task connection."""
+    with session_lock(task):
+        directory=session_dir(task)
+        live=sum(session_alive(json.loads(p.read_text())) for p in directory.glob('*.json'))
+        if live>=SESSION_MAX:return {'status':'rejected','reason':'session_limit','running':False}
+        sid=new_session_id(directory);path=directory/f'{sid}.json'
+        meta={'task_id':task,'session_id':sid,'pid':0,'socket':str(directory/f'{sid}.sock'),
+            'log':str(directory/f'{sid}.log'),'argv':[],'idle':SESSION_IDLE,'created':int(time.time()),
+            'scope':config['allowed'],'transport':'callback','resource':peer,'username':'unknown',
+            'purpose':'incoming interactive connection','callback_port':port,'owner':'','owner_pid':0}
+        tool_store(path,meta)
+        self_path=os.path.realpath(sys.argv[0])
+        if not self_path.startswith(('/usr/local/sbin/','/usr/sbin/')):raise ValueError('Callback session must use the installed broker')
+        with open(meta['log'],'ab') as log:
+            child=subprocess.Popen([self_path,'session-worker','--task-id',str(task),'--session-id',sid,
+                '--accepted-fd',str(connection.fileno())],pass_fds=(connection.fileno(),),
+                stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True,env={'PATH':'/usr/bin:/bin','LC_ALL':'C'})
+        meta.update(pid=child.pid,process_birth=process_birth(child.pid));tool_store(path,meta)
+        for _ in range(120):
+            if Path(meta['socket']).exists() or child.poll() is not None:break
+            time.sleep(0.05)
+        if not Path(meta['socket']).exists():
+            if child.poll() is None:child.terminate()
+            return {'status':'failed','reason':'incoming_session_worker_not_ready','session_id':sid,'running':False}
+        return {'status':'connected','session_id':sid,'resource':peer,'transport':'callback',
+                'running':True,'owner':'','username':'unknown'}
+
+
+def session_worker(task, session_id,accepted_fd=-1):
     """Detached worker: owns the PTY and keeps the sandbox alive between calls."""
     ensure_root()
     v, config = owned_config(task)
@@ -2235,55 +2695,77 @@ def session_worker(task, session_id):
     workdir = task_workdir(task, config)
     idle = int(meta.get('idle') or SESSION_IDLE)
     argv = [str(item) for item in meta.get('argv') or []]
+    control=-1;extra=()
+    if meta.get('ssh'):
+        control=os.open(meta['ssh']['control_root'],os.O_DIRECTORY|os.O_NOFOLLOW)
+        os.set_inheritable(control,True)
+        extra=['--dir','/run','--bind',f'/proc/self/fd/{control}','/run/pm-control']
     command = isolated_command(v['name'], config['owner'], config['uid'],
-                               config['gid'], argv, workdir=workdir,
+                               config['gid'], argv, extra,workdir=workdir,
                                new_session=False)
     default_shell = argv == ['/bin/bash', '--noprofile', '--norc', '-i']
     if default_shell:
         separator = command.index('--')
         command[separator:separator] = ['--setenv', 'PS1', 'PM_SESSION> ']
-    child, master = os.forkpty()
-    if child == 0:
-        try:
-            os.execv(command[0], command)
-        except OSError:
-            os._exit(127)
+    incoming=None
+    if meta.get('transport')=='callback':
+        if accepted_fd<0:raise ValueError('Incoming session needs its accepted socket')
+        incoming=socket.socket(fileno=accepted_fd)
+        peer=incoming.getpeername()[0]
+        if peer!=meta['resource'] or not ip_in_allowed(peer,config['allowed']):raise ValueError('Incoming session peer differs from scope')
+        child=0;master=incoming.fileno()
+    else:
+        if accepted_fd>=0:raise ValueError('Unexpected incoming socket')
+        child, master = os.forkpty()
+        if child == 0:
+            try:os.execv(command[0], command)
+            except OSError:os._exit(127)
     os.set_blocking(master, False)
+    if control>=0:os.close(control)
     buffer = bytearray()
     cursor = 0
     last_request = time.monotonic()
     log = open(log_path, 'ab', buffering=0)
+    log_bytes=os.fstat(log.fileno()).st_size;log_truncated=False;dropped_bytes=0
 
     def drain(seconds=0.0):
         """Move PTY output into the buffer; False means the child is gone."""
-        nonlocal cursor
+        nonlocal cursor,log_bytes,log_truncated,dropped_bytes
+        drained=0
         deadline = time.monotonic() + max(0.0, seconds)
         while True:
             try:
                 chunk = os.read(master, 65536)
             except BlockingIOError:
-                chunk = b''
+                chunk = None
             except OSError:
                 return False
             if chunk:
                 buffer.extend(chunk)
                 try:
-                    log.write(chunk)
+                    writable=max(0,SESSION_LOG_BYTES-log_bytes)
+                    log.write(chunk[:writable]);log_bytes+=min(writable,len(chunk))
+                    if len(chunk)>writable:log_truncated=True
                 except OSError:
-                    pass
+                    log_truncated=True
                 overflow = len(buffer) - SESSION_OUTPUT_KEEP
                 if overflow > 0:
                     del buffer[:overflow]
+                    dropped_bytes+=overflow
                     cursor = max(0, cursor - overflow)
+                drained+=len(chunk)
+                if drained>=SESSION_OUTPUT_KEEP:return True # service interrupt/control even under continuous output
                 continue
+            if chunk==b'':return False
             if time.monotonic() >= deadline:
                 return True
             time.sleep(0.05)
 
     def take():
         nonlocal cursor
-        text = bytes(buffer[cursor:]).decode('utf-8', 'replace')
-        cursor = len(buffer)
+        end=min(len(buffer),cursor+SESSION_REPLY_BYTES)
+        text = bytes(buffer[cursor:end]).decode('utf-8', 'replace')
+        cursor = end
         return text
 
     def prompt_seen():
@@ -2308,14 +2790,19 @@ def session_worker(task, session_id):
         op = str(request.get('op') or '')
         wait = min(max(float(request.get('wait') or 0), 0.0), 5.0)
         if op == 'status':
-            return {'status': 'running', 'pid': child, 'session_id': session_id,
+            alive=drain(0)
+            return {'status': 'running' if alive else 'disconnected','running':alive,'pid': child, 'session_id': session_id,
+                    'worker_pid':os.getpid(),'worker_birth':process_birth(os.getpid()),
                     'workdir': str(workdir),
-                    'buffered': len(buffer) - cursor}, False
+                    'prompt_seen':prompt_seen(),
+                    'buffered': len(buffer) - cursor,'log_truncated':log_truncated,'dropped_bytes':dropped_bytes,
+                    'stream_state_sha256':hashlib.sha256(buffer).hexdigest(),'has_more':cursor<len(buffer)}, False
         if op == 'read':
-            drain(wait)
+            alive=drain(wait)
             text = take()
-            return {'status': 'ok', 'output': text, 'chars': len(text),
-                    'prompt_seen': prompt_seen()}, False
+            return {'status': 'ok' if alive else 'disconnected','running':alive, 'output': text, 'chars': len(text),
+                    'prompt_seen': prompt_seen(),'has_more':cursor<len(buffer),'log_truncated':log_truncated,'dropped_bytes':dropped_bytes,
+                    'stream_state_sha256':hashlib.sha256(buffer).hexdigest()}, False
         if op in ('send', 'interrupt'):
             data = str(request.get('data') or '') if op == 'send' else '\x03'
             if len(data.encode('utf-8')) > SESSION_DATA_MAX:
@@ -2327,7 +2814,8 @@ def session_worker(task, session_id):
             drain(wait)
             text = take()
             reply = {'status': 'ok', 'output': text, 'chars': len(text),
-                     'prompt_seen': prompt_seen()}
+                     'prompt_seen': prompt_seen(),'has_more':cursor<len(buffer),'log_truncated':log_truncated,'dropped_bytes':dropped_bytes,
+                     'stream_state_sha256':hashlib.sha256(buffer).hexdigest()}
             warning = heredoc_warning(data) if op == 'send' else None
             if warning:
                 reply['warning'] = warning
@@ -2386,10 +2874,10 @@ def session_worker(task, session_id):
             if time.monotonic() - last_request > idle:
                 break
     finally:
-        try:
-            os.killpg(child, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if child:
+            try:os.killpg(child, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):pass
+        if incoming:incoming.close()
         try:
             log.close()
         except OSError:
@@ -2404,53 +2892,40 @@ def session_worker(task, session_id):
         meta_path.unlink(missing_ok=True)
 
 
-def session_send(task, session_id, data, wait):
+def session_send(task, session_id, data, wait,owner='',owner_pid=0):
     reject_password_change(text=data)
     ensure_root()
     owned_config(task)
     if len(str(data).encode('utf-8')) > SESSION_DATA_MAX:
         raise ValueError('Session input is too large')
-    meta = session_meta(task, session_id)
-    if not session_alive(meta):
-        raise ValueError('Session is not running')
-    return session_request(meta, {'op': 'send', 'data': str(data),
-                                  'wait': float(wait or 0)})
+    return session_access(task,session_id,'send',owner=owner,owner_pid=owner_pid,data=str(data),wait=wait)
 
 
-def session_interrupt(task, session_id, wait):
+def session_interrupt(task, session_id, wait,owner='',owner_pid=0):
+    ensure_root()
+    owned_config(task)
+    return session_access(task,session_id,'interrupt',owner=owner,owner_pid=owner_pid,wait=wait)
+
+
+def session_read(task, session_id, wait,owner='',owner_pid=0):
+    ensure_root()
+    owned_config(task)
+    return session_access(task,session_id,'read',owner=owner,owner_pid=owner_pid,wait=wait)
+
+
+def session_close(task, session_id,owner='',owner_pid=0):
     ensure_root()
     owned_config(task)
     meta = session_meta(task, session_id)
-    if not session_alive(meta):
-        raise ValueError('Session is not running')
-    return session_request(meta, {'op': 'interrupt', 'wait': float(wait or 0)})
-
-
-def session_read(task, session_id, wait):
-    ensure_root()
-    owned_config(task)
-    meta = session_meta(task, session_id)
-    if not session_alive(meta):
-        raise ValueError('Session is not running')
-    return session_request(meta, {'op': 'read', 'wait': float(wait or 0)})
-
-
-def session_close(task, session_id):
-    ensure_root()
-    owned_config(task)
-    meta = session_meta(task, session_id)
+    released=session_access(task,session_id,'close',owner=owner,owner_pid=owner_pid)
+    if released.get('status') in ('blocked','unknown'):return released
     pid = int(meta.get('pid') or 0)
-    if session_alive(meta):
-        try:
-            session_request(meta, {'op': 'close'}, timeout=10)
-        except (OSError, ValueError, RuntimeError):
-            pass
     killed = False
     for _ in range(40):
-        if not pid or not Path(f'/proc/{pid}').exists():
+        if not pid or not session_alive(meta):
             break
         time.sleep(0.05)
-    if pid and Path(f'/proc/{pid}').exists():
+    if pid and session_alive(meta):
         try:
             os.kill(pid, signal.SIGKILL)
             killed = True
@@ -2464,26 +2939,58 @@ def session_close(task, session_id):
             'killed': killed, 'log': meta.get('log')}
 
 
-def session_list(task):
+def ssh_health(task,meta):
+    v,config=owned_config(task);ssh=meta['ssh']
+    try:check_target(ssh['target'],config['allowed']);authorize_resource(config.get('resource_policy'),'session',ssh['target'])
+    except ValueError:return {'status':'unverified','operation':'not_started: source outside current task scope'}
+    control=os.open(ssh['control_root'],os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        # Existing master only: if multiplexing is gone, ProxyCommand=false
+        # forbids a new connection or authentication attempt during recovery.
+        args=['/usr/bin/ssh','-F','/dev/null','-S',ssh['control'],'-o','ControlMaster=no',
+            '-o','BatchMode=yes','-o','ProxyCommand=/usr/bin/false','-p',str(ssh['port']),
+            '--',ssh['user']+'@'+ssh['target'],'true']
+        result=cmd(*isolated_command(v['name'],config['owner'],config['uid'],config['gid'],args,
+            ['--dir','/run','--bind',f'/proc/self/fd/{control}','/run/pm-control'],workdir=task_workdir(task,config)),
+            timeout=3,check=False,pass_fds=(control,))
+        return {'status':'verified_remote_exec' if result.returncode==0 else 'unverified',
+                'exit_code':result.returncode,'operation':'fixed POSIX true via existing SSH master; no fallback login'}
+    except (OSError,RuntimeError,subprocess.TimeoutExpired):return {'status':'unverified','operation':'existing SSH master health check failed'}
+    finally:os.close(control)
+
+
+def session_list(task,check_remote=False):
     ensure_root()
-    owned_config(task)
+    session_invoker(task)
     directory = session_dir(task)
     sessions = []
     for path in sorted(directory.glob('*.json')):
         try:
-            meta = json.loads(path.read_text())
+            meta = session_meta(task,path.stem)
         except (ValueError, OSError):
-            path.unlink(missing_ok=True)
+            sessions.append({'session_id':path.stem,'running':None,'reason':'metadata_unreadable'})
             continue
-        alive = session_alive(meta)
+        alive = session_alive(meta) if meta.get('pid') else None
+        health={}
+        if alive:
+            try:
+                health=session_request(meta,{'op':'status'},timeout=2)
+                alive=bool(health.get('running'))
+            except (OSError,ValueError,RuntimeError):alive=None
+        if alive and meta.get('transport')=='ssh' and check_remote:health['ssh']=ssh_health(task,meta)
         sessions.append({'session_id': meta.get('session_id'),
                          'pid': meta.get('pid'), 'running': alive,
                          'argv': meta.get('argv'),
                          'idle_timeout': meta.get('idle'),
                          'created': meta.get('created'),
+                         'owner':meta.get('owner',''),'resource':meta.get('resource','task'),
+                         'username':meta.get('username','unknown'),'purpose':meta.get('purpose',''),
+                         'transport':meta.get('transport','pty'),'health':health,
+                         'connection_ready':bool(alive and (meta.get('transport')!='ssh' or
+                             health.get('ssh',{}).get('status')=='verified_remote_exec')),
+                         'remote_liveness':'unknown unless validated by current I/O or explicit SSH health check',
+                         'authentication_status':'not inferred from process liveness',
                          'log': meta.get('log')})
-        if not alive:
-            path.unlink(missing_ok=True)
     return {'status': 'ok', 'task_id': task, 'count': len(sessions),
             'sessions': sessions, 'max': SESSION_MAX,
             'workdir': str(WORK_BASE / str(task))}
@@ -2557,15 +3064,34 @@ def main():
     hs.add_argument('--task-id', type=int, required=True)
     hs.add_argument('--hostname', action='append', required=True)
     cb = sub.add_parser('callback')
-    cb.add_argument('--action', required=True, choices=('open', 'read', 'close', 'listen'))
+    cb.add_argument('--action', required=True, choices=('open', 'read', 'close', 'listen','diagnose','configure'))
     cb.add_argument('--task-id', type=int, required=True)
     cb.add_argument('--port', default='')
     cb.add_argument('--bind', default='')
     cb.add_argument('--timeout', default='300')
     cb.add_argument('--since', default='')
+    cb.add_argument('--mode',choices=('interactive','transfer'),default='interactive')
+    cb.add_argument('--expected-bytes',type=int,default=None)
+    cb.add_argument('--expected-sha256',default='')
+    cb.add_argument('--max-bytes',type=int,default=TRANSFER_DEFAULT_BYTES)
+    cb.add_argument('--interface',default='')
+    cb.add_argument('--advertise',default='')
+    cb.add_argument('--reason',default='')
+    cb.add_argument('--variant-limit',type=int,choices=range(1,11),default=None)
+    pi=sub.add_parser('pivot')
+    pi.add_argument('--task-id',type=int,required=True)
+    pi.add_argument('--action',choices=('prepare','authorize','apply','status','probe','close'),required=True)
+    pi.add_argument('--spec-json',default='');pi.add_argument('--request-id',default='')
     se = sub.add_parser('session')
     se.add_argument('--action', required=True,
-                    choices=('open', 'send', 'read', 'interrupt', 'close', 'list'))
+                    choices=('open', 'send', 'read', 'interrupt', 'close', 'list','release'))
+    se.add_argument('--owner',default='')
+    se.add_argument('--owner-pid',type=int,default=0)
+    se.add_argument('--ssh-json',default='')
+    se.add_argument('--resource',default='')
+    se.add_argument('--username',default='')
+    se.add_argument('--purpose',default='')
+    se.add_argument('--check-remote',type=int,choices=(0,1),default=0)
     se.add_argument('--task-id', type=int, required=True)
     se.add_argument('--session-id', default='')
     se.add_argument('--argv', action='append', default=None)
@@ -2575,6 +3101,7 @@ def main():
     sw = sub.add_parser('session-worker')
     sw.add_argument('--task-id', type=int, required=True)
     sw.add_argument('--session-id', required=True)
+    sw.add_argument('--accepted-fd',type=int,default=-1)
     sf = sub.add_parser('sync-forward')
     sf.add_argument('--task-id', type=int, required=True)
     st = sub.add_parser('status')
@@ -2583,6 +3110,7 @@ def main():
     try:
         if args.command == 'capabilities':
             output({'capture_protocol': 1,'resource_policy_protocol':1,'ipv6':True, 'tool_protocol': TOOL_PROTOCOL,
+                    'session_protocol':2,'pivot_protocol':1,'transfer_protocol':1,
                     'system_tools': SYSTEM_TOOLS, 'privileged_scan_profiles': list(RAW_SCAN_PROFILES),
                     'profiles': ['http_capture', 'exec', 'poc_run', 'research', 'session', *RAW_SCAN_PROFILES],
                     'research_domains': list(RESEARCH_DOMAINS),
@@ -2608,32 +3136,38 @@ def main():
                                         research_host=args.research_host, timeout=args.timeout or None,
                                         ssrf_destination=args.ssrf_destination,ssrf_context=args.ssrf_context,ssrf_parameter=args.ssrf_parameter)
         elif args.command == 'sync-forward': sync_forward(args.task_id)
+        elif args.command=='pivot':
+            output(pivot_prepare(args.task_id,json.loads(args.spec_json)) if args.action=='prepare' else pivot_action(args.task_id,args.action,args.request_id))
         elif args.command == 'callback':
             action = args.action
             if action == 'open':
-                output(callback_open(args.task_id, args.port or '4444', args.bind, args.timeout))
+                output(callback_open(args.task_id, args.port or '4444', args.bind, args.timeout,args.mode,args.expected_bytes,args.expected_sha256,args.max_bytes))
             elif action == 'read':
                 output(callback_read(args.task_id, args.since or None))
             elif action == 'close':
                 output(callback_close(args.task_id, args.port or None))
+            elif action=='diagnose':output(callback_diagnose(args.task_id,args.port or '4444'))
+            elif action=='configure':output(callback_configure(args.task_id,args.bind,args.interface,args.advertise,args.reason,args.variant_limit))
             else:
-                output(callback_listen(args.task_id, args.port or '4444', args.bind, args.timeout))
+                output(callback_listen(args.task_id, args.port or '4444', args.bind, args.timeout,args.mode,args.expected_bytes,args.expected_sha256,args.max_bytes))
         elif args.command == 'session-worker':
-            session_worker(args.task_id, args.session_id)
+            session_worker(args.task_id, args.session_id,args.accepted_fd)
         elif args.command == 'session':
             action = args.action
             if action == 'open':
-                output(session_open(args.task_id, args.argv, args.idle))
+                output(session_open(args.task_id, args.argv, args.idle,args.owner,args.owner_pid,
+                    json.loads(args.ssh_json) if args.ssh_json else None,args.resource,args.username,args.purpose))
             elif action == 'list':
-                output(session_list(args.task_id))
+                output(session_list(args.task_id,bool(args.check_remote)))
+            elif action=='release':output(session_access(args.task_id,args.session_id,'release',owner=args.owner,owner_pid=args.owner_pid))
             elif action == 'send':
-                output(session_send(args.task_id, args.session_id, args.data, args.wait))
+                output(session_send(args.task_id, args.session_id, args.data, args.wait,args.owner,args.owner_pid))
             elif action == 'read':
-                output(session_read(args.task_id, args.session_id, args.wait))
+                output(session_read(args.task_id, args.session_id, args.wait,args.owner,args.owner_pid))
             elif action == 'interrupt':
-                output(session_interrupt(args.task_id, args.session_id, args.wait))
+                output(session_interrupt(args.task_id, args.session_id, args.wait,args.owner,args.owner_pid))
             else:
-                output(session_close(args.task_id, args.session_id))
+                output(session_close(args.task_id, args.session_id,args.owner,args.owner_pid))
         elif args.command == 'hosts': set_hostnames(args.task_id, args.hostname)
         else:
             _, config = owned_config(args.task_id)
@@ -2643,7 +3177,8 @@ def main():
                     'current_egress': config.get('current_egress', config['egress']),
                     'host_veth_ip': config['host_ip'],
                     'docker_forward_managed': config.get('docker_forward_managed', False),
-                    'hostnames': config.get('hostnames', [])})
+                    'hostnames': config.get('hostnames', []),
+                    'resource_policy':config.get('resource_policy')})
     except ToolError as e:
         output({'status': 'blocked', 'kind': e.category, 'reason_category': e.category, 'error': str(e)}, fail=True)
     except PermissionError as e:

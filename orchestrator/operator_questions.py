@@ -49,6 +49,10 @@ def listing(db,task_id,*,pending=False):
             from orchestrator import tool_requests
             tool=tool_requests.for_question(db,task_id,item['id'])
             if tool:item['tool_request']=tool_requests.describe(tool)
+        if item['kind']=='pivoting':
+            from orchestrator import pivoting
+            route=pivoting.for_question(db,task_id,item['id'])
+            if route:item['pivot_request']=route
         if item['branch_id'].startswith('resource:') and task_memory.exists(db,'pm_resources'):
             resource=db.execute('SELECT kind,value,context FROM pm_resources WHERE task_id=? AND id=?',(task_id,item['branch_id'])).fetchone()
             if resource:item['resource']={'kind':resource[0],'value':resource[1],'context':resource[2]}
@@ -83,6 +87,9 @@ def request(db,task_id,target,decision,step_id,*,_flag_proposal=None):
     if kind=='tool' and 'request' in decision['operator_question']:
         from orchestrator import tool_requests
         return tool_requests.request(db,task_id,target,decision,step_id)
+    if kind=='pivoting' and 'request' in decision['operator_question']:
+        from orchestrator import pivoting
+        return pivoting.request(db,task_id,target,decision,step_id)
     if kind=='flag_confirmation' and _flag_proposal is None:
         from orchestrator import flag_review
         flag_review.activate(db,task_id)
@@ -140,6 +147,9 @@ def answer(db,task_id,question_id,decision,text='',*,capability_log=None):
             from orchestrator import tool_requests
             if tool_requests.answered(db,item,decision):
                 payload['permission_effect']='one immutable tool receipt only; task scope and budgets unchanged'
+        if item['kind']=='pivoting':
+            from orchestrator import pivoting
+            if pivoting.answered(db,item,decision):payload['permission_effect']='one scoped SSH-forward receipt; no additional task scope'
         if item['kind']=='flag_confirmation':
             from orchestrator import flag_review
             proposal=flag_review.for_question(db,task_id,item)

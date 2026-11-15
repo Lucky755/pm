@@ -2154,7 +2154,13 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
     context['_model_sessions']=[]
     prior_probe_ids = set(report_probe_records(task_id))
     db = connect()
+    from orchestrator import task_sessions
+    session_scope=task_sessions.role_scope(db,task_id,objective,
+        check_remote=spec['tools']=='inherit' or 'pm_session' in spec['tools'])
+    session_scope_entered=False
     try:
+        session_scope.__enter__()
+        session_scope_entered=True
         from orchestrator import operator_questions
         fact_state.import_capability_assets(
             db, task_id, CAPABILITY_LOG / f'task_{task_id}.jsonl')
@@ -2194,6 +2200,8 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                 # SDK from api_key). EXPERIENTIAL_API_KEY is injected too so the
                 # same key stays available if the profile name is ever changed.
                 env=harness_env({'EXPERIENTIAL_API_KEY': key,
+                                 'PM_SESSION_OWNER':task_sessions.owner(),
+                                 'PM_SESSION_PURPOSE':objective[:1000],
                                  'PM_AGENT_STATS_FILE': str(stats_path),
                                  'PM_AGENT_STEP_LIMIT': str(step_limit),
                                  'PM_AGENT_POC_BUDGET': str(poc_budget)}),
@@ -2240,7 +2248,6 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                 stats.update(watcher.metrics)
                 return turn, note, parsed, stats
 
-        close_task_sessions(task_id)
         try:
             result, recovery, report, tool_calls = attempt(max_tokens, prompt)
 
@@ -2340,9 +2347,9 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
             report.pop('operator_dependencies',None)
             probe_records=report_probe_records(task_id)
             requested={r['capture_record']['result'].get('question_id') for rid,r in probe_records.items()
-                       if rid not in prior_probe_ids and r['tool']=='tool_request' and r['status']=='waiting_operator'}
+                       if rid not in prior_probe_ids and r['tool'] in ('tool_request','pivot_request') and r['status']=='waiting_operator'}
             dependencies=[q['id'] for q in operator_questions.listing(db,task_id)
-                if q['id'] in requested and q['status']=='pending' and q.get('tool_request')]
+                if q['id'] in requested and q['status']=='pending' and (q.get('tool_request') or q.get('pivot_request'))]
             if dependencies and not (report.get('findings') or report.get('hypotheses')) and execution['status']=='not_started':
                 report['operator_dependencies']=dependencies
             else:dependencies=[]
@@ -2384,8 +2391,9 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                 pass
             raise
     finally:
-        close_task_sessions(task_id)
-        db.close()
+        try:
+            if session_scope_entered:session_scope.__exit__(*sys.exc_info())
+        finally:db.close()
 
     return {
         'status': 'report_damaged' if degraded else 'completed',

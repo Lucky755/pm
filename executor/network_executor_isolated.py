@@ -121,6 +121,9 @@ def session_command(args):
         raise ValueError('Unsupported session action')
     command = ['sudo', '-n', BROKER, 'session', '--action', args.action,
                '--task-id', str(args.task_id)]
+    for key in ('owner','owner_pid','ssh_json','resource','username','purpose'):
+        value=getattr(args,key,None)
+        if value is not None:command+=['--'+key.replace('_','-'),str(value)]
     if args.action == 'open':
         for token in parse_session_argv(args.argv_json or '[]'):
             command.append('--argv=' + token)
@@ -202,6 +205,12 @@ def main():
     ses.add_argument('--data', default='')
     ses.add_argument('--wait', type=float, default=0.8)
     ses.add_argument('--idle', type=int, default=0)
+    ses.add_argument('--owner',default='')
+    ses.add_argument('--owner-pid',type=int,default=0)
+    ses.add_argument('--ssh-json',default='')
+    ses.add_argument('--resource',default='')
+    ses.add_argument('--username',default='')
+    ses.add_argument('--purpose',default='')
     ses.add_argument('--execute', action='store_true')
     args = p.parse_args()
 

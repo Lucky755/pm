@@ -34,7 +34,7 @@ DECISION_ERRORS = {'decision_fields','decision_action','decision_question','deci
                    'unexpected_stop_kind','repeated_question_without_new_evidence','coordinator_tool_request',
                    'coordinator_model_not_completed','triage_objective_rejected',
                    'unknown_profile','invalid_boundaries','resource_not_authorized','invalid_inputs',
-                   'invalid_operator_question','invalid_branch','branch_waiting_operator'}
+                   'invalid_operator_question','invalid_branch','branch_waiting_operator','pivot_previously_declined'}
 
 
 class DecisionRejected(ValueError):
@@ -245,6 +245,10 @@ def snapshot(db, task_id, expect):
     from orchestrator import tool_requests
     tools=[tool_requests.describe(item) for item in tool_requests.listing(db,task_id)]
     for item in tools:refs['tool_request:'+str(item['id'])]=item
+    from orchestrator import task_sessions,pivoting
+    sessions=task_sessions.listing(db,task_id);routes=pivoting.listing(db,task_id)
+    for item in sessions:refs['session:'+item['session_id']]=item
+    for item in routes:refs['pivot:'+str(item['id'])]=item
     recent = results[-20:]
     for item in results:
         if isinstance(item['result_id'], str) and item['result_id']:
@@ -271,6 +275,7 @@ def snapshot(db, task_id, expect):
             'operator_checkpoints':{**checkpoints.history(db,task_id,context['target']),'blocking':False},
             'operator_questions':operator_questions.listing(db,task_id),
             'tool_requests':tools,
+            'task_sessions':sessions,'pivot_routes':routes,
             'flag_candidates':flag_candidates, 'flag_proposals':flag_review.listing(db,task_id),
             'success_verified': success, 'verified_stop_reason': stop,
             'authorization_block': authorization(db, context, mapped)}
@@ -321,10 +326,17 @@ def parse_decision(value, state, roles):
                 or question['kind'] not in operator_questions.KINDS):
             raise ValueError('invalid_operator_question')
         if 'request' in question:
-            if question['kind']!='tool':raise ValueError('invalid_operator_question')
-            from executor.netguard_root import tool_spec
-            try:tool_spec(question['request'])
+            if question['kind'] not in ('tool','pivoting'):raise ValueError('invalid_operator_question')
+            from executor.netguard_root import tool_spec,pivot_spec
+            try:(tool_spec if question['kind']=='tool' else pivot_spec)(question['request'])
             except ValueError:raise ValueError('invalid_operator_question')
+            if question['kind']=='pivoting':
+                requested=pivot_spec(question['request'])
+                if ('session:'+requested['source_session'] not in state['references'] or requested['resource_ref'] not in resources):
+                    raise ValueError('unknown_reference')
+                fingerprint=digest({k:v for k,v in requested.items() if k!='purpose'})
+                if any(r['state']=='declined' and r['fingerprint']==fingerprint for r in state.get('pivot_routes',[])):
+                    raise ValueError('pivot_previously_declined')
         if question['kind']=='flag_confirmation' and len([ref for ref in refs if ref.startswith('flag:')])!=1:
             raise ValueError('invalid_operator_question')
         if operator_questions.blocked(decision,state):raise ValueError('branch_waiting_operator')
@@ -405,6 +417,8 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             "For an actionable tool/docs/package request use operator_question={kind:tool,request:spec}. "
             "spec: kind=user_tool|documentation,name,purpose,version,source (one exact URL),channel=internet|kali_local|local_file,filename,sha256 (empty if unknown),interpreter=direct|python3|bash|perl|ruby (none for documentation). "
             "For system_package use only kind,name,purpose,version (candidate or exact), supported nmap/curl/jq. "
+            "For a supported SSH pivot use operator_question={kind:pivoting,request:{source_session,resource_ref,destination,port,local_port,probe:http_headers|banner,purpose}}. "
+            "Use only an existing managed SSH source and a saved authorized internal address with allow_pivot and allow_port_forward enabled. This permission does not expand scope. "
             "Use installed tools and saved documentation first. Prior refusals/install errors require another method, not a reworded permission. Acquisition grants no target scope. "
             "Use existing reference keys and a profile listed for that role in specialist_profiles. "
             "flag_candidates lists technical provenance and blockers; flag_proposals contains goal-bound platform decisions. "
@@ -752,7 +766,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                     try:
                         question=operator_questions.request(db,task_id,target,decision,step_id)
                     except (ValueError,RuntimeError,OSError) as exc:
-                        if decision.get('operator_question',{}).get('kind')!='tool':raise
+                        if decision.get('operator_question',{}).get('kind') not in ('tool','pivoting'):raise
                         update_step(db,step_id,'failed',error=str(exc)[:180],outcome_uncertain=0)
                         diagnostics.emit('coordinator.tool_request_failed',task_id=task_id,step_id=step_id,
                             reason='tool_request_prepare_failed',reason_summary=str(exc)[:180])
@@ -760,7 +774,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                     update_step(db,step_id,'waiting_operator' if question['status']=='pending' else 'failed',
                                 error='operator_question_pending' if question['status']=='pending' else 'operator_question_already_answered')
                     state=snapshot(db,task_id,expect_flags)
-                    if (question['status']=='pending' or not question.get('tool_request')) and (question['branch_id']=='task' or not operator_questions.available(state)):
+                    if (question['status']=='pending' or not (question.get('tool_request') or question.get('pivot_request'))) and (question['branch_id']=='task' or not operator_questions.available(state)):
                         return finish('operator_questions_pending','waiting_operator')
                     continue
                 if decision['action']=='stop':
@@ -831,7 +845,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                                          reason_summary='Отчёт неполон или противоречив; требуется проверка оператором. Исход исполнения сохранён отдельно.')
                         return finish('role_report_incomplete_requires_review','waiting_operator')
                     dependencies=[q for q in operator_questions.listing(db,task_id,pending=True)
-                        if q['id'] in report.get('operator_dependencies',[]) and q.get('tool_request')]
+                        if q['id'] in report.get('operator_dependencies',[]) and (q.get('tool_request') or q.get('pivot_request'))]
                     if dependencies:
                         with db:
                             for question in dependencies:

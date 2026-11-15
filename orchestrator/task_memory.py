@@ -285,6 +285,13 @@ def source_state(db,task_id,capability_log):
                     put('sessions','session:'+str(session['session_id']),{'session_id':session['session_id'],
                         'last_result_id':record['id'],'liveness':'unknown','observed_alive':session.get('alive'),
                         'observed_at':record.get('timestamp')})
+    from orchestrator import task_sessions
+    for session in task_sessions.listing(db,task_id):put('sessions','session:'+session['session_id'],session)
+    from orchestrator import pivoting
+    for route in pivoting.listing(db,task_id):
+        put('resources','pivot:'+str(route['id']),route)
+        put('relations','pivot_source:'+str(route['id']),{'from':'session:'+route['source_session'],
+            'to':route['resource_ref'],'kind':'reached_via_ssh_forward','state':route['state']})
     for step in rows(db,'pm_coordinator_steps',task_id):
         decision=json.loads(step['decision_json'])
         section='plan' if step['status'] in ('planned','running','waiting_operator') else 'checks'
@@ -511,7 +518,8 @@ def analysis_context(db,task_id):
 def canonical_operation(tool,command,target,provenance='network'):
     """Canonical executable input, never the model's wording/result ID/time."""
     argv=list(map(str,command));params={};inner=None
-    transient={'--task-id','--timeout','--wait','--idle','--new-evidence-id','--hypothesis-key'}
+    transient={'--task-id','--timeout','--wait','--idle','--new-evidence-id','--hypothesis-key',
+               '--owner','--owner-pid','--purpose','--username','--resource'}
     i=0
     while i<len(argv):
         token=argv[i]
@@ -550,9 +558,11 @@ def canonical_operation(tool,command,target,provenance='network'):
                       'session_id':params.get('--session-id')})
     # Origin is evidence metadata, not permission to replay arbitrary local code.
     # Only known buffer/index readers bypass execution deduplication.
-    repeatable_read=(tool in ('capability_read','evidence_index','observations') or
+    safe_session_bootstrap=(tool=='session' and params.get('--action')=='open' and not params.get('--ssh-json')
+        and inner in (None,[],['/bin/bash','--noprofile','--norc','-i']))
+    repeatable_read=(safe_session_bootstrap or tool in ('capability_read','evidence_index','observations') or
         tool=='session' and params.get('--action') in ('read','list') or
-        tool=='callback' and params.get('--action')=='read')
+        tool in ('callback','transfer') and params.get('--action') in ('read','diagnose'))
     local=provenance=='local' or repeatable_read or tool=='worknote'
     return {'resource':resource,'operation':tool,'parameters':params,'local':local,
             'repeatable_read':repeatable_read,

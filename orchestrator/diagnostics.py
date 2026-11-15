@@ -244,6 +244,10 @@ def failure_details(payload=None, exc=None):
     """Classify failure without copying stdout, stderr, commands or environments."""
     payload = payload if isinstance(payload, dict) else {}
     acquisition_reasons = {
+        'session_busy':'Another live agent owns this terminal; input was not sent.',
+        'callback_address_invalid':'Callback address/interface is absent or does not follow the laboratory route; operator correction required.',
+        'receiver_unavailable':'The callback receiver failed to bind or start.',
+        'callback_budget_exhausted':'Callback variant budget exhausted; diagnose the route/listener before another attempt.',
         'tool_missing': 'Required executable/package is unavailable; request a bounded tool acquisition.',
         'permission_denied': 'Required execution/installation rights were denied.',
         'network_denied': 'The resource is outside the granted network channel or exact source permission.',

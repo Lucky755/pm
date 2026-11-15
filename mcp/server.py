@@ -746,9 +746,22 @@ def capability_provenance(tool, payload, command):
     if tool=='session' and '--action' in command:
         action=list(command)[list(command).index('--action')+1]
         if action in ('read','list'):return 'local'
-    if tool=='callback' and '--action' in command:
+        if action=='open':
+            def option(key):
+                try:return command[list(command).index(key)+1]
+                except (ValueError,IndexError):return ''
+            try:args=json.loads(option('--argv-json') or '[]')
+            except ValueError:args=None
+            if not option('--ssh-json') and args in ([],['/bin/bash','--noprofile','--norc','-i']):return 'local'
+            return 'unknown' # starting an SSH/client process does not prove contact/authentication
+        if payload.get('network_contact') is True:return 'network'
+        if payload.get('network_contact') is False:return 'local'
+        return 'unknown' # a generic PTY may run local code or a nested client
+    if tool in ('callback','transfer') and '--action' in command:
         action=list(command)[list(command).index('--action')+1]
-        if action=='read':return 'local'
+        if action in ('read','diagnose'):return 'local'
+    if tool=='pivot_probe':return 'network' if payload.get('probe_performed') else 'local'
+    if tool in ('pivot_request','pivot_status'):return 'local'
     if tool in ('session', 'network_probe', 'privileged_scan', 'http_get', 'http_headers',
                 'http_path', 'http_document', 'http_capture'):
         return 'network'
@@ -963,7 +976,7 @@ def track_memory_operation(function):
                 try:return command[list(command).index('--'+name)+1]
                 except (ValueError,IndexError):return default
             profile=option('profile',tool)
-            if profile!='research' and not (tool in ('session','callback') and option('action') in ('read','list','close','interrupt')):
+            if profile!='research' and not (tool in ('session','callback','transfer') and option('action') in ('read','list','close','interrupt','diagnose')):
                 try:
                     resources.authorize(db,task_id,'http' if profile.startswith(('http','https')) else profile,
                         option('target',row[0]),scheme=option('scheme','http'),hostname=option('hostname'),
@@ -980,6 +993,10 @@ def track_memory_operation(function):
                 **{k:entry[k] for k in ('protocol','port','state','identification_conflict','identification_uncertain')},
                 'identifications':[{k:v for k,v in identity.items() if k!='source'} for identity in entry['identifications']]}
                 for entry in services if not description['ports'] or entry['port'] in description['ports']]
+            if tool=='session' and option('session-id'):
+                from orchestrator import task_sessions
+                saved=next((s for s in task_sessions.listing(db,task_id) if s['session_id']==option('session-id')),None)
+                conditions['session_stream_state']=saved['details'].get('stream_state_sha256') if saved else None
             if tool=='poc_run' and '--poc-file' in command:
                 poc=Path(command[list(command).index('--poc-file')+1])
                 allowed=(POC_ROOT/f'task_{task_id}').resolve()
@@ -1034,6 +1051,12 @@ def track_memory_operation(function):
                     if not not_started:
                         task_memory.transition(db,task_id,oid,'started',expected_phase='dispatching')
                     task_memory.transition(db,task_id,oid,phase,expected_phase='dispatching' if not_started else 'started',outcome=outcome,result_id=payload.get('result_id'))
+                    if tool=='session' and phase=='finished' and (payload.get('stream_state_sha256') or isinstance(payload.get('output'),str) and payload['output']):
+                        # Compare the next command with the previous *post* state.
+                        # Its own identical reply is not a reason to repeat it.
+                        after={**conditions,'session_stream_state':payload.get('stream_state_sha256') or task_memory.digest(payload['output'])}
+                        db.execute('UPDATE pm_memory_operations SET conditions_sha256=? WHERE id=? AND task_id=?',
+                                   (task_memory.digest(after),oid,task_id))
                     task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='operation_'+phase)
             except (sqlite3.Error,task_memory.VersionConflict) as exc:
                 print('[MEMORY-ERROR] '+type(exc).__name__+'; completed evidence retained',file=sys.stderr,flush=True)
@@ -1737,16 +1760,16 @@ def pm_callback(
     bind: str = "",
     timeout: int = 300,
 ) -> str:
-    """Scoped listener that collects blind results from the target.
+    """Interactive callbacks from scoped peers on the current laboratory route.
 
-    action: open | read | close. open starts a listener that accepts connections
-    only from the task's authorized target and stores received bytes.
-    read returns what arrived; close stops the listener. Run the reverse-shell
-    or exfiltrating part of the PoC with pm_poc_run, then read the result here.
-    bind: optional local address (for example the VPN interface address).
-    target: required for open (scope of accepted peers); optional for read/close.
+    action=open/read/close/diagnose. read returns accepted session IDs; use
+    pm_session for bidirectional I/O. Use pm_transfer for streamed files.
+    The listener binds the current VPN route source, not guessed NAT/old VPN.
+    An operator can correct topology with callback-config. Diagnose the address,
+    receiver and saved preflight; silence alone does not prove egress filtering.
+    Accepted sockets are peer-bound; no arbitrary host execution is provided.
     """
-    if not valid_task(task_id):
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):
         return response("callback", "blocked", 1, stderr="Invalid task ID")
 
     address = ""
@@ -1765,6 +1788,15 @@ def pm_callback(
             stderr="target is required to open a scoped listener",
         )
 
+    if action=='diagnose':
+        command=['sudo','-n','/usr/local/sbin/pm-netguard','callback','--task-id',str(task_id),'--action','diagnose','--port',str(port)]
+        reply=json.loads(run_capability(command,15,tool='callback',task_id=task_id))
+        if ASSET_DB.is_file():
+            from orchestrator import task_sessions
+            with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True,timeout=10)) as db:
+                reply=task_sessions.callback_assessment(db,task_id,reply)
+        diagnostics.emit('callback.assessment',task_id=task_id,result_id=reply.get('result_id'),reason=reply.get('diagnosis'))
+        return tool_response(reply)
     if action not in ("open", "read", "close"):
         return response(
             "callback",
@@ -1802,6 +1834,10 @@ def pm_callback(
     command.append("--execute")
 
     result = run_capability(command, 60, tool="callback", task_id=task_id)
+    if action=='read' and ASSET_DB.is_file() and CAPABILITY_LOG.parent==ASSET_DB.parent:
+        from orchestrator import task_sessions
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            task_sessions.record_result(db,task_id,'list',json.loads(result));db.commit()
 
     if action == "open":
         # A listener on that port is already running, which is exactly the state
@@ -1825,6 +1861,87 @@ def pm_callback(
 
 @mcp.tool()
 @diagnostics.tool
+def pm_transfer(task_id:int,action:str,port:int=4445,expected_bytes:int=-1,sha256:str='',
+                max_bytes:int=536870912,timeout:int=300)->str:
+    """Separate streamed file receiver. No interactive terminal and no universal 4 MiB limit.
+
+    Known size + EOF establishes size completeness; optional SHA256 verifies content.
+    Unknown size/timeout/disk exhaustion remain explicitly unverified/incomplete.
+    """
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked','error':'Wrong task'})
+    if action not in ('open','read','close','diagnose') or not 1024<=port<=65535:return tool_response({'status':'blocked','error':'Invalid transfer action/port'})
+    if not 1<=max_bytes<=1073741824 or expected_bytes < -1 or expected_bytes>max_bytes or not 10<=timeout<=3600:
+        return tool_response({'status':'blocked','error':'Invalid transfer budget'})
+    if sha256 and not re.fullmatch(r'[a-f0-9]{64}',sha256):return tool_response({'status':'blocked','error':'Invalid expected SHA256'})
+    command=['sudo','-n','/usr/local/sbin/pm-netguard','callback','--task-id',str(task_id),'--action',action,'--port',str(port),'--mode','transfer']
+    if action=='open':
+        command+=['--timeout',str(timeout),'--max-bytes',str(max_bytes)]
+        if expected_bytes>=0:command+=['--expected-bytes',str(expected_bytes)]
+        if sha256:command+=['--expected-sha256',sha256]
+    return run_capability(command,20,tool='transfer',task_id=task_id)
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_pivot_request(task_id:int,spec_json:str)->str:
+    """Request one scoped SSH forward through an existing managed SSH session.
+
+    spec: source_session,resource_ref,destination (saved internal address),port,
+    local_port,probe=http_headers|banner,purpose. Operator approval is required.
+    """
+    from orchestrator import pivoting
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked','error':'Wrong task'})
+    try:
+        spec=pivoting.pivot_spec(json.loads(spec_json))
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            target=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()[0]
+            decision={'operator_question':{'kind':'pivoting','request':spec},'question':spec['purpose'],'reason':spec['purpose'],
+                'branch_id':spec['resource_ref'],'references':[spec['resource_ref'],'session:'+spec['source_session']],
+                'boundaries':{'task_id':task_id,'target':target,'intent_ref':'intent','resource_refs':[spec['resource_ref']]}}
+            question=pivoting.request(db,task_id,target,decision)
+            task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='pivot_request');db.commit()
+        payload={'status':'waiting_operator' if question['status']=='pending' else question['pivot_request']['state'],
+                 'question_id':question['id'],'route':question['pivot_request'],'execution_started':False}
+    except (ValueError,sqlite3.Error,OSError) as exc:payload={'status':'blocked','error':str(exc),'execution_started':False}
+    rid=log_capability('pivot_request',task_id,payload,0)
+    return tool_response({**payload,'result_id':rid})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_pivot(task_id:int,route_id:int,action:str='status')->str:
+    """Status/apply an operator-authorized SSH forward; cannot authorize or recreate broken/unknown forwards.
+
+    action=probe performs a bounded check of the saved destination through the
+    existing forward, not a new tunnel. Use the saved local endpoint only for its
+    specified resource. status is local metadata/control health, not fresh target evidence.
+    """
+    from orchestrator import pivoting
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked','error':'Wrong task'})
+    if action not in ('status','apply','probe','close'):return tool_response({'status':'blocked','error':'Invalid route action'})
+    with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+        route=next((r for r in pivoting.listing(db,task_id) if r['id']==route_id),None)
+        if not route:return tool_response({'status':'blocked','error':'Unknown task route'})
+        if action=='probe' and route['state'] in ('active','established_unverified'):
+            reply=json.loads(run_capability(['sudo','-n','/usr/local/sbin/pm-netguard','pivot','--task-id',str(task_id),
+                '--action','probe','--request-id',route['receipt']['request_id']],15,tool='pivot_probe',task_id=task_id))
+            if reply.get('request_id')==route['receipt']['request_id'] and reply.get('manifest')==route['receipt']['manifest']:
+                state=reply.get('route_state',reply.get('status','unknown'))
+                db.execute('UPDATE pm_pivot_routes SET state=?,receipt_json=? WHERE id=?',(state,json.dumps(reply),route_id))
+                task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='pivot_probe_result');db.commit()
+            return tool_response(reply)
+        if action=='close':
+            receipt=pivoting.call(task_id,'close',request_id=route['receipt']['request_id'])
+            db.execute('UPDATE pm_pivot_routes SET state=?,receipt_json=? WHERE id=?',(receipt.get('status','unknown'),json.dumps(receipt),route_id))
+            db.execute("UPDATE pm_session_dependencies SET state='closed' WHERE task_id=? AND dependent_ref=?",(task_id,'pivot:'+str(route_id)))
+            db.commit();payload=receipt
+        else:payload=pivoting.apply(db,task_id,route_id,perform=action=='apply')
+    rid=log_capability('pivot_status',task_id,payload,0)
+    return tool_response({**payload,'result_id':rid})
+
+
+@mcp.tool()
+@diagnostics.tool
 def pm_session(
     task_id: int,
     action: str,
@@ -1833,8 +1950,10 @@ def pm_session(
     data: str | list[str] = "",
     wait: float = 0.8,
     idle: int = 1800,
+    resource: str = '', username: str = '', purpose: str = '', retain: bool | None = None,
+    ssh_json: str = '',
 ) -> str:
-    """A process that keeps running between calls, inside the task namespace.
+    """Shared task PTY/managed SSH or an already accepted peer-bound callback.
 
     A normal call starts a sandbox, runs one command and throws it away, so a
     half-finished exploit, a downloaded binary or a gdb session is lost in
@@ -1848,6 +1967,13 @@ def pm_session(
     - action=read returns output produced since the last read.
     - action=interrupt sends Ctrl-C without closing the session.
     - action=close stops it. action=list shows all sessions of the task.
+
+    Up to ten live connections survive roles. One live agent owns a terminal;
+    read after handoff before send. retain=false closes unused sessions at role
+    end unless a route depends on them. resource/username/purpose are metadata,
+    not proof of access. ssh_json={target,user,port,identity} selects managed SSH
+    instead of argv_json, for supported operator-approved pivoting. Unknown
+    prior input is never automatically replayed. Saved DB/PID is not liveness.
 
     /work is shared with pm_poc_run and pm_net_exec and now persists for the
     whole task, so files written here are still there on the next call. The
@@ -1863,6 +1989,7 @@ def pm_session(
 
     if not valid_task(task_id):
         return blocked("Invalid task ID")
+    if (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return blocked('Session task differs from active SDK task')
 
     if action not in ("open", "send", "read", "interrupt", "close", "list"):
         return blocked("action must be open, send, read, interrupt, close or list")
@@ -1922,9 +2049,28 @@ def pm_session(
         command.extend(["--wait", str(min(max(float(wait), 0.0), 5.0))])
 
     command.append("--execute")
-
+    from orchestrator import task_sessions
+    command+=['--owner',task_sessions.owner(),'--owner-pid',str(os.getpid())]
+    if action=='open':
+        if ssh_json:
+            try:
+                ssh=json.loads(ssh_json)
+                if not isinstance(ssh,dict) or set(ssh)!={'target','user','port','identity'}:raise ValueError('Invalid managed SSH')
+            except ValueError:return blocked('Invalid ssh_json')
+            if argv_json:return blocked('Choose argv_json or ssh_json')
+            try:ssh['target']=str(ipaddress.ip_address(ssh['target']))
+            except ValueError:return blocked('Managed SSH requires a scoped numeric address')
+            command+=['--ssh-json',json.dumps(ssh,sort_keys=True,separators=(',',':'))]
+        purpose=purpose or os.environ.get('PM_SESSION_PURPOSE','interactive task work')
+        command+=['--resource',resource,'--username',username,'--purpose',purpose[:1000]]
     result = run_capability(command, 120 if action == "open" else 60,
                             tool="session", task_id=task_id)
+    if ASSET_DB.is_file() and CAPABILITY_LOG.parent==ASSET_DB.parent:
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            task_sessions.record_result(db,task_id,action,json.loads(result),session_id=session_id,
+                resource=json.loads(result).get('resource') or resource,username=json.loads(result).get('username') or username,purpose=purpose,retain=retain)
+            task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='session_'+action)
+            db.commit()
     return result
 
 

@@ -1359,6 +1359,18 @@ def render_tool_request(question):
     if tool.get('error'):line('    Ошибка: '+safe_display(tool['error']))
 
 
+def render_pivot_request(question):
+    route=question.get('pivot_request')
+    if not route:return
+    manifest=route['receipt']['manifest'];spec=manifest['spec']
+    line(f"    Маршрут #{route['id']}: сессия {safe_display(spec['source_session'])} → {safe_display(spec['destination'])}:{spec['port']}")
+    line('    Назначение: '+safe_display(spec['purpose'])+' · состояние '+safe_display(route['state']))
+    line('    Endpoint: '+safe_display(manifest['listener'])+' в namespace задачи; scope прежний')
+    line('    Действия: '+safe_display(json.dumps(manifest['actions'],ensure_ascii=False)))
+    line('    Права: '+safe_display(manifest['rights']))
+    if route['receipt'].get('probe'):line('    Последняя проверка: '+safe_display(json.dumps(route['receipt']['probe'],ensure_ascii=False)))
+
+
 def render_coordinator_result(result, args):
     if getattr(args,'json',False):
         line(json.dumps(result,ensure_ascii=False,indent=2))
@@ -1378,6 +1390,7 @@ def render_coordinator_result(result, args):
         if question.get('resource'):line('    Ресурс: '+diagnostics.clean(question['resource']['value'],limit=None)+' · контекст '+safe_display(question['resource']['context']))
         render_flag_candidate(question)
         render_tool_request(question)
+        render_pivot_request(question)
         line('    Причина: '+safe_display(question['reason']))
         line('    Границы: '+safe_display(json.dumps(question['boundaries'],ensure_ascii=False)))
         line('    Ссылки: '+', '.join(safe_display(ref) for ref in question['references']))
@@ -2687,11 +2700,11 @@ def op_status(args):
 
 
 def op_questions(args):
-    from orchestrator import coordinated_attack, operator_questions, agent_actions, flag_review, tool_requests
+    from orchestrator import coordinated_attack, operator_questions, agent_actions, flag_review, tool_requests,pivoting
     if getattr(args,'answer',None) is not None and getattr(args,'reconsider',None) is not None:
         raise OperatorError('Выберите ответ на вопрос либо пересмотр кандидата')
-    if getattr(args,'apply_tool',None) is not None and (getattr(args,'answer',None) is not None or getattr(args,'reconsider',None) is not None):
-        raise OperatorError('--apply-tool используется отдельно от ответа и пересмотра')
+    if sum(getattr(args,field,None) is not None for field in ('answer','reconsider','apply_tool','apply_pivot'))>1:
+        raise OperatorError('Выберите одно действие: ответ, пересмотр, --apply-tool или --apply-pivot')
     if getattr(args,'decision',None) and getattr(args,'answer',None) is None:
         raise OperatorError('--decision используется вместе с --answer')
     with coordinated_attack.task_lock(args.task_id), connect() as db:
@@ -2711,8 +2724,11 @@ def op_questions(args):
             db.commit()  # Permission is durable before external installation starts.
             if answered.get('tool_request') and args.decision=='approve':
                 tool_requests.acquire(db,args.task_id,answered['tool_request']['id'],authorize=True)
+            if answered.get('pivot_request') and args.decision=='approve':
+                pivoting.apply(db,args.task_id,answered['pivot_request']['id'],authorize=True)
         if getattr(args,'apply_tool',None) is not None:
             tool_requests.acquire(db,args.task_id,args.apply_tool,authorize=True)
+        if getattr(args,'apply_pivot',None) is not None:pivoting.apply(db,args.task_id,args.apply_pivot,authorize=True)
         rows=operator_questions.listing(db,args.task_id)
         if getattr(args,'json',False):line(json.dumps(rows,ensure_ascii=False,indent=2))
         else:
@@ -2722,6 +2738,7 @@ def op_questions(args):
                 if item.get('resource'):line('    Ресурс: '+diagnostics.clean(item['resource']['value'],limit=None))
                 render_flag_candidate(item)
                 render_tool_request(item)
+                render_pivot_request(item)
                 line('    Границы: '+safe_display(json.dumps(item['boundaries'],ensure_ascii=False)))
                 line('    Ссылки: '+', '.join(safe_display(ref) for ref in item['references']))
             if not rows:line('  Ожидающих или сохранённых вопросов нет.')
@@ -2729,6 +2746,20 @@ def op_questions(args):
         solved=flag_review.completed_result(db,args.task_id)
         if solved and not getattr(args,'json',False):render_coordinator_result(solved,args)
         return rows
+
+
+def op_callback_config(args):
+    from orchestrator.coordinated_attack import task_lock
+    with task_lock(args.task_id),connect() as db:
+        task_target(db,args.task_id)
+        command=['callback','--action','configure','--task-id',str(args.task_id),
+            '--bind',args.address,'--interface',args.interface,'--advertise',args.advertise or args.address,'--reason',args.reason]
+        if args.attempt_limit is not None:command+=['--variant-limit',str(args.attempt_limit)]
+        result,_=sudo_checked(command)
+        db.execute('CREATE TABLE IF NOT EXISTS pm_callback_settings(task_id INTEGER PRIMARY KEY,settings_json TEXT NOT NULL)')
+        db.execute('INSERT INTO pm_callback_settings VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET settings_json=excluded.settings_json',
+            (args.task_id,json.dumps(result['callback_override'])))
+        line(json.dumps(result,ensure_ascii=False,indent=2));return result
 
 
 def op_hosts(args):
@@ -3160,10 +3191,16 @@ def parser_main():
     questions.add_argument('task_id',type=int)
     questions.add_argument('--answer',type=int,help='ID ожидающего вопроса')
     questions.add_argument('--apply-tool',type=int,help='Явно применить уже одобренный запрос инструмента после прерывания выдачи разрешения')
+    questions.add_argument('--apply-pivot',type=int,help='Применить ранее одобренный SSH-forward; unknown/broken автоматически не пересоздаётся')
     questions.add_argument('--reconsider',type=int,help='ID отклонённого кандидата для явного пересмотра; нужна причина в --note-file')
     questions.add_argument('--decision',choices=('approve','decline','information'))
     questions.add_argument('--note-file',help='Файл пояснения UTF-8; ответ не передаётся модели до продолжения')
     questions.add_argument('--json',action='store_true')
+    callback=sub.add_parser('callback-config',help='Явная операторская корректировка адреса callback, без обращения к цели')
+    callback.add_argument('task_id',type=int);callback.add_argument('--address',required=True)
+    callback.add_argument('--interface',required=True);callback.add_argument('--advertise')
+    callback.add_argument('--reason',required=True)
+    callback.add_argument('--attempt-limit',type=int,choices=range(1,11),help='Явное изменение общего лимита вариантов этой трассы (по умолчанию 3)')
     status = sub.add_parser('status', help='Показать краткий отчёт')
     status.add_argument('task_id', type=int)
     close = sub.add_parser('close', help='Удалить NetGuard правила и namespace')
@@ -3497,6 +3534,7 @@ def main():
         elif args.command == 'resume': op_resume(args)
         elif args.command == 'status': op_status(args)
         elif args.command == 'questions': op_questions(args)
+        elif args.command == 'callback-config':op_callback_config(args)
         elif args.command == 'http-artifacts': op_http_artifacts(args)
         elif args.command == 'http-reparse': op_http_reparse(args)
         elif args.command == 'http-policy': op_http_policy(args)
