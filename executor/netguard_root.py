@@ -33,7 +33,8 @@ DOCS = tuple(ipaddress.ip_network(v) for v in
              ('192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24','2001:db8::/32'))
 MAX_TASK = 200
 HTTP_CAPTURE_BODY_LIMIT = 2 * 1024 * 1024
-HTTP_CAPTURE_WIRE_LIMIT = HTTP_CAPTURE_BODY_LIMIT + 65536
+HTTP_HEADER_LIMIT = 1024 * 1024
+HTTP_CAPTURE_WIRE_LIMIT = HTTP_CAPTURE_BODY_LIMIT + HTTP_HEADER_LIMIT
 HTTP_CAPTURE_LIMITS = (HTTP_CAPTURE_BODY_LIMIT, 8 * 1024 * 1024)
 HTTP_CAPTURE_TIMEOUT = 48
 
@@ -541,7 +542,14 @@ def resource_denied(policy,url):
         except ValueError:
             item=resource_url(denied)
             if item['kind']=='domain' and item['host']==url['host']:return True
-            if item['kind']=='url' and item['origin']==url['origin'] and url['path'].startswith(item['path']):return True
+            if item['kind']=='url' and item['origin']==url['origin']:
+                import posixpath
+                candidate=url['path']
+                for _ in range(8):
+                    if candidate.startswith(item['path']) or posixpath.normpath(candidate.replace('\\','/')).startswith(item['path']):return True
+                    decoded=unquote(candidate)
+                    if decoded==candidate:break
+                    candidate=decoded
     return False
 
 
@@ -592,7 +600,19 @@ def _network_exclusion(value):
     except ValueError:return False
 
 
-def path_within(path,prefix):return prefix=='/' or path==prefix.rstrip('/') or path.startswith(prefix.rstrip('/')+'/')
+def path_within(path,prefix):
+    # Traversal is a legitimate probe in a whole-site grant, but cannot escape
+    # an explicit path boundary by encoding or dot segments.
+    import posixpath
+    if prefix=='/':return True
+    for _ in range(8):
+        if not (path==prefix.rstrip('/') or path.startswith(prefix.rstrip('/')+'/')):return False
+        decoded=unquote(path).replace('\\','/')
+        normal=posixpath.normpath(decoded.split('?',1)[0])
+        if not (normal==prefix.rstrip('/') or normal.startswith(prefix.rstrip('/')+'/')):return False
+        if decoded==path:break
+        path=decoded
+    return True
 
 
 def resource_filter_rules(v,allowed,egress,policy=None):
@@ -1095,18 +1115,12 @@ def safe_http_path(path):
     if len(path)>8192:raise ValueError('Encoded HTTP request target is too long')
     if not re.fullmatch(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/?\[\]\-]*",path):
         raise ValueError('Unsafe HTTP request characters')
-    decoded = path.split('?',1)[0]
-    for _ in range(3):
-        decoded = unquote(decoded)
-        if ('\\' in decoded or '//' in decoded or
-                any(part == '..' for part in decoded.split('/')) or
-                any(ord(char) < 32 or ord(char) == 127 for char in decoded)):
-            raise ValueError('Unsafe HTTP path or encoded traversal')
-    query=path.partition('?')[2]
-    for _ in range(3):query=unquote(query)
-    if any(ord(c)<32 or ord(c)==127 for c in query) or '\\' in query:raise ValueError('Unsafe HTTP query')
-    if '%' in decoded and re.search(r'%(?:2e|2f|5c|0[0-9a-f]|7f)', decoded, flags=re.I):
-        raise ValueError('Encoded traversal or control denied')
+    decoded=path
+    for _ in range(8):
+        if any(ord(c)<32 or ord(c)==127 for c in decoded):raise ValueError('HTTP control characters denied')
+        next_value=unquote(decoded)
+        if next_value==decoded:break
+        decoded=next_value
     return path
 
 
@@ -1752,7 +1766,15 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
     cmd('/usr/sbin/nft', 'list', 'table', 'inet', v['table'])
     cmd('/usr/sbin/nft', 'list', 'table', 'ip', v['nat'])
     if profile == 'http_capture':
-        data = capture_process(isolated_command(v['name'], config['owner'], config['uid'], config['gid'], args),capture_limit)
+        spec=http_spec({'method':'GET','target':target,'scheme':scheme,'hostname':hostname or target,'port':int(port),
+            'path':path,'headers':[],'body_b64':'','session_id':'legacy','limit_bytes':capture_limit,
+            'timeout':25,'tls_verify':True,'ssrf':None})
+        captured=http_process(v,config,spec)
+        wire=base64.b64decode(captured['headers_b64'])+base64.b64decode(captured['body_b64'])
+        data={'status':'completed' if captured['transport_complete'] else 'incomplete',
+              'exit_code':0 if captured['transport_complete'] else 63 if captured['body_truncated'] else 1,
+              'response_b64':base64.b64encode(wire).decode(),'response_bytes':len(wire),
+              'capture_truncated':captured['body_truncated'],'elapsed_seconds':captured['elapsed_seconds']}
         output({'operation': 'network_probe_isolated', 'capture_protocol': 1,
                 'task_id': task, 'target': target, 'profile': profile,
                 'port': int(port), 'scheme': scheme, 'path': path, 'hostname': hostname or target,
@@ -1821,7 +1843,7 @@ def capture_process(argv, body_limit=None, *, acquisition=False, process_env=Non
     else:
         if not (acquisition and type(body_limit) is int and 0 < body_limit <= 256 * 1024 * 1024) and body_limit not in HTTP_CAPTURE_LIMITS:
             raise ValueError('Unsupported HTTP capture limit')
-        wire_limit = body_limit + 65536
+        wire_limit = body_limit + HTTP_HEADER_LIMIT
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True,
@@ -1880,6 +1902,197 @@ def capture_process(argv, body_limit=None, *, acquisition=False, process_env=Non
             'wire_limit_bytes': wire_limit, 'capture_truncated': limited,
             'stderr': stderr.decode('utf-8', errors='replace'), 'stderr_truncated': stderr_limited,
             'elapsed_seconds': round(time.monotonic() - started, 3)}
+
+
+def http_spec(raw):
+    fields={'method','target','scheme','hostname','port','path','headers','body_b64','session_id','limit_bytes','timeout','tls_verify','ssrf'}
+    if not isinstance(raw,dict) or set(raw)!=fields:raise ValueError('Invalid HTTP request schema')
+    spec=dict(raw)
+    if not isinstance(spec['method'],str) or not re.fullmatch(r'[A-Z][A-Z0-9-]{0,31}',spec['method']) or spec['method']=='CONNECT':raise ValueError('Unsupported HTTP method/tunnel')
+    spec['target']=str(ipaddress.ip_address(spec['target']))
+    parsed=resource_url(http_origin(spec['scheme'],spec['hostname'],spec['port'])+spec['path'])
+    if parsed['scheme']!=spec['scheme'] or parsed['host']!=spec['hostname'] or parsed['port']!=spec['port']:raise ValueError('Invalid HTTP authority')
+    spec['path']=safe_http_path(spec['path'])
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',spec['session_id']):raise ValueError('Invalid HTTP session')
+    if spec['limit_bytes'] not in HTTP_CAPTURE_LIMITS or type(spec['timeout']) is not int or not 1<=spec['timeout']<=30:raise ValueError('Invalid HTTP budget')
+    if type(spec['tls_verify']) is not bool:raise ValueError('Invalid TLS verification setting')
+    if not isinstance(spec['headers'],list) or len(spec['headers'])>200:raise ValueError('Invalid HTTP headers')
+    count=0
+    single_headers=set()
+    for pair in spec['headers']:
+        if not isinstance(pair,list) or len(pair)!=2 or not all(isinstance(v,str) for v in pair):raise ValueError('Header must be a name/value pair')
+        name,value=pair
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+",name) or any(ord(c)<32 and c!='\t' or ord(c)==127 for c in value):raise ValueError('Invalid HTTP header characters')
+        if name.lower() in ('host','content-length','transfer-encoding','connection','expect','upgrade','proxy-authorization'):raise ValueError('Use URL authority and supported body framing')
+        if name.lower() in ('content-type','authorization','cookie'):
+            if name.lower() in single_headers:raise ValueError('Ambiguous duplicate request header')
+            single_headers.add(name.lower())
+        count+=len(name.encode('ascii'))+len(value.encode('latin-1'))+4
+    if count>HTTP_HEADER_LIMIT:raise ValueError('Request headers exceed 1 MiB')
+    if not isinstance(spec['body_b64'],str) or len(spec['body_b64'])>((8*1024*1024+2)//3)*4:raise ValueError('Request body exceeds 8 MiB')
+    body=base64.b64decode(spec['body_b64'],validate=True)
+    if len(body)>8*1024*1024:raise ValueError('Request body exceeds 8 MiB')
+    authority=('['+spec['hostname']+']' if ':' in spec['hostname'] else spec['hostname'])+':'+str(spec['port'])
+    overhead=len((spec['method']+' '+spec['path']+' HTTP/1.1\r\nHost: '+authority+'\r\nConnection: close\r\n\r\n').encode('ascii'))
+    if body or spec['method'] in ('POST','PUT','PATCH'):overhead+=len('Content-Length: '+str(len(body))+'\r\n')
+    if count+overhead>HTTP_HEADER_LIMIT:raise ValueError('Total request headers exceed 1 MiB')
+    path=spec['path']
+    for _ in range(8):
+        if spec['method'] not in ('GET','HEAD','OPTIONS') and re.search(r'(?i)(?:change|reset|set)[_-]?pass(?:word)?|pass(?:word)?[_-]?(?:change|reset|set)',path):raise ValueError('Room rule: password changes are prohibited')
+        decoded=unquote(path)
+        if decoded==path:break
+        path=decoded
+    query_names=[k for k,v in parse_qsl(urlsplit(spec['path']).query)]
+    if any(re.fullmatch(r'(?i)new[_-]?pass(?:word)?|password_confirmation|change_password|set_password',name) for name in query_names):raise ValueError('Room rule: password changes are prohibited')
+    if spec['method'] not in ('GET','HEAD','OPTIONS'):
+        raw_ctype=next((v for k,v in spec['headers'] if k.lower()=='content-type'),'')
+        ctype=raw_ctype.lower()
+        names=[]
+        if ctype.startswith('application/x-www-form-urlencoded'):names=[k for k,v in parse_qsl(body.decode('utf-8',errors='replace'))]
+        elif ctype.startswith('application/json'):
+            try:
+                document=json.loads(body)
+                def keys(value,depth=0):
+                    if depth>16:return []
+                    if isinstance(value,dict):return list(value)+[key for sub in value.values() for key in keys(sub,depth+1)]
+                    if isinstance(value,list):return [key for sub in value for key in keys(sub,depth+1)]
+                    return []
+                names=keys(document)
+            except ValueError:pass
+        elif ctype.startswith('multipart/form-data'):
+            boundary=re.search(r'(?i)boundary="?([^; "]+)',raw_ctype)
+            if boundary:
+                for part in body.split(boundary[1].encode()):
+                    header=part.split(b'\r\n\r\n',1)[0]
+                    names.extend(v.decode('utf-8',errors='replace') for v in re.findall(rb'(?i)\bname="([^"]+)"',header))
+        if any(re.fullmatch(r'(?i)new[_-]?pass(?:word)?|password_confirmation|change_password|set_password',name) or
+               spec['method'] in ('PUT','PATCH') and name.lower() in ('password','passwd') for name in names):raise ValueError('Room rule: password changes are prohibited')
+    ssrf=spec['ssrf']
+    if ssrf is not None:
+        if not isinstance(ssrf,dict) or set(ssrf)!={'destination','context'} or resource_url(ssrf['destination'])['kind']!='url':raise ValueError('Invalid SSRF route declaration')
+    return spec
+
+
+def http_transport(raw):
+    """One real HTTP/1.1 exchange, pinned socket + original headers, no redirects.
+
+    Runs as the task user inside its namespace. No writable project imports,
+    shell, proxy env, URL cache or automatic retry. The caller controls redirects.
+    """
+    import http.client
+    import ssl
+    from email.parser import BytesParser
+    spec=http_spec(raw);started=time.monotonic();body=base64.b64decode(spec['body_b64'])
+    class WireReader:
+        def __init__(self,stream):self.stream=stream;self.raw=bytearray();self.truncated=False
+        def keep(self,value):
+            available=HTTP_HEADER_LIMIT+spec['limit_bytes']+65536-len(self.raw)
+            self.raw.extend(value[:available]);self.truncated=self.truncated or len(value)>available
+            return value
+        def readline(self,*args):return self.keep(self.stream.readline(*args))
+        def read(self,*args):return self.keep(self.stream.read(*args))
+        def read1(self,*args):return self.keep(self.stream.read1(*args))
+        def __getattr__(self,name):return getattr(self.stream,name)
+    class Response(http.client.HTTPResponse):
+        def __init__(self,*args,**kw):
+            super().__init__(*args,**kw);self.recording=WireReader(self.fp);self.fp=self.recording
+        def _read_and_discard_trailer(self):
+            size=len(self.raw_headers)
+            while True:
+                line=self.fp.readline(HTTP_HEADER_LIMIT-size+1);size+=len(line)
+                if size>HTTP_HEADER_LIMIT:raise ValueError('HTTP trailers exceed total header limit')
+                if not line:raise ValueError('Incomplete HTTP trailers')
+                if line in (b'\r\n',b'\n'):return
+        def begin(self):
+            if self.headers is not None:return
+            self.raw_headers=bytearray()
+            for _ in range(8):
+                line=self.fp.readline(1025);self.raw_headers.extend(line)
+                match=re.fullmatch(rb'HTTP/(1\.[01]) ([0-9]{3})([^\r\n]*)\r?\n',line)
+                if not match:raise ValueError('Invalid HTTP response status')
+                fields=bytearray()
+                while True:
+                    available=HTTP_HEADER_LIMIT-len(self.raw_headers)
+                    line=self.fp.readline(available+1)
+                    self.raw_headers.extend(line)
+                    if len(self.raw_headers)>HTTP_HEADER_LIMIT:raise ValueError('Response headers exceed 1 MiB')
+                    if not line:raise ValueError('Incomplete response headers')
+                    if line in (b'\r\n',b'\n'):break
+                    fields.extend(line)
+                self.status=self.code=int(match[2]);self.reason=match[3].decode('latin-1').strip()
+                if self.status not in (100,102,103):break
+            else:raise ValueError('Too many interim responses')
+            self.version=11 if match[1]==b'1.1' else 10
+            self.headers=self.msg=BytesParser(_class=http.client.HTTPMessage).parsebytes(bytes(fields))
+            if self.headers.defects:raise ValueError('Malformed HTTP headers')
+            self.chunked=self.headers.get('transfer-encoding','').lower()=='chunked';self.chunk_left=None
+            self.will_close=self._check_close();self.length=None
+            lengths=self.headers.get_all('content-length',[])
+            if lengths and (len(set(lengths))!=1 or not lengths[0].isdigit()):raise ValueError('Ambiguous HTTP body framing')
+            if lengths and not self.chunked:self.length=int(lengths[0])
+            if self.status in (204,304) or 100<=self.status<200 or self._method=='HEAD':self.length=0
+            if not self.will_close and not self.chunked and self.length is None:self.will_close=True
+    connection_type=http.client.HTTPSConnection if spec['scheme']=='https' else http.client.HTTPConnection
+    options={'timeout':spec['timeout']}
+    if spec['scheme']=='https':options['context']=ssl.create_default_context() if spec['tls_verify'] else ssl._create_unverified_context()
+    connection=connection_type(spec['hostname'],spec['port'],**options)
+    connection.response_class=Response
+    connection._create_connection=lambda address,timeout,*a,**kw:socket.create_connection((spec['target'],spec['port']),timeout)
+    authority=('['+spec['hostname']+']' if ':' in spec['hostname'] else spec['hostname'])+':'+str(spec['port'])
+    headers=[['Host',authority],['Connection','close'],*spec['headers']]
+    if body or spec['method'] in ('POST','PUT','PATCH'):headers.append(['Content-Length',str(len(body))])
+    request=(spec['method']+' '+spec['path']+' HTTP/1.1\r\n'+''.join(k+': '+v+'\r\n' for k,v in headers)+'\r\n').encode('latin-1')+body
+    response=None;received=bytearray();head=b'';complete=False;error=None;status=None;limited=False;sent=False
+    try:
+        connection.connect();connection.sock.sendall(request);sent=True
+        response=Response(connection.sock,method=spec['method']);response.begin()
+        head=bytes(response.raw_headers);status=response.status
+        while True:
+            if time.monotonic()-started>spec['timeout']:raise TimeoutError('HTTP deadline')
+            chunk=response.read1(min(65536,spec['limit_bytes']+1-len(received)))
+            if not chunk:
+                complete=response.length in (None,0);break
+            received.extend(chunk)
+            if len(received)>spec['limit_bytes']:limited=True;break
+    except (OSError,ValueError,http.client.HTTPException) as exc:
+        error=type(exc).__name__
+        if response is not None:head=bytes(getattr(response,'raw_headers',b''))[:HTTP_HEADER_LIMIT]
+    finally:
+        if response is not None:response.close()
+        connection.close()
+    return {'http_protocol':1,'request_sha256':tool_digest(spec),'request_b64':base64.b64encode(request).decode(),
+        'request_write_completed':sent,
+        'wire_b64':base64.b64encode(bytes(response.recording.raw) if response else b'').decode(),
+        'wire_truncated':response.recording.truncated if response else False,
+        'headers_b64':base64.b64encode(head).decode(),'body_b64':base64.b64encode(received[:spec['limit_bytes']]).decode(),
+        'status_code':status,'transport_complete':complete and not limited,'body_truncated':limited,
+        'error_type':error,'status':'completed' if complete and not limited else 'incomplete',
+        'elapsed_seconds':round(time.monotonic()-started,3)}
+
+
+def http_process(v,config,spec):
+    command=isolated_command(v['name'],config['owner'],config['uid'],config['gid'],
+        ['/usr/bin/python3','/usr/local/sbin/pm-netguard','http-worker'])
+    result=subprocess.run(command,input=json.dumps(spec),text=True,capture_output=True,timeout=spec['timeout']+5)
+    payload=json.loads(result.stdout)
+    if result.returncode or not isinstance(payload,dict) or payload.get('request_sha256')!=tool_digest(spec):raise ValueError('HTTP worker protocol failure')
+    return payload
+
+
+def http_run(task,raw):
+    ensure_root();v,config=owned_config(task);spec=http_spec(raw)
+    if int(os.environ.get('SUDO_UID',config['uid']))!=config['uid']:raise PermissionError('Wrong HTTP task owner')
+    check_target(spec['target'],config['allowed'])
+    policy=config.get('resource_policy');route=spec['ssrf'] or {}
+    authorize_resource(policy,'ssrf' if route else 'http',spec['target'],scheme=spec['scheme'],hostname=spec['hostname'],
+        port=spec['port'],path=spec['path'],destination=route.get('destination',''),context=route.get('context',''))
+    if route and not policy:raise ValueError('SSRF requires explicit resource policy')
+    if not policy and spec['hostname']!=spec['target'] and spec['hostname'] not in config.get('hostnames',[]):raise ValueError('Unapproved HTTP hostname')
+    config=ensure_target_egress(v,config,spec['target']);verify_target_egress(config,spec['target'])
+    if task_docker_families(config) and (not config.get('docker_forward_managed') or
+        not all(docker_rule_exists(rule) for rule in docker_forward_rules(v,config))):raise EgressError('Task Docker forwarding rules missing')
+    cmd('/usr/sbin/nft','list','table','inet',v['table']);cmd('/usr/sbin/nft','list','table','ip',v['nat'])
+    return http_process(v,config,spec)
 
 
 def ip_in_allowed(ip, allowed):
@@ -3027,6 +3240,9 @@ def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('capabilities')
+    sub.add_parser('http-worker')
+    http_parser=sub.add_parser('http')
+    http_parser.add_argument('--task-id',type=int,required=True)
     s = sub.add_parser('setup')
     s.add_argument('--task-id', type=int, required=True)
     s.add_argument('--owner', required=True)
@@ -3110,6 +3326,7 @@ def main():
     try:
         if args.command == 'capabilities':
             output({'capture_protocol': 1,'resource_policy_protocol':1,'ipv6':True, 'tool_protocol': TOOL_PROTOCOL,
+                    'http_protocol':1,'http_header_limit':HTTP_HEADER_LIMIT,
                     'session_protocol':2,'pivot_protocol':1,'transfer_protocol':1,
                     'system_tools': SYSTEM_TOOLS, 'privileged_scan_profiles': list(RAW_SCAN_PROFILES),
                     'profiles': ['http_capture', 'exec', 'poc_run', 'research', 'session', *RAW_SCAN_PROFILES],
@@ -3123,6 +3340,12 @@ def main():
                     'poc_interpreters': list(POC_INTERPRETERS),
                     'callback': {'ports_min': 1024, 'max_bytes': CALLBACK_MAX_BYTES},
                     'capture_limit_bytes': HTTP_CAPTURE_BODY_LIMIT,'capture_limits':list(HTTP_CAPTURE_LIMITS)})
+        elif args.command in ('http','http-worker'):
+            if args.command=='http-worker' and os.geteuid()==0:raise PermissionError('HTTP worker must run as the unprivileged task user')
+            text=sys.stdin.read(20*1024*1024+1)
+            if len(text)>20*1024*1024:raise ValueError('HTTP input budget exceeded')
+            raw=json.loads(text)
+            output(http_run(args.task_id,raw) if args.command=='http' else http_transport(raw))
         elif args.command == 'setup': setup(args.task_id, args.owner, args.allow, args.egress,
                                           json.loads(args.resource_policy) if args.resource_policy else None)
         elif args.command == 'teardown': teardown(args.task_id)

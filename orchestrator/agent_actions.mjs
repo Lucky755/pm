@@ -84,7 +84,7 @@ export function apply(ctx) {
     if (PROFILE_TOOLS && !PROFILE_TOOLS.has(toolKey(tool))) {
       return reject('PM_PROFILE_TOOL_DENIED: this specialization does not allow that tool.');
     }
-    if (tool.endsWith('pm_capability_read') || tool.endsWith('pm_evidence_index') ||
+    if (tool.endsWith('pm_http_read') || tool.endsWith('pm_capability_read') || tool.endsWith('pm_evidence_index') ||
         tool.endsWith('pm_task_memory') || tool.endsWith('pm_material_read') || tool.endsWith('pm_tool_status') || tool.endsWith('pm_tool_read')) {
       const usedReads = reads.get(agent) || 0;
       if (usedReads >= READ_LIMIT) {

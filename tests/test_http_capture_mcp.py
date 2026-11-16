@@ -134,11 +134,12 @@ class CaptureMCPTests(unittest.TestCase):
         self.assertEqual(len(self.calls),1)
 
     def test_scope_and_unsafe_paths_are_refused_before_broker(self):
-        for args in ({'target':'10.0.0.2'},{'hostname':'outside.example'},
-                     {'path':'/logout'},{'path':'/../secret'},{'path':'/x?flag=%0Aknown'}):
+        for args in ({'target':'10.0.0.2'},{'hostname':'outside.example'},{'path':'/x?flag=%0Aknown'}):
             with self.subTest(args=args):
                 self.assertEqual(self.call(**args)['status'],'blocked')
         self.assertEqual(self.calls,[])
+        for path in ('/logout','/../secret'):
+            self.assertEqual(self.call(path=path)['status'],'completed')
 
     def test_registered_reflection_is_not_discovery_and_does_not_cancel_good_capture(self):
         reflected=self.call(path='/echo/'+quote(self.value,safe=''))

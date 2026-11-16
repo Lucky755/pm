@@ -592,3 +592,61 @@ Unix-сокетов или netlink. Первые девять тестов до 
 `flag_verify`), compileall и `git diff --check` проходят. Десять ручных
 API/инфраструктурных экспериментов не запускались и не считаются пройденными.
 Зависимости Harness и исходник standalone broker этим исправлением не менялись.
+
+## Общий HTTP-компонент — реализовано от `3ac2a80`
+
+`pm_http_request` получает свежий ответ с method/query/headers/cookies/auth,
+text/binary/JSON/form/multipart. `pm_http_read` читает проверенные сохранённые
+диапазоны без сети. SQLite хранит версии веб-сессий и обмены с intent/start/
+finished/unknown, ресурсом, временем и связями оригиналов. Приватные cookies/auth
+сохраняются отдельно; идентичность исполнения учитывает реальные method/body/
+headers/auth, но не новое имя сессии/лимит выдачи. Повтор POST и unknown не
+перезапускаются автоматически. HTTP 200/403 и transport_complete не являются
+авторизацией, доступом или выполненной целью. Модельных вызовов для агрегирования
+HTTP-данных нет; адаптер Harness и его зависимости сохранены.
+
+Каждый redirect проверяется PM и root broker: исходные auth/cookie headers не
+копируются на другой origin, применяются его auth и подходящие scoped cookies.
+Shared HTTP budget и ограничения задачи сохранены. Общие именные
+запреты logout/delete/reset/traversal удалены; явные path grants/room exclusions,
+включая decoded traversal, продолжают действовать. Поддержанный password-change
+guard различает чтение формы и изменение, проверяет известные endpoint/поля
+JSON/form/multipart/query; это не полное понимание семантики любого API.
+
+Typed SSRF выражается query/form/JSON. Сохраняются application request,
+предполагаемое destination и наблюдаемый ответ приложения, без утверждения
+непроверенного внутреннего контакта. Target loopback не разрешается как Kali.
+Новые ссылки на кандидаты флагов сохраняют прежний операторский механизм;
+отражение исходных headers/body/cookies не становится независимым обнаружением.
+Источники с одним URL/телом, но разными запросами не сливаются в один proof.
+
+Реальный фиксированный Python worker принимает headers до 1 MiB; сохраняются
+исходные plaintext HTTP request/response, включая chunk framing, отдельно от
+entity body и ≤4096-символьной выдачи модели. Body/wire/model/decode truncation
+помечаются раздельно. Worker исполняется task user в прежнем NetGuard, не от root,
+без writable imports/произвольной shell. Старый broker отклоняется до сетевого
+запуска: требуется http_protocol=1/header_limit=1048576. Установленная копия при
+разработке не менялась. Legacy capture/discovery cache сохранён для совместимости
+и не подменяет свежие проверки. Контракт — [HTTP_COMPONENT.md](HTTP_COMPONENT.md).
+
+Проверено: [24 новых HTTP runtime-сценария](../tests/test_http_client_runtime.py)
+с настоящими loopback-серверами, worker-процессом, MCP-регистрацией, временной
+SQLite и artifact store. Подменена только привилегированная граница: вместо
+namespace/VPN логический test-address отображён на настоящий loopback socket.
+HTTP-ответы, парсинг, сохранение, повторы и cookies не подменяются. Проверены
+POST/query/методы/JSON/binary/form/multipart, cookie Path/Secure/auth isolation,
+redirects/303/307/scope, прежний URL с новым ответом, ровно 1 MiB/oversize headers,
+chunk framing/неполные trailers, partial bodies, SSRF query/form/JSON, unknown
+POST без повтора, новые session labels, password guard и отсутствие secret dumps.
+
+Полный `.venv/bin/python tests/run_offline.py --runtime`: **668 unittest** и
+шесть legacy-скриптов, ноль сбоев и пропусков. Обе самопроверки (`agent_actions`,
+`flag_verify`), compileall, Node syntax, environment check и `git diff --check`
+проходят. Прежние четыре проверки эвристических запретов обновлены на новый
+контракт; проверки внешних ресурсов/control injection/явных границ сохранены.
+
+Не проверялись реальные VPN/kernel/bubblewrap, внешний HTTPS/SNI, живая цель и
+платный API. Десять ручных API/инфраструктурных экспериментов не запускались и не
+считаются пройденными. Полный браузер/OIDC/NTLM/HTTP2/HTTP3, CONNECT/upgrade и
+произвольные SSRF-протоколы не реализованы. Общий координатор, parallel workflow
+этапа 15, рабочие задачи/SQLite/отчёты/доказательства этим этапом не менялись.

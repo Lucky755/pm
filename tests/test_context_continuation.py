@@ -27,9 +27,11 @@ class ContinuationTests(unittest.TestCase):
             self.assertEqual(pm.session_api_key(args,required=True),'test-only')
         prompt.assert_called_once()
 
-    def test_encoded_state_changing_paths_are_rejected(self):
+    def test_encoded_endpoint_names_do_not_create_a_generic_permission_gate(self):
         for path in ('/%6cogout', '/%2564elete', '/%2572eset'):
-            self.assertIsNone(web.normalize_href(path, 'http://10.0.0.1/', '10.0.0.1', ['10.0.0.1']))
+            self.assertEqual(web.normalize_href(path, 'http://10.0.0.1/', '10.0.0.1', ['10.0.0.1']),
+                             ('http','10.0.0.1',80,path))
+        self.assertIsNone(web.normalize_href('http://outside.invalid/%6cogout', 'http://10.0.0.1/', '10.0.0.1', ['10.0.0.1']))
 
     def test_form_fields_stay_inside_their_form(self):
         parser = web.PageMetadata()

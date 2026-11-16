@@ -46,7 +46,7 @@ def collect(db, task_id, *, artifact_id=None):
         proof = {'kind': 'http_capture', 'task_id': task_id, 'target': target,
                  'capture_ref': ref, 'capture_refs':[ref], 'path': path, 'capture_sha256': capture_sha,
                  'scheme':scheme,'hostname':hostname,'port':port,'status_code':status}
-        proof['request'] = {'method':'GET','scheme':scheme,'hostname':hostname,'port':port,'path':path}
+        proof['request'] = metadata.get('request') or {'method':'GET','scheme':scheme,'hostname':hostname,'port':port,'path':path}
         if object_path:
             try:
                 decoder = zlib.decompressobj()
@@ -80,7 +80,8 @@ def collect(db, task_id, *, artifact_id=None):
         proof['sha256'] = hashlib.sha256(body).hexdigest()
         proof['bytes'] = len(body)
         # Reading/re-capturing identical bytes does not create another witness.
-        key = (target, scheme, hostname, port, path, proof['sha256'])
+        request_identity=proof['request'].get('raw_request_ref',{}).get('sha256') or repr(proof['request'])
+        key = (target, scheme, hostname, port, path, proof['sha256'],request_identity)
         if key in seen:
             seen[key]['capture_refs'].append(ref)
             continue
@@ -99,6 +100,9 @@ def value_in_request(proof, value):
     request = proof['request']
     text = '\n'.join(str(request[k]) for k in ('method','scheme','hostname','port','path'))
     text += '\n' + proof['target']
+    if request.get('raw_request_ref'):
+        try:text+='\n'+artifacts.load_material(proof['task_id'],request['raw_request_ref']).decode('utf-8',errors='replace')
+        except (OSError,ValueError):return True # lost request provenance cannot establish discovery
     pending, seen = [text], {text}
     while pending:
         current = pending.pop()

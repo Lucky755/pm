@@ -1,8 +1,9 @@
 """Read-only bounded HTTP discovery using the root-owned isolated NetGuard broker.
 
-For every task: manually launched, no brute force, no redirects followed by curl,
-no forms submitted, no cookies or page bodies persisted. Finds paths from already
-observed Location headers and public HTML href links on the *same* approved host.
+Legacy initial reconnaissance: no brute force, automatic form submission or
+authenticated web-session state. Captures persist bodies in the artifact store;
+this module preserves its explicit discovery cache. Fresh method/body/session
+requests and scoped redirects belong to orchestrator.http_client.
 """
 from __future__ import annotations
 
@@ -30,8 +31,6 @@ MAX_BODY_PARSE = 20000
 MAX_DOCUMENT_PARSE = 262144
 MAX_DOCUMENT_REFRESH = 2
 MAX_METADATA_REFRESH = 4
-SKIP_SEGMENTS = {'logout', 'logoff', 'delete', 'remove', 'destroy', 'reset',
-                 'signout', 'sign-off', 'unsubscribe', 'shutdown', 'install', 'setup'}
 
 
 def now():
@@ -131,13 +130,7 @@ def migrate_route_key(db):
 def _safe_path(path):
     # Keep validation aligned with the root broker, which is the final authority.
     from executor.netguard_root import safe_http_path
-    path = safe_http_path(path)
-    decoded = path
-    for _ in range(3):
-        decoded = unquote(decoded)
-    if any(segment.lower().split('.')[0] in SKIP_SEGMENTS for segment in decoded.split('?',1)[0].split('/')):
-        raise ValueError('Path matches potentially state-changing endpoint')
-    return path
+    return safe_http_path(path)
 
 
 def normalize_href(href, base_url, target, allowed_hosts):
@@ -601,13 +594,13 @@ def request_capture(task_id, target, scheme, hostname, port, path, *, runner=sub
     if result.returncode or not isinstance(payload,dict) or any(payload.get(k) != v for k,v in expected.items()):
         raise ValueError('HTTP capture broker rejected request or returned a scope/protocol mismatch')
     encoded = payload.get('response_b64')
-    if not isinstance(encoded,str) or len(encoded) > ((limit_bytes+65536+2)//3)*4:
+    if not isinstance(encoded,str) or len(encoded) > ((limit_bytes+artifacts.MAX_HEADERS+2)//3)*4:
         raise ValueError('Invalid HTTP capture transport length')
     try:
         wire = base64.b64decode(encoded,validate=True)
     except ValueError as exc:
         raise ValueError('Invalid HTTP capture binary encoding') from exc
-    if len(wire) != payload.get('response_bytes') or len(wire) > limit_bytes+65536:
+    if len(wire) != payload.get('response_bytes') or len(wire) > limit_bytes+artifacts.MAX_HEADERS:
         raise ValueError('HTTP capture byte count mismatch')
     try:
         status, headers, full_body = artifacts.split_response(wire)
@@ -642,6 +635,9 @@ def attempts_used(db, task_id):
     for table in ('pm_http_size_recovery', 'pm_http_metadata_refresh', 'pm_http_document_refresh', 'pm_http_capture_refresh', 'pm_http_capture_upgrades'):
         total += db.execute(f'SELECT COUNT(*) FROM {table} r JOIN pm_http_discovery d '
                             'ON d.id=r.observation_id WHERE d.task_id=?', (task_id,)).fetchone()[0]
+    from orchestrator.task_memory import exists
+    if exists(db,'pm_http_exchanges'):
+        total+=db.execute('SELECT COUNT(*) FROM pm_http_exchanges WHERE task_id=?',(task_id,)).fetchone()[0]
     return total
 
 

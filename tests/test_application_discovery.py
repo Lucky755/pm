@@ -68,7 +68,7 @@ class ApplicationTests(unittest.TestCase):
             fetch('relative'); fetch('/%64elete.php'); fetch('/x?token=secret');
             fetch('http://other.invalid/path'); fetch('http://10.0.0.1:81/path');
             import('./child.js');''', 'http://10.0.0.1/js/app.js', TARGET)
-        self.assertEqual({r['path'] for r in refs}, {'/api/info','/api/submit','/js/child.js','/x?token=secret'})
+        self.assertEqual({r['path'] for r in refs}, {'/api/info','/api/submit','/js/child.js','/x?token=secret','/%64elete.php'})
         from orchestrator import diagnostics
         self.assertNotIn('token=secret',diagnostics.clean(json.dumps(refs),limit=None))
 

@@ -1,4 +1,4 @@
-"""Private bounded HTTP body artifacts. No raw response headers in storage/evidence."""
+"""Private bounded HTTP artifacts. Raw exchanges are separate from model digests."""
 import gzip
 import hashlib
 import io
@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1] / 'artifacts' / 'http'
 DEFAULT_BODY = 2 * 1024 * 1024
 MAX_BODY = 8 * 1024 * 1024
 MAX_TASK_BYTES = 64 * 1024 * 1024
-MAX_HEADERS = 65536
+MAX_HEADERS = 1024 * 1024
 
 
 def split_response(raw):
@@ -153,6 +153,8 @@ def save(db, task_id, target, scheme, host, port, path, capture, stamp):
     if not present and used+len(body) > MAX_TASK_BYTES:
         raise ValueError('Task HTTP artifact storage budget exceeded')
     directory = _directory(task_id)
+    used=max(used,sum(p.stat().st_size for p in directory.iterdir() if p.is_file()))
+    if not present and used+len(body)>MAX_TASK_BYTES:raise ValueError('Task HTTP artifact storage budget exceeded')
     destination = directory / (digest+'.body')
     if destination.is_symlink():
         raise ValueError('Unsafe HTTP artifact file')
@@ -165,11 +167,11 @@ def save(db, task_id, target, scheme, host, port, path, capture, stamp):
         if os.path.exists(temporary):
             os.unlink(temporary)
     metadata = {k:v for k,v in capture['metadata'].items()}
-    # Only these headers may be persisted; no cookies/auth/location query.
+    # Safe subset in body metadata; full headers live only in private originals.
     metadata['headers'] = {k:v for k,v in capture['headers'].items()
                           if k in ('content-type','content-length','content-encoding','server')}
-    # These are the actual fixed-GET parameters, not response/model annotations.
-    metadata['request'] = {'method':'GET','scheme':scheme,'hostname':host,'port':port,'path':path}
+    # Actual transport parameters; the compatibility writer defaults to fixed GET.
+    metadata['request'] = capture.get('request') or {'method':'GET','scheme':scheme,'hostname':host,'port':port,'path':path}
     with db:
         cursor = db.execute('INSERT INTO pm_http_artifacts '
             '(task_id,target,scheme,hostname,port,path,status_code,sha256,bytes_saved,complete,metadata_json,created_at) '
@@ -202,6 +204,37 @@ def load(db, task_id, artifact_id):
     if len(body) != row[1] or hashlib.sha256(body).hexdigest() != row[0]:
         raise ValueError('HTTP artifact checksum mismatch')
     return body,json.loads(row[2])
+
+
+def save_material(task_id,body):
+    """Private content-addressed original request/response, independently verifiable."""
+    if len(body)>MAX_BODY+MAX_HEADERS+65536:raise ValueError('HTTP material exceeds limit')
+    digest=hashlib.sha256(body).hexdigest();directory=_directory(task_id)
+    # Count all originals, including headers and uploads, against the same budget.
+    used=sum(p.stat().st_size for p in directory.iterdir() if p.is_file())
+    destination=directory/(digest+'.http')
+    if destination.is_symlink():raise ValueError('Unsafe HTTP material')
+    if not destination.exists():
+        if used+len(body)>MAX_TASK_BYTES:raise ValueError('Task HTTP artifact storage budget exceeded')
+        fd,temporary=tempfile.mkstemp(prefix='.exchange-',dir=directory)
+        try:
+            with os.fdopen(fd,'wb') as stream:stream.write(body)
+            os.replace(temporary,destination)
+        finally:
+            if os.path.exists(temporary):os.unlink(temporary)
+    return {'sha256':digest,'bytes':len(body)}
+
+
+def load_material(task_id,reference):
+    if not isinstance(reference,dict) or not re.fullmatch(r'[a-f0-9]{64}',str(reference.get('sha256',''))):raise ValueError('Invalid HTTP material reference')
+    file=_directory(task_id,create=False)/(reference['sha256']+'.http')
+    fd=os.open(file,os.O_RDONLY|os.O_NOFOLLOW)
+    with os.fdopen(fd,'rb') as stream:
+        info=os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:raise ValueError('Unsafe HTTP material permissions')
+        body=stream.read(MAX_BODY+MAX_HEADERS+65536+1)
+    if len(body)!=reference['bytes'] or hashlib.sha256(body).hexdigest()!=reference['sha256']:raise ValueError('HTTP material checksum mismatch')
+    return body
 
 
 def diagnostic_text(text):

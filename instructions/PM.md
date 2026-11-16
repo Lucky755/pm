@@ -47,7 +47,11 @@ Pin approved addresses with the saved Host/SNI. Preserve query; a fragment is
 browser state and must not be sent as an HTTP request target. Room exclusions
 and path boundaries override other grants. Do not bypass a bounded-tool refusal
 with generic exec or PoC. Arbitrary code is not proven to obey URL boundaries.
-For supported SSRF, use pm_http_ssrf with the authorized source application,
+For fresh HTTP use pm_http_request; pm_http_read reads saved originals without
+network I/O. Keep authorization/cookies in the named web session; a completed
+transport or HTTP 200 does not establish authentication or task success.
+For supported SSRF, use the typed ssrf field of pm_http_request (or legacy
+pm_http_ssrf) with the authorized source application,
 destination and target-machine context. Remote loopback belongs to that target;
 it is never Kali loopback. The application response alone does not prove that
 the inner destination was contacted. Ask a pivoting question linked to the

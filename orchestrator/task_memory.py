@@ -237,6 +237,13 @@ def source_state(db,task_id,capability_log):
             'sha256':artifact['sha256'],'bytes':artifact['bytes_saved'],'target':target,
             'path':artifact['path'],'port':artifact['port'],'complete':artifact['complete'],
             'source':{'table':'pm_http_artifacts','id':artifact['id']}})
+    for session in rows(db,'pm_http_sessions',task_id):
+        put('sessions','web_session:'+session['name'],{'kind':'http','name':session['name'],
+            'version':session['version'],'active_exchange_id':session['active_exchange_id'],
+            'liveness':'request/response session, not a persistent authenticated socket'})
+    for exchange in rows(db,'pm_http_exchanges',task_id):
+        put('checks','http_exchange:'+str(exchange['id']),{k:exchange[k] for k in
+            ('id','session_id','parent_id','method','url','target','request_sha256','operation_id','phase','artifact_id','created_at')})
     if exists(db,'network_job_runs') and exists(db,'network_phase_plans'):
         for row in db.execute('SELECT r.id,r.status,r.result_json,p.id,p.profile,p.parameters_json '
                               'FROM network_job_runs r JOIN network_phase_plans p ON p.id=r.plan_id '

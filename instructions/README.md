@@ -50,7 +50,7 @@
 | Профиль | Процедура | Инструментальная граница | Потолок шага/PoC/выходных токенов |
 |---|---|---|---|
 | recon/vuln/access/verify | нет автоматически | наследует существующую доступность | наследует бюджет вызова |
-| http-surface | http-capture | capture и чтение/память, без net_exec/PoC/session | 6 / 1 / 8192 |
+| http-surface | http-capture | свежий HTTP с method/body/web-session, capture и чтение/память, без net_exec/PoC/PTY | 6 / 1 / 8192 |
 | capture-audit | capture-audit | только чтение сохранённых данных и заметки, без GET | 4 / 1 / 8192 |
 | access-triage | access-triage | net_exec/session и чтение/память, без PoC/research/callback | 8 / 1 / 8192 |
 

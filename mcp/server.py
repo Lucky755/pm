@@ -1616,6 +1616,46 @@ def pm_net_exec(
 
 @mcp.tool()
 @diagnostics.tool
+def pm_http_request(task_id:int,request_json:str,session_id:str='default')->str:
+    """Fresh task-scoped HTTP exchange with methods, bodies, cookies and uploads.
+
+    JSON fields: url,method,headers,query,cookies,auth,body/body_b64/json/form/files,
+    ssrf,timeout,tls_verify. Files name task /work paths. No implicit response
+    cache. Redirects are checked individually; credentials are origin/session
+    bound. HTTP completion/status does not confirm login or a research goal.
+    Use pm_http_read for saved original ranges, not another network operation.
+    """
+    from orchestrator import http_client
+    started=time.monotonic()
+    try:
+        if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):raise ValueError('Wrong HTTP task')
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            payload=http_client.execute(db,task_id,json.loads(request_json),session_id)
+    except http_client.HTTPExecutionError as exc:
+        payload={'status':'unknown','reason_category':'outcome_unknown','reason':str(exc),'task_id':task_id}
+    except (ValueError,TypeError,KeyError) as exc:
+        payload={'status':'blocked','error_type':type(exc).__name__,'reason':str(exc)[:240],'task_id':task_id}
+    except (OSError,sqlite3.Error,subprocess.SubprocessError) as exc:
+        payload={'status':'error','error_type':type(exc).__name__,'reason':'HTTP operation outcome unknown; inspect saved exchange, no automatic retry','task_id':task_id}
+    rid=log_capability('http_capture',task_id,payload,time.monotonic()-started,
+        ['http_request','--task-id',str(task_id),'--session-id',session_id])
+    return tool_response({**payload,'result_id':rid})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_http_read(task_id:int,exchange_id:int,part:str='body',offset:int=0,limit:int=4096)->str:
+    """Read a saved HTTP request/response/body range. No network or new evidence."""
+    from orchestrator import http_client
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked','error':'Wrong task'})
+    try:
+        with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True,timeout=10)) as db:
+            return tool_response(http_client.read(db,task_id,exchange_id,part,offset,limit))
+    except (ValueError,OSError,sqlite3.Error,KeyError):return tool_response({'status':'blocked','reason':'Saved HTTP material unavailable'})
+
+
+@mcp.tool()
+@diagnostics.tool
 def pm_http_capture(
     task_id: int,
     target: str,
@@ -1626,7 +1666,7 @@ def pm_http_capture(
     hypothesis_key: str = "",
     new_evidence_id: str = "",
 ) -> str:
-    """Save one bounded HTTP(S) GET as original evidence through NetGuard.
+    """Legacy cached GET discovery. Use pm_http_request for a fresh/current response.
 
     Authorized task resource and pinned Host/SNI. Query is preserved; a fragment
     is browser-only. No body, custom headers, redirects or shell. Returns artifact_ref and result_id.
@@ -1667,7 +1707,7 @@ def pm_http_capture(
 @mcp.tool()
 @diagnostics.tool
 def pm_http_ssrf(task_id:int,application:str,destination:str,parameter:str='url',context:str='') -> str:
-    """One bounded SSRF GET via an authorized application and explicit destination.
+    """Legacy cached SSRF GET. Use pm_http_request.ssrf for fresh query/form/JSON checks.
 
     The destination is reached by the target application, never by Kali directly.
     Target-relative loopback needs an explicit grant; arbitrary destinations are denied.
