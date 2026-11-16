@@ -36,7 +36,7 @@ BROKER = '/usr/local/sbin/pm-netguard'
 DB = ROOT / 'storage/tasks.db'
 DOC_NETS = [ipaddress.ip_network(x) for x in (
     '192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24')]
-PORTS_MAX = 32
+PORTS_MAX = 50
 MAX_HOSTNAMES = 12
 TRANSITION_MAX_BYTES = 256 * 1024
 from intent_limits import INTENT_MAX, HINTS_MAX
@@ -573,7 +573,7 @@ def show_plan(task_id, plan):
 def reprobe_ports(ports_raw):
     values = ports_raw.split(',')
     if not 1 <= len(values) <= PORTS_MAX or any(not re.fullmatch(r'\d{1,5}', x) for x in values):
-        raise OperatorError('Для --reprobe укажи 1..32 порта через запятую')
+        raise OperatorError('Для --reprobe укажи 1..50 портов через запятую')
     ports = [int(v) for v in values]
     if len(set(ports)) != len(ports) or any(not 1 <= p <= 65535 for p in ports):
         raise OperatorError('Недопустимые/повторяющиеся порты')
@@ -1072,7 +1072,7 @@ def ensure_scan_followups(db, task_id, target):
         return False
     scan = db.execute('SELECT id,status,open_ports_json,followup_status FROM pm_tcp_full_scans '
                       'WHERE task_id=? AND target=?', (task_id, target)).fetchone()
-    if not scan or scan[1] != 'completed' or scan[3] not in ('pending', 'failed'):
+    if not scan or scan[1] not in ('completed','partial') or scan[3] not in ('pending', 'failed'):
         return False
     identifiers = {'id': scan[0], 'task_id': task_id}
     created = []
@@ -1118,13 +1118,13 @@ def ensure_scan_followups(db, task_id, target):
 def run_full_tcp_scan(db, task_id, target):
     """One bounded full scan per explicit console run, with durable retry audit.
 
-    A previous COMPLETED positive scan is cached. A failure or empty result
-    may be retried only after the operator explicitly resumes the task.
+    Completed, empty and partial results are cached. An interrupted running
+    attempt needs review; remaining discovery uses an explicit port queue.
     """
     initialize_tcp_scans(db)
     entry = db.execute('SELECT status,open_ports_json,error FROM pm_tcp_full_scans WHERE task_id=? AND target=?',
                        (task_id, target)).fetchone()
-    if entry and entry[0] == 'completed':
+    if entry and entry[0] in ('completed','partial','empty'):
         diagnostics.emit('cache.hit', name='tcp_full_scan', task_id=task_id, parameters={'target': target})
         scan = db.execute('SELECT created_at FROM pm_tcp_full_scans WHERE task_id=? AND target=?',
                           (task_id, target)).fetchone()
@@ -1143,6 +1143,8 @@ def run_full_tcp_scan(db, task_id, target):
     if entry and entry[0] == 'running':
         raise OperatorError('Предыдущий TCP-скан был прерван без подтверждения завершения. '
                             'Сначала убедись, что процесс Nmap уже остановлен.')
+    from orchestrator.target_availability import require_network
+    require_network(db,task_id)
     with db:
         if entry:
             db.execute("UPDATE pm_tcp_full_scans SET status='running',error=NULL,followup_status=NULL,"
@@ -1154,11 +1156,17 @@ def run_full_tcp_scan(db, task_id, target):
         attempt = db.execute('INSERT INTO pm_tcp_full_scan_attempts(task_id,target,status,created_at) VALUES (?,?,?,?)',
                              (task_id, target, 'running', datetime.now(timezone.utc).isoformat())).lastrowid
     line('  ' + tint('[SCAN]', 'brand') + f' TCP connect 1–65535 · {target} · --min-rate 1000')
+    payload=None
     try:
         payload, rc = diagnostics.call('tcp_full', sudo_checked, ['run', '--task-id', str(task_id),
                                     '--profile', 'tcp_full', '--target', target],
                                    task_id=task_id, parameters={'target': target, 'profile': 'tcp_full'},
                                    timeout=270, allow_error=True)
+        from orchestrator.port_research import nmap_summary
+        text=payload.get('stdout','')
+        complete=not rc and payload.get('status')=='completed' and not payload.get('output_truncated') and 'Nmap done:' in text and not re.search(r'(?i)host timeout|skipping host',text)
+        payload['port_discovery']=nmap_summary(text,complete=complete)
+        with db:db.execute('UPDATE pm_tcp_full_scan_attempts SET result_json=? WHERE id=?',(json.dumps(payload,ensure_ascii=False),attempt))
         if rc or payload.get('status') != 'completed' or payload.get('output_truncated'):
             raise OperatorError('Nmap: ' + str(payload.get('stderr') or payload.get('error') or
                                                       payload.get('status'))[:300])
@@ -1182,9 +1190,12 @@ def run_full_tcp_scan(db, task_id, target):
                          table='pm_tcp_full_scan_attempts', identifiers={'id': attempt},
                          parameters={'target': target, 'open_ports': len(ports)}, reason='nmap_result_saved')
     except Exception as exc:
+        observed=sorted({int(p) for p in re.findall(r'(?m)^(\d+)/tcp\s+open\s+', (payload or {}).get('stdout','')) if 1<=int(p)<=65535})
+        partial=bool(observed or (payload or {}).get('status')=='timeout' or (payload or {}).get('output_truncated') or
+            re.search(r'(?i)host timeout|skipping host',(payload or {}).get('stdout','')))
         with db:
-            db.execute('UPDATE pm_tcp_full_scans SET status=?,error=? WHERE task_id=? AND target=?',
-                       ('failed', str(exc)[:500], task_id, target))
+            db.execute('UPDATE pm_tcp_full_scans SET status=?,error=?,open_ports_json=?,followup_status=? WHERE task_id=? AND target=?',
+                       ('partial' if partial else 'failed', str(exc)[:500],json.dumps(observed),'pending' if observed else 'completed',task_id,target))
             db.execute('UPDATE pm_tcp_full_scan_attempts SET status=?,error=? WHERE id=?',
                        ('failed', str(exc)[:500], attempt))
         diagnostics.emit('scan.result', task_id=task_id, status='failed',
@@ -1198,64 +1209,80 @@ def run_full_tcp_scan(db, task_id, target):
 
 @diagnostics.stage
 def preflight_target(db, task_id, target, ports, timeout=2.0):
-    """Probe cached ports through the task broker and its existing NetGuard path."""
+    """Persistent availability queue, 50 ports/operation, individual deadlines."""
+    from orchestrator import port_research, target_availability
+    from executor import netguard_root
+    import inspect
     try:
-        selected = sorted({int(port) for port in ports if 1 <= int(port) <= 65535})
-        timeout = min(2.0, max(0.05, float(timeout)))
-    except (ValueError, TypeError) as exc:
-        raise OperatorError('Некорректные порты или тайм-аут проверки доступности') from exc
-    stamp = datetime.now(timezone.utc).isoformat()
-    if not selected:
-        result={'reachable': [], 'unreachable': [], 'unchecked': [], 'checked_at': stamp}
-        preflight_summary(task_id,target,selected,result)
-        return result
-    script = ('import json,socket,sys,time; host=sys.argv[1]; ports=json.loads(sys.argv[2]); '
-              'limit=time.monotonic()+10; ok=[]; bad=[]; '
-              'exec("for port in ports:\\n if time.monotonic()>=limit: break\\n try:\\n  s=socket.create_connection((host,port),timeout=min(float(sys.argv[3]),max(0.05,limit-time.monotonic()))); s.close(); ok.append(port)\\n except OSError:\\n  bad.append(port)\\n"); '
-              'print(json.dumps({"reachable":ok,"unreachable":bad,"unchecked":ports[len(ok)+len(bad):]}))')
-    argv = ['/usr/bin/python3', '-c', script, target, json.dumps(selected), str(timeout)]
-    command = ['run', '--task-id', str(task_id), '--profile', 'exec', '--target', target,
-               '--timeout', '12']
-    for item in argv:
-        command.append('--argv=' + item)
-    try:
-        payload, rc = diagnostics.call('preflight', sudo_checked, command, task_id=task_id,
-                                       parameters={'target': target, 'profile': 'exec', 'ports': ','.join(map(str, selected))},
-                                       timeout=20, allow_error=True)
-        if rc or payload.get('status') != 'completed' or payload.get('exit_code') != 0:
-            raise OperatorError('Проверка доступности через NetGuard не завершилась: ' +
-                                str(payload.get('error') or payload.get('stderr') or 'ошибка')[:200])
-        result = json.loads(payload.get('stdout', ''))
-        if (not isinstance(result,dict)
-                or any(not isinstance(result.get(key),list) or any(type(p) is not int for p in result[key])
-                       for key in ('reachable','unreachable','unchecked'))
-                or sorted(result['reachable']+result['unreachable']+result['unchecked'])!=selected):
-            raise ValueError('invalid probe result')
-    except OperatorError as exc:
-        with db:
-            db.execute('INSERT INTO pm_tcp_full_scan_attempts(task_id,target,status,error,created_at) '
-                       'VALUES (?,?,?,?,?)', (task_id, target, 'preflight_fail', str(exc)[:500], stamp))
-        raise
-    except (OSError, subprocess.SubprocessError) as exc:
-        with db:
-            db.execute('INSERT INTO pm_tcp_full_scan_attempts(task_id,target,status,error,created_at) '
-                       'VALUES (?,?,?,?,?)', (task_id, target, 'preflight_fail', str(exc)[:500], stamp))
-        raise OperatorError('Проверка доступности через NetGuard не завершилась') from exc
-    except (ValueError, KeyError, TypeError) as exc:
-        with db:
-            db.execute('INSERT INTO pm_tcp_full_scan_attempts(task_id,target,status,error,created_at) '
-                       'VALUES (?,?,?,?,?)', (task_id, target, 'preflight_fail', str(exc)[:500], stamp))
-        raise OperatorError('Некорректный результат проверки доступности NetGuard') from exc
-    result['checked_at'] = stamp
+        selected=sorted({int(p) for p in ports if 1<=int(p)<=65535})
+        timeout=min(2.0,max(.05,float(timeout)))
+    except (ValueError,TypeError) as exc:raise OperatorError('Некорректная проверка доступности') from exc
+    port_research.initialize(db)
+    state=target_availability.saved(db,task_id)
+    if state['state'] in ('deactivated','confirmed_unavailable'):raise OperatorError('target_offline: '+state['reason'])
+    stamp=datetime.now(timezone.utc).isoformat()
+    with db:
+        for port in selected:
+            db.execute("INSERT OR IGNORE INTO pm_port_preflight VALUES(?,?,?,'unchecked','{}',NULL)",(task_id,target,port))
+        from orchestrator.service_inventory import timestamp,age_minutes
+        clock=datetime.now(timezone.utc)
+        for port,state,observed in db.execute('SELECT port,state,checked_at FROM pm_port_preflight WHERE task_id=? AND target=?',(task_id,target)).fetchall():
+            when=timestamp(observed)
+            if port in selected and state!='unchecked' and (when is None or not 0<=(clock-when).total_seconds()<=age_minutes()*60):
+                db.execute("UPDATE pm_port_preflight SET state='unchecked' WHERE task_id=? AND target=? AND port=?",(task_id,target,port))
+    existing={p:(s,raw) for p,s,raw in db.execute('SELECT port,state,result_json FROM pm_port_preflight WHERE task_id=? AND target=?',(task_id,target)) if p in selected}
+    if selected and all(existing[p][0]!='unchecked' for p in selected):
+        with db:db.executemany("UPDATE pm_port_preflight SET state='unchecked' WHERE task_id=? AND target=? AND port=?",[(task_id,target,p) for p in selected])
+        existing={p:('unchecked','{}') for p in selected}
+    pending=[p for p in selected if existing[p][0]=='unchecked']
+    # Operation count, not a ten-second deadline over the entire inventory.
+    for offset in range(0,min(len(pending),8*PORTS_MAX),PORTS_MAX):
+        batch=pending[offset:offset+PORTS_MAX]
+        code=inspect.getsource(netguard_root.port_probe)+"\nimport json,sys; rows=[port_probe(sys.argv[1],p,'tcp',float(sys.argv[3])) for p in json.loads(sys.argv[2])]; print(json.dumps({'reachable':[r['port'] for r in rows if r['state']=='open'],'unreachable':[r['port'] for r in rows if r['state']!='open'],'unchecked':[],'port_states':rows}))"
+        argv=['/usr/bin/python3','-c',code,target,json.dumps(batch),str(timeout)]
+        seconds=int(len(batch)*timeout)+4
+        command=['run','--task-id',str(task_id),'--profile','exec','--target',target,'--timeout',str(seconds)]
+        command+=['--argv='+item for item in argv]
+        try:
+            payload,rc=diagnostics.call('preflight',sudo_checked,command,task_id=task_id,
+                parameters={'target':target,'ports':','.join(map(str,batch))},timeout=seconds+8,allow_error=True)
+            result=json.loads(payload.get('stdout',''))
+            if (not isinstance(result,dict) or any(not isinstance(result.get(k),list) or any(type(p) is not int for p in result[k]) for k in ('reachable','unreachable','unchecked'))
+                    or sorted(result['reachable']+result['unreachable']+result['unchecked'])!=batch):raise ValueError('invalid preflight partition')
+            rows={r['port']:r for r in result.get('port_states',[]) if isinstance(r,dict) and r.get('state') in port_research.STATES and r.get('protocol')=='tcp'}
+            with db:
+                for port in result['reachable']+result['unreachable']:
+                    value=rows.get(port,{'port':port,'protocol':'tcp','state':'open' if port in result['reachable'] else 'timeout','classification':'legacy result; exact failure unknown'})
+                    db.execute('UPDATE pm_port_preflight SET state=?,result_json=?,checked_at=? WHERE task_id=? AND target=? AND port=?',
+                        (value['state'],json.dumps(value),value.get('probe_finished_at',stamp),task_id,target,port))
+            if result['unchecked']:break
+        except (ValueError,TypeError,KeyError,OSError,subprocess.SubprocessError,OperatorError) as exc:
+            with db:db.execute('INSERT INTO pm_tcp_full_scan_attempts(task_id,target,status,error,created_at) VALUES(?,?,?,?,?)',(task_id,target,'preflight_fail',str(exc)[:500],stamp))
+            target_availability.set_state(db,task_id,'temporary_error','Preflight transport/protocol failed; host shutdown is not established',source='preflight')
+            raise OperatorError('Проверка доступности не завершилась: '+type(exc).__name__) from exc
+    rows={p:(state,json.loads(raw),observed) for p,state,raw,observed in db.execute('SELECT port,state,result_json,checked_at FROM pm_port_preflight WHERE task_id=? AND target=?',(task_id,target)) if p in selected}
+    result={'reachable':[p for p in selected if rows[p][0]=='open'],
+        'unreachable':[p for p in selected if rows[p][0] not in ('open','unchecked')],
+        'unchecked':[p for p in selected if rows[p][0]=='unchecked'],'checked_at':stamp,
+        'port_states':[{'port':p,'protocol':'tcp','state':rows[p][0],'checked_at':rows[p][2],'purpose':'availability'} for p in selected],
+        'negative_transport_response_observed':any(rows[p][0]=='closed' for p in selected),
+        'host_state':'unknown; service observations never prove machine shutdown'}
     preflight_summary(task_id,target,selected,result)
     with db:
-        db.execute('INSERT INTO pm_tcp_full_scan_attempts(task_id,target,status,error,created_at) '
-                   'VALUES (?,?,?,?,?)', (task_id, target, 'preflight_ok' if result['reachable'] else
-                   'preflight_incomplete' if result['unchecked'] else 'preflight_fail',
-                   json.dumps(result, ensure_ascii=False), stamp))
+        db.execute('INSERT INTO pm_tcp_full_scan_attempts(task_id,target,status,error,created_at) VALUES(?,?,?,?,?)',
+            (task_id,target,'preflight_ok' if result['reachable'] else 'preflight_incomplete' if result['unchecked'] else 'preflight_fail',json.dumps(result),stamp))
         if result['reachable']:
-            db.execute('UPDATE pm_tcp_full_scans SET last_seen_at=? WHERE task_id=? AND target=?',
-                       (stamp, task_id, target))
+            last=max(rows[p][2] for p in result['reachable'] if rows[p][2])
+            db.execute('UPDATE pm_tcp_full_scans SET last_seen_at=? WHERE task_id=? AND target=?',(last,task_id,target))
+    if selected and not result['reachable'] and not result['unchecked']:
+        from orchestrator.service_inventory import collect_full
+        other_live=any(e['protocol']=='udp' and e['fresh'] and e['state']=='open' for e in collect_full(db,task_id)['entries'])
+        if not other_live and not result['negative_transport_response_observed']:target_availability.set_state(db,task_id,'services_unavailable','Known TCP probes failed; shutdown unconfirmed. No repeat reconnaissance; saved-data analysis remains available.',source='preflight')
+        try:
+            route,_=diagnostics.call('network_route_diagnostic',sudo_checked,['network-diagnostic','--task-id',str(task_id),'--target',target],task_id=task_id,timeout=8,allow_error=True)
+            result['route_diagnostic']={k:route.get(k) for k in ('status','route_dev','configured_egress','route_matches','interface_state')}
+        except Exception as exc:result['route_diagnostic']={'status':'unknown','error_type':type(exc).__name__}
+        diagnostics.emit('network.diagnostic',task_id=task_id,reason='known_services_unavailable_host_shutdown_unproven',parameters=result['route_diagnostic'])
     return result
 
 
@@ -1381,6 +1408,10 @@ def render_coordinator_result(result, args):
         line(json.dumps(result,ensure_ascii=False,indent=2))
         return result
     line('  Остановка: ' + safe_display(result['stop_reason']))
+    availability=result.get('target_availability',{})
+    if availability.get('network_allowed') is False:
+        line('  Цель: '+safe_display(availability['state'])+' · '+safe_display(availability['reason']))
+        line('  Доступны сохранённые материалы и подтверждение флагов. Свежие TCP/UDP, HTTP и SSH требуют восстановления цели/маршрута и явного target-state active.')
     if result['stop_reason']=='role_report_damaged_requires_review':
         line('  Отчёт специалиста повреждён; исход операции приведён отдельно по журналу исполнителя. '
              'Новые действия и планирование приостановлены. Изучите исходный ответ и доказательства; '
@@ -1470,6 +1501,10 @@ def run_task_coordinator(db, task_id, args):
 def launch_configured_task(db, task_id, target, args):
     from orchestrator.coordinated_attack import task_lock
     with task_lock(task_id):
+        from orchestrator import target_availability
+        if not target_availability.saved(db,task_id)['network_allowed']:
+            if getattr(args,'coordinated',False):return run_task_coordinator(db,task_id,args)
+            raise OperatorError('target_offline: используйте сохранённые данные; восстановление цели требует явного target-state active')
         from orchestrator import resources
         scope=resources.saved(db,task_id)
         validate_resource_launch(args,scope)
@@ -1557,6 +1592,8 @@ def launch_rebound_task(db,task_id,target,args,scope):
 
 def launch_coordinated_task(db, task_id, target, args):
     from orchestrator import service_inventory, task_runtime
+    from orchestrator import target_availability
+    if not target_availability.saved(db,task_id)['network_allowed']:return run_task_coordinator(db,task_id,args)
     meta=task_runtime.saved(db,task_id)
     if meta is None:
         task_runtime.save_mode(db,task_id,'coordinated')
@@ -1567,6 +1604,10 @@ def launch_coordinated_task(db, task_id, target, args):
             raise OperatorError('Структурированный инвентарь не соответствует текущему scope и адресу задачи')
         return sorted({entry['port'] for entry in inventory['entries'] if entry['protocol']=='tcp'})
     ports=known_tcp_ports()
+    fresh_udp=any(e['protocol']=='udp' and e['fresh'] and e['state']=='open' for e in service_inventory.collect_full(db,task_id)['entries'])
+    if not ports and fresh_udp:
+        task_runtime.reconnaissance(db,task_id,'completed')
+        return run_task_coordinator(db,task_id,args)
     cached=bool(ports and meta['recon_status'] in ('pending','completed'))
     def pause(reason):
         task_runtime.reconnaissance(db,task_id,'waiting_operator',reason)
@@ -1585,9 +1626,11 @@ def launch_coordinated_task(db, task_id, target, args):
         if not ports:
             return pause('reconnaissance_no_tcp_services')
         checked=preflight_target(db,task_id,target,ports)
-        if not checked['reachable'] and not getattr(args,'force_unreachable',False):
+        if not checked['reachable'] and not fresh_udp and not checked.get('negative_transport_response_observed') and not getattr(args,'force_unreachable',False):
             return pause('reconnaissance_preflight_incomplete' if checked.get('unchecked')
-                         else 'reconnaissance_target_unreachable')
+                         else 'reconnaissance_services_unavailable')
+        if not checked['reachable'] and getattr(args,'force_unreachable',False):
+            target_availability.set_state(db,task_id,'active','Operator explicitly requested bounded work despite failed TCP preflight; reachability remains unconfirmed',source='operator')
         if cached and not repaired and not getattr(args,'reprobe',None) and not getattr(args,'sync_burp',False):
             diagnostics.emit('cache.hit',name='initial_reconnaissance',task_id=task_id,
                              reason='saved_scoped_service_map')
@@ -1624,6 +1667,9 @@ def launch_legacy_task(db, task_id, target, args):
         line('  [!] Пока нет подтверждённых TCP-сервисов. Без новых фактов агенты не запускаются.')
         return
     preflight = preflight_target(db, task_id, target, ports)
+    if not preflight['reachable'] and getattr(args,'force_unreachable',False):
+        from orchestrator import target_availability
+        target_availability.set_state(db,task_id,'active','Operator force-unreachable; reachability remains unconfirmed',source='operator')
     if not preflight['reachable'] and not getattr(args, 'force_unreachable', False):
         if preflight.get('unchecked'):
             raise OperatorError(f"Проверка доступности не завершена: {len(preflight['unchecked'])} "
@@ -1739,6 +1785,15 @@ def op_resume(args):
             elif getattr(args,'abandon_running_step',None) is not None:
                 raise OperatorError('Нет сохранённого шага для этого операторского действия')
         task_runtime.save_mode(db,args.task_id,mode)
+        from orchestrator import target_availability
+        if not target_availability.saved(db,args.task_id)['network_allowed']:
+            if getattr(args,'force_unreachable',False):
+                raise OperatorError('Сохранённое выключение/ожидание не отменяется --force-unreachable; сначала явно target-state active')
+            if not args.coordinated:
+                return render_coordinator_result({'task_id':args.task_id,'status':'waiting_operator','succeeded':False,
+                    'stop_reason':'target_restoration_required','steps':[],
+                    'target_availability':target_availability.saved(db,args.task_id)},args)
+            return run_task_coordinator(db,args.task_id,args)
         target = configure(db, args.task_id, args)
         save_flag_options(db, args.task_id, args)
         save_objective_options(db, args.task_id, args)
@@ -2779,6 +2834,30 @@ def op_browser_config(args):
         result,_=sudo_checked(command);line(json.dumps(result,ensure_ascii=False,indent=2));return result
 
 
+def op_target_state(args):
+    from orchestrator import target_availability
+    from orchestrator.coordinated_attack import task_lock
+    with task_lock(args.task_id),connect() as db:
+        task_target(db,args.task_id)
+        value=target_availability.set_state(db,args.task_id,args.state,args.reason,source='operator') if args.state else target_availability.saved(db,args.task_id)
+        line(json.dumps(value,ensure_ascii=False,indent=2));return value
+
+
+def op_port_survey(args):
+    from orchestrator import port_research,target_availability
+    from orchestrator.coordinated_attack import task_lock
+    selected=reprobe_ports(args.ports)
+    with task_lock(args.task_id),connect() as db:
+        target_availability.require_network(db,args.task_id)
+        target=task_target(db,args.task_id)
+        from executor.task_scope import check_action
+        ensure_task_scope(db,args.task_id,target)
+        if check_action(db,args.task_id,'scan',target)['decision']!='ALLOW':raise OperatorError('Область URL не разрешает исследование хоста')
+        configure(db,args.task_id,args)
+        result=port_research.run(db,args.task_id,target,args.protocol,selected,args.max_jobs)
+        line(json.dumps(result,ensure_ascii=False,indent=2));return result
+
+
 def op_hosts(args):
     with connect() as db:
         target = configure(db, args.task_id, args)
@@ -2832,6 +2911,11 @@ def attack_task(args):
         with connect() as db:
             task_runtime.save_mode(db,args.task_id,'coordinated')
             return run_task_coordinator(db,args.task_id,args)
+    from orchestrator import target_availability
+    with connect() as db:
+        if not target_availability.saved(db,args.task_id)['network_allowed']:
+            return render_coordinator_result({'task_id':args.task_id,'status':'waiting_operator','succeeded':False,
+                'stop_reason':'target_restoration_required','steps':[],'target_availability':target_availability.saved(db,args.task_id)},args)
     key = session_api_key(args, required=True)
     heading(f'Ролевой цикл - задача #{args.task_id}')
     line('  ' + tint('решает оркестратор: ' + ' -> '.join(roles), 'bright'))
@@ -3203,7 +3287,7 @@ def parser_main():
                         help='Флаг совместимости; проверка доступности выполняется при запуске задачи')
     resume = sub.add_parser('resume', help='Продолжить существующую задачу')
     resume.add_argument('task_id', type=int)
-    resume.add_argument('--reprobe', help='Однократно перепроверить 1..32 порта после ремонта сети, напр. 22,80')
+    resume.add_argument('--reprobe', help='Однократно перепроверить 1..50 портов после ремонта сети, напр. 22,80')
     questions = sub.add_parser('questions', help='Очередь: просмотр без сети; установка только после явного одобрения tool')
     questions.add_argument('task_id',type=int)
     questions.add_argument('--answer',type=int,help='ID ожидающего вопроса')
@@ -3219,6 +3303,13 @@ def parser_main():
     callback.add_argument('--reason',required=True)
     callback.add_argument('--attempt-limit',type=int,choices=range(1,11),help='Явное изменение общего лимита вариантов этой трассы (по умолчанию 3)')
     browser=sub.add_parser('browser-config',help='Настроить Playwright/Chromium и необязательный task-local Burp; не запускает браузер/цель')
+    available=sub.add_parser('target-state',help='Показать/явно изменить доступность без сетевых проверок')
+    available.add_argument('task_id',type=int);available.add_argument('--state',choices=('active','deactivated','confirmed_unavailable'))
+    available.add_argument('--reason',default='Operator assertion')
+    survey=sub.add_parser('survey',help='Отдельная сохраняемая TCP/UDP очередь; явные порты, без модели')
+    survey.add_argument('task_id',type=int);survey.add_argument('--protocol',required=True,choices=('tcp','udp'))
+    survey.add_argument('--ports',required=True);survey.add_argument('--max-jobs',type=int,default=1,choices=range(1,9))
+    survey.add_argument('--egress');survey.add_argument('--hostnames')
     browser.add_argument('task_id',type=int);browser.add_argument('--runtime',required=True)
     browser.add_argument('--chromium',default='/usr/lib/chromium/chromium')
     browser.add_argument('--burp-proxy-port',type=int,default=0);browser.add_argument('--burp-bridge-port',type=int,default=17779)
@@ -3558,6 +3649,8 @@ def main():
         elif args.command == 'questions': op_questions(args)
         elif args.command == 'callback-config':op_callback_config(args)
         elif args.command == 'browser-config':op_browser_config(args)
+        elif args.command == 'target-state':op_target_state(args)
+        elif args.command == 'survey':op_port_survey(args)
         elif args.command == 'http-artifacts': op_http_artifacts(args)
         elif args.command == 'http-reparse': op_http_reparse(args)
         elif args.command == 'http-policy': op_http_policy(args)

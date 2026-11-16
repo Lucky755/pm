@@ -362,7 +362,7 @@ def validate_plan(db, plan):
         str(address),
     ]
 
-    if profile == "tcp_ports":
+    if profile in ('tcp_ports','service_versions'):
         if set(params) != {"ports"}:
             raise ValueError(
                 "Unexpected TCP profile parameters"
@@ -377,9 +377,9 @@ def validate_plan(db, plan):
 
         parts = raw.split(",")
 
-        if not 1 <= len(parts) <= 32:
+        if not 1 <= len(parts) <= 50:
             raise ValueError(
-                "Expected 1..32 TCP ports"
+                "Expected 1..50 TCP ports"
             )
 
         numbers = []
@@ -411,6 +411,13 @@ def validate_plan(db, plan):
             "--ports",
             ",".join(str(x) for x in numbers),
         ])
+
+    elif profile=='udp_ports':
+        if set(params)!={'ports'}:raise ValueError('Unexpected UDP parameters')
+        from executor.netguard_root import tool_args
+        tool_args('udp_ports',str(address),80,params['ports'],'http')
+        return ['sudo','-n','/usr/local/sbin/pm-netguard','run','--task-id',str(plan['task_id']),
+            '--profile','udp_ports','--target',str(address),'--ports',params['ports']]
 
     elif profile == "http_headers":
         if set(params) != {"port"}:
@@ -596,6 +603,8 @@ def completed_run(db, plan_id):
 @diagnostics.stage
 def execute_job(db, plan_id):
     plan = load_plan(db, plan_id)
+    from orchestrator.target_availability import require_network
+    require_network(db,plan['task_id'])
     diagnostics.emit('job.plan', task_id=plan['task_id'], plan_id=plan_id,
                      parameters=diagnostics.parameters(plan), reason=plan.get('model_summary') or plan.get('goal'))
     command = validate_plan(db, plan)
@@ -743,7 +752,9 @@ def execute_job(db, plan_id):
 
     observations = []
 
-    if status == "completed":
+    result_bound=(isinstance(result,dict) and result.get('task_id')==plan['task_id'] and
+        result.get('target')==plan['target'] and result.get('profile')==plan['profile'])
+    if status in ('completed','timeout') and result_bound:
         observations = parse_observations(
             plan["profile"],
             plan["target"],
@@ -752,6 +763,18 @@ def execute_job(db, plan_id):
             result.get("parameters") or plan.get("parameters") or {},
             result,
         )
+
+    if plan['profile'] in ('tcp_ports','udp_ports'):
+        from orchestrator import port_research
+        selected=[int(p) for p in plan['parameters']['ports'].split(',')]
+        if plan['profile']=='tcp_ports':
+            states=port_research.parse(result.get('stdout','') if result_bound else '','tcp',selected,complete=status=='completed')
+        else:
+            try:seen=json.loads(result.get('stdout','{}') if result_bound else '{}').get('observations',[])
+            except ValueError:seen=[]
+            lookup={r['port']:r for r in seen if isinstance(r,dict) and r.get('port') in selected and r.get('state') in port_research.STATES and r.get('protocol')=='udp'}
+            states=[lookup.get(p,{'port':p,'protocol':'udp','state':'unchecked','service_verified':False}) for p in selected]
+        observations.extend({'kind':'port_state','data':{**r,'purpose':'discovery','complete':status=='completed' and r['state']!='unchecked'}} for r in states)
 
     with db:
         db.execute("""

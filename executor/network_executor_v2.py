@@ -162,7 +162,6 @@ def build_command(
                 "-sT",
                 "-Pn",
                 "-n",
-                "--open",
                 "--max-retries", "1",
                 "--host-timeout", "25s",
                 "-p", selected_ports,

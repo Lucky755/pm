@@ -81,12 +81,10 @@ class Tests(unittest.TestCase):
         db=db_test()
         with patch.object(pm,'sudo_checked',return_value=({'status':'timeout','stderr':'host timeout'},0)) as calls,redirect_stdout(io.StringIO()):
             with self.assertRaises(pm.OperatorError): pm.run_full_tcp_scan(db,11,'10.10.10.65')
-            # A second EXPLICIT invocation may retry, but never retries within
-            # the first call or automatically on a background schedule.
-            with self.assertRaises(pm.OperatorError): pm.run_full_tcp_scan(db,11,'10.10.10.65')
-        self.assertEqual(calls.call_count,2)
-        self.assertEqual(db.execute('SELECT status FROM pm_tcp_full_scans').fetchone()[0],'failed')
-        self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_tcp_full_scan_attempts').fetchone()[0],2)
+            self.assertEqual(pm.run_full_tcp_scan(db,11,'10.10.10.65'),0)
+        self.assertEqual(calls.call_count,1)
+        self.assertEqual(db.execute('SELECT status FROM pm_tcp_full_scans').fetchone()[0],'partial')
+        self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_tcp_full_scan_attempts').fetchone()[0],1)
         db.close()
 
     def test_successor_retains_old_task_and_closes_rules(self):

@@ -1,6 +1,6 @@
 """Bounded, resumable TCP discovery bootstrap for an authorized task.
 
-Creates 32-port Nmap plans in the existing SQLite queue, ordered by the
+Creates 50-port Nmap plans in the existing SQLite queue, ordered by the
 installed Nmap service-frequency database. Makes no target network calls.
 Root-owned NetGuard remains the sole live execution path.
 
@@ -21,7 +21,7 @@ SERVICES = (
     Path('/usr/share/nmap/nmap-services'),
     Path('/usr/local/share/nmap/nmap-services'),
 )
-PORTS_PER_PLAN = 32
+PORTS_PER_PLAN = 50
 MAX_DISCOVERY_PORTS = 1024
 BATCHES_PER_ROUND = 2
 

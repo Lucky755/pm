@@ -33,7 +33,7 @@ DATABASE = ROOT / "storage/tasks.db"
 AUDIT = ROOT / "logs/network_executor.jsonl"
 BWRAP = "/usr/bin/bwrap"
 
-MAX_PORTS = 32
+MAX_PORTS = 50
 TIMEOUT = 25
 
 
@@ -67,7 +67,7 @@ def validate_ports(raw):
 
     if not 1 <= len(parts) <= MAX_PORTS:
         raise ValueError(
-            "Specify 1..32 individual TCP ports"
+            "Specify 1..50 individual TCP ports"
         )
 
     numbers = [

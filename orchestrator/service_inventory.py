@@ -4,6 +4,7 @@ Port reachability is evidence; product/version identification remains a hint.
 The context view is bounded, while original rows and their references stay stored.
 """
 from datetime import datetime, timezone
+from collections import Counter
 import json
 import hashlib
 import os
@@ -93,15 +94,16 @@ def collect_full(db, task_id, *, at=None, address=None):
             row = cursor.fetchone()
             scan = dict(zip((c[0] for c in cursor.description), row)) if row else None
             status['pm_tcp_full_scans'] = scan['status'] if scan else 'absent'
-            if scan and scan['status'] == 'completed':
+            if scan and scan['status'] in ('completed','partial','empty'):
                 ports = decoded(scan['open_ports_json'])
+                if scan['status']=='empty' and ports:ports=None
                 if isinstance(ports, list):
                     when, attempt_id = scan.get('created_at'), None
                     try:
                         attempt = db.execute("SELECT id,created_at FROM pm_tcp_full_scan_attempts "
-                                             "WHERE task_id=? AND target=? AND status='completed' "
+                                             "WHERE task_id=? AND target=? AND status=? "
                                              'ORDER BY created_at DESC,id DESC LIMIT 1',
-                                             (task_id, target)).fetchone()
+                                             (task_id, target,'failed' if scan['status']=='partial' else 'empty' if scan['status']=='empty' else 'completed')).fetchone()
                         if attempt and timestamp(attempt[1]) and (
                                 not timestamp(when) or timestamp(attempt[1]) >= timestamp(when)):
                             attempt_id, when = attempt
@@ -112,9 +114,15 @@ def collect_full(db, task_id, *, at=None, address=None):
                     if attempt_id is not None:
                         source['attempt_id'] = attempt_id
                     valid_ports = sorted({p for p in ports if type(p) is int and 1 <= p <= 65535})
-                    coverage = {'source': source, 'ports_total': len(valid_ports),
+                    coverage = {'source': source, 'ports_total': len(valid_ports),'complete':scan['status'] in ('completed','empty'),'exhaustive_services':False,
                                 'last_seen_at': timestamp(scan.get('last_seen_at')).isoformat()
                                 if timestamp(scan.get('last_seen_at')) else None}
+                    if attempt_id is not None:
+                        try:
+                            raw=db.execute('SELECT result_json FROM pm_tcp_full_scan_attempts WHERE id=?',(attempt_id,)).fetchone()
+                            result=decoded(raw[0]) if raw else None
+                            if isinstance(result,dict):coverage['discovery_summary']=result.get('port_discovery')
+                        except sqlite3.OperationalError:pass
                     for port in valid_ports:
                         add(port, 'tcp', source)
                     counts['pm_tcp_full_scans'] = 1
@@ -184,6 +192,24 @@ def collect_full(db, task_id, *, at=None, address=None):
         when = timestamp(source['observed_at'])
         return (-(when.timestamp() if when else 0), source['table'], json.dumps(source['key'], sort_keys=True))
 
+    # Discovery states and availability are distinct from service identities.
+    port_states=[]
+    if scope_valid:
+        try:
+            from orchestrator import port_research
+            latest={}
+            for data in port_research.records(db,task_id,target):
+                source=reference('network_observations',{'id':data['observation_id']},data['observed_at'],run_id=data['run_id'],plan_id=data['plan_id'],execution_outcome=data['job_outcome'])
+                counts['network_observations']+=1
+                latest[(data['protocol'],data['port'])]={**data,'source':source}
+                if data['state']=='open':add(data['port'],data['protocol'],source)
+            port_states=[latest[k] for k in sorted(latest)]
+        except sqlite3.OperationalError:pass
+    availability=[]
+    if scope_valid:
+        try:
+            availability=[{'port':p,'protocol':'tcp','state':state,'checked_at':stamp,'purpose':'availability'} for p,state,stamp in db.execute('SELECT port,state,checked_at FROM pm_port_preflight WHERE task_id=? AND target=? ORDER BY port',(task_id,target))]
+        except sqlite3.OperationalError:pass
     for entry in entries.values():
         sources, identities = entry['sources'], entry['identifications']
         services = {i.get('service_hint_sha256', i['service_hint']) for i in identities if i['service_hint']}
@@ -205,6 +231,10 @@ def collect_full(db, task_id, *, at=None, address=None):
     reason = ('fresh_full_tcp_scan' if scan_fresh else 'fresh_structured_observations' if is_fresh
               else 'structured_data_stale' if all_entries else 'no_structured_services')
     mode='spot_check' if is_fresh else 'full_scan'
+    if coverage and coverage['source']['fresh']:
+        mode='spot_check'
+        if not coverage['ports_total']:reason='saved_tcp_discovery_no_open_ports_use_udp_or_targeted_queue'
+        elif not coverage['complete']:reason='partial_tcp_discovery_resume_explicit_queue'
     if isinstance(db,sqlite3.Connection):
         from orchestrator import resources
         scope=resources.saved(db,task_id)
@@ -212,10 +242,16 @@ def collect_full(db, task_id, *, at=None, address=None):
             mode,reason='web_only','web_scope_no_host_scan'
         elif scope and scope['migration']:
             mode,reason='spot_check','same_machine_address_change_reuse_saved_state'
+        from orchestrator.target_availability import saved
+        target_status=saved(db,task_id)
+        if not target_status['network_allowed']:mode,reason='saved_only','target_'+target_status['state']
     return {'task_id': task_id, 'target': target, 'scope_valid': scope_valid,
             'max_age_minutes': ttl, 'full_scan': coverage, 'source_status': status,
             'source_counts': counts, 'fresh': is_fresh,
             'scan_mode':mode, 'scan_mode_reason': reason,
+            'port_states':port_states,'port_availability':availability,'exhaustive_services':False,
+            'port_state_counts':dict(Counter(r['state'] for r in port_states)),
+            'port_availability_counts':dict(Counter(r['state'] for r in availability)),
             'total_entries': len(all_entries), 'omitted_entries': 0, 'entries': all_entries}
 
 
@@ -228,4 +264,6 @@ def collect(db, task_id, *, keep=ENTRY_LIMIT, at=None):
                 'identifications':entry['identifications'][:IDENTIFICATION_LIMIT],
                 'identifications_omitted':max(0,entry['identifications_total']-IDENTIFICATION_LIMIT)}
                for entry in inventory['entries'][:limit]]
-    return {**inventory,'entries':entries,'omitted_entries':max(0,inventory['total_entries']-limit)}
+    return {**inventory,'entries':entries,'omitted_entries':max(0,inventory['total_entries']-limit),
+        'port_states':inventory['port_states'][:limit],'port_states_omitted':max(0,len(inventory['port_states'])-limit),
+        'port_availability':inventory['port_availability'][:limit],'port_availability_omitted':max(0,len(inventory['port_availability'])-limit)}

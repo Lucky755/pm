@@ -44,6 +44,10 @@ from orchestrator import fact_state, diagnostics, task_memory
 
 mcp = FastMCP("pentest-master")
 ASSET_DB = ROOT / 'storage/tasks.db'
+from orchestrator import target_availability
+network_guard=target_availability.guard(lambda:ASSET_DB)
+
+
 _memory_operation_id=ContextVar('pm_memory_operation_id',default=None)
 
 
@@ -80,7 +84,7 @@ NETWORK_PROFILES = {
         ),
         "parameter": "ports",
         "default": "80,443",
-        "max_ports": 32,
+        "max_ports": 50,
     },
     "http_headers": {
         "binary": "curl",
@@ -529,6 +533,7 @@ def list_network_profiles() -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def run_network_probe(
     task_id: int,
     profile: str,
@@ -1326,6 +1331,7 @@ def pm_write_poc(task_id: int, filename: str, content: str) -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_poc_run(
     task_id: int,
     target: str,
@@ -1514,10 +1520,48 @@ def pm_tool_acquire(task_id: int, request_id: int) -> str:
 
 @mcp.tool()
 @diagnostics.tool
+def pm_port_status(task_id:int,offset:int=0,limit:int=50)->str:
+    """Read aggregated saved discovery states, no target/broker/API requests."""
+    from orchestrator import port_research
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked','reason':'Wrong task'})
+    with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True)) as db:
+        if not task_memory.exists(db,'network_observations'):return tool_response({'status':'completed','items':[],'total':0})
+        target=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()[0]
+        return tool_response({'status':'completed',**port_research.summary(db,task_id,target,offset=offset,limit=limit)})
+
+
+@mcp.tool()
+@diagnostics.tool
+@network_guard
+def pm_port_survey(task_id:int,protocol:str,ports:str,max_jobs:int=1)->str:
+    """Separate explicit TCP/UDP discovery queue (1..50 ports), no service identity.
+
+    Persists before next job, resumes only unstarted jobs, UDP silence is
+    open|filtered, not open. No two scans guarantee all services. URL scope
+    does not authorize scanning a host. Model interprets aggregated saved data.
+    """
+    from orchestrator import port_research
+    try:
+        if max_jobs!=1:raise ValueError('MCP discovery executes one job per tool step; use the next step to resume')
+        if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):raise ValueError('Wrong task')
+        selected=[int(p) for p in ports.split(',')]
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            target=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()[0]
+            result=port_research.run(db,task_id,target,protocol,selected,max_jobs)
+            # An actual MCP capability receipt; original runs/observations stay
+            # in their existing tables. Reusing the queue is a local read.
+            record=log_capability('network_probe',task_id,result,0)
+            return tool_response({**result,'result_id':record})
+    except (ValueError,OSError,sqlite3.Error) as exc:return tool_response({'status':'blocked','reason':str(exc)[:200]})
+
+
+@mcp.tool()
+@diagnostics.tool
+@network_guard
 def pm_privileged_scan(task_id: int, target: str, profile: str, ports: str) -> str:
     """Fixed nmap_syn/nmap_udp/nmap_os through broker; scope/NetGuard/repeat budgets still apply.
 
-    1..32 explicit ports (UDP <=8), bounded runtime, no NSE/custom arguments or root PoC.
+    1..50 explicit ports (UDP <=8), bounded runtime, no NSE/custom arguments or root PoC.
     """
     from executor.netguard_root import RAW_SCAN_PROFILES, tool_args
     try:
@@ -1532,6 +1576,7 @@ def pm_privileged_scan(task_id: int, target: str, profile: str, ports: str) -> s
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_net_exec(
     task_id: int,
     target: str,
@@ -1616,6 +1661,7 @@ def pm_net_exec(
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_browser(task_id:int,action:str,session_id:str='',action_json:str='{}',url:str='',username:str='',purpose:str='',proxy:str='')->str:
     """Managed JavaScript browser, with scoped PM HTTP as its only network path.
 
@@ -1717,6 +1763,7 @@ def pm_burp(task_id:int,action:str='status',url:str='',after:int=0,limit:int=1)-
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_http_request(task_id:int,request_json:str,session_id:str='default')->str:
     """Fresh task-scoped HTTP exchange with methods, bodies, cookies and uploads.
 
@@ -1761,6 +1808,7 @@ def pm_http_read(task_id:int,exchange_id:int,part:str='body',offset:int=0,limit:
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_http_capture(
     task_id: int,
     target: str,
@@ -1811,6 +1859,7 @@ def pm_http_capture(
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_http_ssrf(task_id:int,application:str,destination:str,parameter:str='url',context:str='') -> str:
     """Legacy cached SSRF GET. Use pm_http_request.ssrf for fresh query/form/JSON checks.
 
@@ -1897,6 +1946,7 @@ def pm_research(task_id: int, target: str, host: str, path: str = "/") -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_callback(
     task_id: int,
     action: str,
@@ -2006,6 +2056,7 @@ def pm_callback(
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_transfer(task_id:int,action:str,port:int=4445,expected_bytes:int=-1,sha256:str='',
                 max_bytes:int=536870912,timeout:int=300)->str:
     """Separate streamed file receiver. No interactive terminal and no universal 4 MiB limit.
@@ -2028,6 +2079,7 @@ def pm_transfer(task_id:int,action:str,port:int=4445,expected_bytes:int=-1,sha25
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_pivot_request(task_id:int,spec_json:str)->str:
     """Request one scoped SSH forward through an existing managed SSH session.
 
@@ -2054,6 +2106,7 @@ def pm_pivot_request(task_id:int,spec_json:str)->str:
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_pivot(task_id:int,route_id:int,action:str='status')->str:
     """Status/apply an operator-authorized SSH forward; cannot authorize or recreate broken/unknown forwards.
 
@@ -2086,6 +2139,7 @@ def pm_pivot(task_id:int,route_id:int,action:str='status')->str:
 
 @mcp.tool()
 @diagnostics.tool
+@network_guard
 def pm_session(
     task_id: int,
     action: str,

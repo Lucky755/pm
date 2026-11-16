@@ -248,7 +248,8 @@ for line in sys.stdin:
         report = {'summary': 'done', 'hypotheses': [{'claim': 'observed /health',
                   'kind': 'observation', 'result': 'confirmed', 'probe_result_id': 'a' * 24,
                   'quote': 'SECRET raw quote'}]}
-        with d.run('state', 11), patch.object(actions, 'REPORT_DIR', self.root / 'reports'):
+        with d.run('state', 11), patch.object(actions, 'REPORT_DIR', self.root / 'reports'), \
+             patch.object(actions,'CAPABILITY_LOG',self.root/'caps'):
             actions.save_report(db, {'task_id': 11, 'target': '203.0.113.10'}, 'recon', 1, report, 1)
         changes = [e for e in self.events() if e['kind'] == 'state.change']
         self.assertIn('pm_hypotheses', [e['table'] for e in changes])

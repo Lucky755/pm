@@ -55,10 +55,10 @@ class BootstrapTests(unittest.TestCase):
     def test_batches_are_bounded_and_idempotent(self):
         new = b.queue_next(self.db,10)
         self.assertEqual(len(new),2)
-        self.assertEqual([p['ports'] for p in new],[32,32])
+        self.assertEqual([p['ports'] for p in new],[50,50])
         self.assertEqual(b.queue_next(self.db,10), [])
         state = b.progress(self.db,10)
-        self.assertEqual(state['planned_ranked_ports'],64)
+        self.assertEqual(state['planned_ranked_ports'],100)
         self.assertEqual(state['pending_tcp_batches'],2)
 
     def test_empty_scan_can_continue(self):
@@ -67,7 +67,7 @@ class BootstrapTests(unittest.TestCase):
             self.db.execute('INSERT INTO network_job_runs(plan_id,status) VALUES (?,?)', (plan_id,'completed'))
         self.assertTrue(b.has_more(self.db,10))
         self.assertEqual(len(b.queue_next(self.db,10)),2)
-        self.assertEqual(b.progress(self.db,10)['planned_ranked_ports'],128)
+        self.assertEqual(b.progress(self.db,10)['planned_ranked_ports'],200)
 
     def test_known_open_port_stops_new_scans(self):
         b.queue_next(self.db,10)

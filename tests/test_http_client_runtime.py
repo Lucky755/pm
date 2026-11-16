@@ -291,6 +291,10 @@ b.main()
         self.assertEqual(reply['status'],'unknown',reply)
         self.assertEqual(self.call(method='POST',body='only once')['status'],'blocked')
         self.assertEqual(len(self.requests),1)
+        self.assertEqual(self.call('/current')['status'],'blocked')
+        from orchestrator import target_availability
+        with self.case.connect() as db:target_availability.set_state(db,11,'active','Operator restored route',source='operator')
+        self.assertEqual(self.call(method='POST',body='only once')['status'],'blocked')
         self.assertEqual(self.call('/current')['status'],'completed')
 
     def test_injected_and_genuine_same_url_flag_sources_are_not_merged(self):

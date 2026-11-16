@@ -133,10 +133,12 @@ class SchedulerFirstRunTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT status,stop_reason FROM master_auto_runs').fetchone(),
                          ('completed', 'job_budget'))
         self.assertEqual(self.db.execute('SELECT status FROM master_auto_rounds').fetchall(), [('completed',)])
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM network_observations').fetchone()[0], 2)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM network_observations').fetchone()[0], 4)
+        self.assertEqual(dict(self.db.execute('SELECT kind,COUNT(*) FROM network_observations GROUP BY kind')),
+                         {'tcp_port_open':2,'port_state':2})
         self.assertGreaterEqual(self.db.execute('SELECT COUNT(*) FROM evidence_snapshots').fetchone()[0], 2)
         digest, bundle = evidence.make_snapshot(self.db, 1)
-        self.assertEqual(len(bundle['network_observations']), 2)
+        self.assertEqual(len(bundle['network_observations']), 4)
         self.assertEqual(evidence.saved_reports(self.db, 1, digest), {})
         self.assertGreaterEqual(len(self.burp_reads), 4)
         self.assertEqual(len([c for c in self.calls if 'tcp_full' in c]), 1)

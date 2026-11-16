@@ -15,6 +15,7 @@ OFFLINE = OFFLINE | {'test_resource_scope', 'test_tool_requests', 'test_pivot_cl
 SCRIPTS = frozenset(('test_burp_import', 'test_decision_agent', 'test_evidence_pipeline', 'test_evidence_recovery', 'test_master_scheduler', 'test_policy'))
 RUNTIME = frozenset(('test_model_adapter_runtime', 'test_coordinated_runtime', 'test_evidence_readonly_runtime', 'test_tool_download_runtime', 'test_task_sessions', 'test_session_runtime', 'test_http_client_runtime','test_browser_runtime'))
 RUNTIME = RUNTIME | {'test_burp_proxy_runtime'}
+RUNTIME = RUNTIME | {'test_port_research'}
 MANUAL = frozenset(('test_agent_tool_selection', 'test_agent_v3_selection', 'test_approval_mcp', 'test_harness_mcp', 'test_local_tool_mcp', 'test_mcp_connection', 'test_network_mcp', 'test_pi_provider', 'test_shell_disabled', 'test_tool_v3_mcp'))
 
 
@@ -35,14 +36,54 @@ def command(name):
     return [sys.executable,'-m','unittest','tests.'+name,'-v']
 
 
+def storage_guard(directory,workspace=ROOT):
+    """Fail before accidental production SQLite/files access, not a test skip."""
+    directory=Path(directory)
+    source='''import os,sys
+from pathlib import Path
+from urllib.parse import unquote,urlsplit
+from contextvars import ContextVar
+protected=Path(PROTECTED).resolve()
+violation=Path(VIOLATION)
+current_open=ContextVar('pm_guard_open',default=None)
+original_open=os.open
+def checked_open(path,flags,mode=0o777,*,dir_fd=None):
+ name=os.fsdecode(path);actual=Path(name)
+ if dir_fd is not None and not actual.is_absolute():actual=Path('/proc/self/fd/'+str(dir_fd)).resolve()/actual
+ token=current_open.set((name,str(actual)))
+ try:return original_open(path,flags,mode,dir_fd=dir_fd)
+ finally:current_open.reset(token)
+os.open=checked_open
+def guard(event,args):
+ if event not in ('open','sqlite3.connect') or not args:return
+ name=args[0]
+ if not isinstance(name,(str,bytes,os.PathLike)):return
+ name=os.fsdecode(name)
+ override=current_open.get()
+ if event=='open' and override and name==override[0]:name=override[1]
+ if name.startswith('file:'):name=unquote(urlsplit(name).path)
+ if Path(name).resolve().is_relative_to(protected):
+  violation.write_text(name)
+  raise PermissionError('Offline test attempted working storage access: '+name)
+sys.addaudithook(guard)
+'''.replace('PROTECTED',repr(str(Path(workspace)/'storage'))).replace('VIOLATION',repr(str(directory/'storage-violation')))
+    (directory/'sitecustomize.py').write_text(source)
+    return str(directory)+os.pathsep+str(ROOT)
+
+
 def run_suite(name, timeout=180):
     env=os.environ.copy()
     env['PYTHONPATH']=str(ROOT) # actual checkout; never the historical hardcoded root
     env.pop('PYTHONOPTIMIZE',None) # legacy assert scripts must actually execute assertions
     with tempfile.TemporaryDirectory(prefix='pm-suite-model-audit-') as directory:
         env['PM_MODEL_AUDIT_DIR']=directory
-        return subprocess.run(command(name),cwd=ROOT,env=env,stdin=subprocess.DEVNULL,
+        env['PYTHONPATH']=storage_guard(directory)
+        result=subprocess.run(command(name),cwd=ROOT,env=env,stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout)
+        if (Path(directory)/'storage-violation').exists():
+            result.returncode=1
+            result.stdout+='\nFAIL: attempted working storage access; exception handling cannot suppress this failure: '+(Path(directory)/'storage-violation').read_text()+'\n'
+        return result
 
 
 def main(argv=None):

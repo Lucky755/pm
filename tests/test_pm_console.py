@@ -58,7 +58,7 @@ class Tests(unittest.TestCase):
             pm.ask_approval(self.db, 10, '10.10.10.161', 'eth0', show=False)
 
     def test_reprobe_reject_injection_and_repeat(self):
-        for bad in ('22; rm -rf', '22,22', '0', '65536', '1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33'):
+        for bad in ('22; rm -rf', '22,22', '0', '65536', ','.join(map(str,range(1,52)))):
             with self.assertRaises(pm.OperatorError): pm.plan_reprobe(self.db, 10, '10.10.10.161', bad)
 
     def test_docker_policy_check_fail_closed(self):

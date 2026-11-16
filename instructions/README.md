@@ -52,6 +52,7 @@
 | recon/vuln/access/verify | нет автоматически | наследует существующую доступность | наследует бюджет вызова |
 | http-surface | http-capture | свежий HTTP с method/body/web-session, capture и чтение/память, без net_exec/PoC/PTY | 6 / 1 / 8192 |
 | browser-web | browser-web | JS open/fill/click/wait/read, отдельный пользователь/владелец, HTTP и пассивный Burp; без net_exec/PoC/PTY | 12 / 1 / 8192 |
+| saved-analysis | saved-analysis | сохранённые материалы/память/заметки/port status, без сети и session reconciliation | 6 / 1 / 8192 |
 | capture-audit | capture-audit | только чтение сохранённых данных и заметки, без GET | 4 / 1 / 8192 |
 | access-triage | access-triage | net_exec/session и чтение/память, без PoC/research/callback | 8 / 1 / 8192 |
 

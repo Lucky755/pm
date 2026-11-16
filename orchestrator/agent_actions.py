@@ -1331,7 +1331,8 @@ def memory_block(db,context,objective):
     memory=context.get('_task_memory') or task_memory.context(
         db,context['task_id'],CAPABILITY_LOG/f"task_{context['task_id']}.jsonl",
         references=assignment.get('references',[]),question=objective)
-    return '<task_memory>\n'+json.dumps(memory,ensure_ascii=False)+'\n</task_memory>'
+    from orchestrator.target_availability import saved
+    return '<target_availability>\n'+json.dumps(saved(db,context['task_id']),ensure_ascii=False)+'\n</target_availability>\n'+ '<task_memory>\n'+json.dumps(memory,ensure_ascii=False)+'\n</task_memory>'
 
 
 def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit=15):
@@ -2116,11 +2117,17 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
     if assignment is not None and not isinstance(assignment,dict):
         raise ValueError('Specialist assignment must be an object')
     spec=instructions.profile(role,(assignment or {}).get('profile'))
+    from orchestrator import target_availability
     effective=instructions.limits(spec,{'step_limit':step_limit,'poc_budget':poc_budget,'max_tokens':max_tokens})
     step_limit,poc_budget,max_tokens=(effective[k] for k in ('step_limit','poc_budget','max_tokens'))
     db = connect()
     try:
         context = task_context(db, task_id)
+        availability=target_availability.saved(db,task_id)
+        context['target_availability']=availability
+        if not availability['network_allowed']:
+            allowed=target_availability.LOCAL_TOOLS
+            spec={**spec,'tools':sorted(allowed if spec['tools']=='inherit' else allowed.intersection(spec['tools']))}
         state = fact_state.access_state(db, task_id)
         validate_triage_objective(state, objective)
         if assignment is not None:
@@ -2155,7 +2162,8 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
     prior_probe_ids = set(report_probe_records(task_id))
     db = connect()
     from orchestrator import task_sessions
-    session_scope=task_sessions.role_scope(db,task_id,objective,
+    from contextlib import nullcontext
+    session_scope=nullcontext() if not availability['network_allowed'] else task_sessions.role_scope(db,task_id,objective,
         check_remote=spec['tools']=='inherit' or 'pm_session' in spec['tools'])
     session_scope_entered=False
     try:

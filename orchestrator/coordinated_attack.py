@@ -109,6 +109,8 @@ def task_lock(task_id):
 def authorization(db, context, mapped):
     if not mapped['scope_valid']:
         return 'scope_unavailable'
+    from orchestrator.target_availability import saved
+    if not saved(db,context['task_id'])['network_allowed']:return None
     try:
         row = db.execute('SELECT target,allowed,closed_at FROM pm_operator_approvals WHERE task_id=?',
                          (context['task_id'],)).fetchone()
@@ -177,7 +179,12 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
         'resources':semantic_set(resource_semantics(r) for r in graph['resources']),
         'relations':semantic_set({**{k:r[k] for k in ('source','relation','destination')},
                                  'data':{k:v for k,v in r['data'].items() if k!='sources'}} for r in graph['relations'])}}
-    return {'version':2,**({'operator_answers':semantic_set(answers)} if answers else {}),
+    port_knowledge={}
+    inventory=actions.service_inventory.collect_full(db,task_id)
+    for section in ('port_states','port_availability'):
+        values=semantic_set({k:r[k] for k in ('protocol','port','state')} for r in inventory[section] if r['state']!='unchecked')
+        if values:port_knowledge[section]=values
+    return {'version':2,**port_knowledge,**({'operator_answers':semantic_set(answers)} if answers else {}),
             **({'tools':semantic_set(tools)} if tools else {}),
             **({'flag_reviews':semantic_set(proposals)} if proposals else {}),**resource_state,'intent':context['intent'],'target':context['target'],
             'goals':[{k:g.get(k) for k in ('key','title','role','weight','status')} for g in goals['objectives']],
@@ -188,6 +195,8 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
 
 
 def snapshot(db, task_id, expect):
+    from orchestrator import target_availability
+    availability=target_availability.saved(db,task_id)
     context = actions.task_context(db, task_id)
     row = db.execute('SELECT COALESCE(MAX(iteration),0)+1 FROM pm_agent_action_reports WHERE task_id=?',
                      (task_id,)).fetchone()
@@ -271,7 +280,8 @@ def snapshot(db, task_id, expect):
             'references': refs, 'known_resources':[scope_ref]+sorted(k for k in refs if k.startswith(('service:','resource:'))),
             'knowledge_sha256':digest(knowledge),
             'history_sha256':digest({'result_ids':[r['result_id'] for r in results],'reports':reports}),
-            'state_sha256':digest(knowledge), 'confirmed_flags': confirmed,
+            'state_sha256':digest(knowledge) if availability['network_allowed'] else digest({'knowledge':knowledge,'network_allowed':False}), 'confirmed_flags': confirmed,
+            'target_availability':availability,
             'operator_checkpoints':{**checkpoints.history(db,task_id,context['target']),'blocking':False},
             'operator_questions':operator_questions.listing(db,task_id),
             'tool_requests':tools,
@@ -342,6 +352,8 @@ def parse_decision(value, state, roles):
         if operator_questions.blocked(decision,state):raise ValueError('branch_waiting_operator')
     elif 'operator_question' in decision:raise ValueError('invalid_operator_question')
     if decision['action']=='run_role':
+        if not state.get('target_availability',{}).get('network_allowed',True) and decision['profile']!='saved-analysis':
+            raise ValueError('target_offline_requires_saved_analysis')
         if operator_questions.blocked(decision,state):raise ValueError('branch_waiting_operator')
         graph=state.get('resource_graph',{})
         if graph.get('configured') and any(r.startswith('resource:') and r not in graph['authorized_resources'] for r in resources):
@@ -407,6 +419,7 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
     return ("You coordinate a manually authorized pentest without tools.\n"+instructions.common('analysis')+"\n"
             "Work autonomously inside the saved assignment, including ACCESS and using credential candidates. "
             "The checkpoint classifier is disabled as an execution gate; labels never require approval. "
+            "When target_availability.network_allowed is false, use saved-analysis only: a concrete local question over saved materials, no fresh probes. One useful local result is followed by waiting for restoration. "
             "Interpret unusual responses from saved bytes; missing fixed-rule classification is not a stop reason. "
             "Choose exactly ONE concrete question for ONE allowed role/profile, enqueue a necessary operator question, or stop. "
             "Operator questions are only pivoting, tool installation/acquisition or documentation, budget, flag_confirmation. "
@@ -601,6 +614,7 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
             'status':status, 'succeeded':state['success_verified'] and status=='completed',
             'task_id':task_id,'coordinator_run_id':run_id,'stop_reason':reason,
             'expected_flags':expect,'confirmed_flags':state['confirmed_flags'],
+            'target_availability':state['target_availability'],
             'objectives_matrix':attack_loop.objective_matrix(state['objectives']['objectives']),
             'checkpoints':[], 'checkpoint_classifier_blocking':False,
             'operator_questions':operator_questions.listing(db,task_id),
@@ -724,6 +738,9 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                     return finish(state['authorization_block'],'waiting_operator')
                 if state['success_verified']:
                     return finish(state['verified_stop_reason'])
+                if (not state['target_availability']['network_allowed'] and
+                        state['target_availability']['analysis_sha256']==state['knowledge_sha256']):
+                    return finish('target_restoration_required','waiting_operator')
                 pending = next((r for r in steps(db,task_id) if r['status']=='planned'),None)
                 if pending:
                     step_id = pending['id']
@@ -880,6 +897,12 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                                  history_changed=before['history_sha256']!=state['history_sha256'])
                 if state['success_verified']:
                     return finish(state['verified_stop_reason'])
+                if not state['target_availability']['network_allowed']:
+                    from orchestrator import target_availability
+                    with db:
+                        db.execute('UPDATE pm_target_availability SET analysis_sha256=? WHERE task_id=?',
+                                   (state['knowledge_sha256'],task_id))
+                    return finish('target_restoration_required','waiting_operator')
                 # Classifier labels are descriptive only. No collect/pending/review
                 # call is allowed to gate execution here, including on resume.
             if any(q['status']=='pending' for q in state['operator_questions']):

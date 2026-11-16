@@ -94,7 +94,7 @@ class ServiceInventoryTests(unittest.TestCase):
                 self.db.execute('DELETE FROM pm_tcp_full_scans')
                 self.scan(status=status, ports=ports)
                 self.assertEqual(self.mapped()['entries'], [])
-                self.assertEqual(self.mapped()['scan_mode'], 'full_scan')
+                self.assertEqual(self.mapped()['scan_mode'], 'spot_check' if status=='completed' and not ports else 'full_scan')
 
     def test_completed_job_scope_and_current_address_are_required(self):
         good = self.observation(port=80)

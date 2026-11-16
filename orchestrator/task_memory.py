@@ -168,6 +168,11 @@ def source_state(db,task_id,capability_log):
     if not row:raise ValueError('Unknown task')
     target=row[0];state={s:{} for s in SECTIONS}
     def put(section,key,value):state[section][key]={'source_owned':True,**value}
+    for item in rows(db,'pm_target_availability',task_id):
+        put('constraints','target_availability',{k:v for k,v in item.items() if k!='analysis_sha256'})
+    for item in rows(db,'pm_port_preflight',task_id,target=target):
+        put('checks','port_availability:'+str(item['port']),{'port':item['port'],'state':item['state'],
+            'observed_at':item['checked_at'],'purpose':'availability','product_identified':False})
     for intent in rows(db,'pm_task_intents',task_id):put('constraints','intent',{'text':intent['intent'],'target':target})
     for settings in rows(db,'task_scope_settings',task_id):put('constraints','scope',settings)
     for network in rows(db,'task_scope_networks',task_id):

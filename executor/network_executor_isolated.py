@@ -237,6 +237,10 @@ def main():
 
         # The existing Task Scope still applies and must authorize the target.
         target = existing.legacy.validate_target(args.target)
+        if args.execute:
+            import sqlite3
+            from orchestrator.target_availability import require_network
+            with sqlite3.connect(existing.legacy.DATABASE) as db:require_network(db,args.task_id)
         existing.validate_execution(target, args.task_id, False)
 
         if args.profile in CAPABILITY_PROFILES:

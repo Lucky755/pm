@@ -130,9 +130,9 @@ class TaskLaunchTests(unittest.TestCase):
             argv=[item[7:] for item in command if item.startswith('--argv=')]
             selected=json.loads(argv[-2]);calls.append(selected)
             self.assertEqual(command[:5],['run','--task-id','11','--profile','exec'])
-            self.assertEqual(kwargs['timeout'],20)
-            self.assertEqual(command[command.index('--timeout')+1],'12')
-            self.assertIn('time.monotonic()+10',argv[2])
+            self.assertEqual(kwargs['timeout'],int(len(selected)*2.0)+12)
+            self.assertEqual(command[command.index('--timeout')+1],str(int(len(selected)*2.0)+4))
+            self.assertNotIn('time.monotonic()+10',argv[2])
             payload={'reachable':[p for p in selected if p in reachable],
                      'unreachable':[p for p in selected if p not in reachable and p not in unchecked],
                      'unchecked':[p for p in selected if p in unchecked]}
@@ -181,7 +181,7 @@ class TaskLaunchTests(unittest.TestCase):
             result=pm.op_resume(self.args('resume','11','--coordinated'))
             summaries=[e for e in d.read_events() if e['kind']=='preflight.summary']
         self.assertEqual(calls,[ports])
-        self.assertEqual(result['stop_reason'],'reconnaissance_target_unreachable')
+        self.assertEqual(result['stop_reason'],'reconnaissance_services_unavailable')
         self.assertEqual([summaries[0][k] for k in ('known_ports','checked_ports','unchecked_ports')],[13,13,0])
 
     def test_unchecked_ports_with_a_reachable_port_still_allow_coordinator(self):

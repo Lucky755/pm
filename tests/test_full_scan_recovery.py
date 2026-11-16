@@ -14,7 +14,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pm
 from executor import task_scope
-from orchestrator import bootstrap_discovery, coordinated_attack, diagnostics, network_jobs, network_phase, task_runtime
+from orchestrator import agent_actions,bootstrap_discovery, coordinated_attack, diagnostics, network_jobs, network_phase, task_runtime
 
 
 class FullScanRecoveryTests(unittest.TestCase):
@@ -39,6 +39,9 @@ class FullScanRecoveryTests(unittest.TestCase):
             manager.__enter__(); self.addCleanup(manager.__exit__, None, None, None)
         for patcher in (
                 patch.object(pm, 'DB', self.database),
+                patch.object(agent_actions,'DB_PATH',self.database),
+                patch.object(agent_actions,'CAPABILITY_LOG',self.root/'caps'),
+                patch.object(agent_actions,'REPORT_DIR',self.root/'reports'),
                 patch.object(diagnostics, 'EVENT_DIR', self.root / 'events'),
                 patch.object(coordinated_attack, 'LOCK_DIR', self.root / 'locks'),
                 patch.dict(os.environ, {key: '' for key in diagnostics.ENV_KEYS}),
@@ -54,13 +57,16 @@ class FullScanRecoveryTests(unittest.TestCase):
 
     def broker(self, command, **kwargs):
         self.broker_calls.append(command)
+        if command[0]=='network-diagnostic':return {'status':'observed','route_dev':'tun-fixture'},0
         profile = command[command.index('--profile') + 1]
         if profile == 'tcp_full':
             return {'status': self.scan_status, 'stdout': self.stdout(), 'stderr': '',
                     'output_truncated': False}, 0
         self.assertEqual(profile, 'exec')  # The preflight script is NOT executed.
+        args=[part.removeprefix('--argv=') for part in command if part.startswith('--argv=')]
+        selected=json.loads(args[-2])
         return {'status': 'completed', 'exit_code': 0, 'stdout': json.dumps(
-            {'reachable': [], 'unreachable': self.scan_ports, 'unchecked': []})}, 0
+            {'reachable': [], 'unreachable': selected, 'unchecked': []})}, 0
 
     def executor(self, command, **kwargs):
         """Only the isolated executor's process boundary may be substituted."""
@@ -95,7 +101,10 @@ class FullScanRecoveryTests(unittest.TestCase):
     def launch(self):
         with patch.object(sys, 'argv', ['pm', 'resume', '1', '--coordinated', '--continue-coordinated']):
             args = pm.parser_main()[1]
-        return pm.launch_coordinated_task(self.db, 1, self.target, args)
+        # This fixture tests scan/queue/preflight, not local interpretation.
+        # The actual offline coordinator is covered by test_port_research.
+        with patch.object(pm,'run_task_coordinator',return_value={'status':'waiting_operator','stop_reason':'target_restoration_required'}):
+            return pm.launch_coordinated_task(self.db, 1, self.target, args)
 
     def test_clean_first_scan_persists_ports_and_queues_real_plan(self):
         self.assertFalse(self.db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'network_%'").fetchall())
@@ -113,8 +122,9 @@ class FullScanRecoveryTests(unittest.TestCase):
         result = self.launch()
         self.assertEqual(self.scan(), ('completed', '[22, 8080]', None))
         self.assertEqual(len(self.plans()), 1)
-        self.assertEqual(result['stop_reason'], 'reconnaissance_target_unreachable')
-        self.assertEqual([cmd[cmd.index('--profile') + 1] for cmd in self.broker_calls], ['tcp_full', 'exec'])
+        self.assertEqual(result['stop_reason'], 'reconnaissance_services_unavailable')
+        self.assertEqual([cmd[cmd.index('--profile') + 1] for cmd in self.broker_calls if '--profile' in cmd], ['tcp_full', 'exec'])
+        self.assertEqual(self.broker_calls[-1][0],'network-diagnostic')
 
     def test_both_initializers_preserve_all_network_records(self):
         # Jobs/workflow initialization must also work before the model planner ever ran.
@@ -213,8 +223,8 @@ class FullScanRecoveryTests(unittest.TestCase):
         self.assertEqual(len(self.broker_calls), 1)
 
     def test_partial_queue_recovery_does_not_duplicate_completed_checks(self):
-        self.scan_ports = list(range(1, 34))
-        self.fail_queue('33')
+        self.scan_ports = list(range(1, 52))
+        self.fail_queue('51')
         with self.assertRaisesRegex(sqlite3.IntegrityError, 'fixture queue unavailable'):
             pm.run_full_tcp_scan(self.db, 1, self.target)
         first = self.plans()[0][0]
@@ -223,7 +233,7 @@ class FullScanRecoveryTests(unittest.TestCase):
         # The known-port coordinated branch bypasses run_full_tcp_scan().
         self.launch()
         self.assertEqual([json.loads(row[3])['ports'] for row in self.plans()],
-                         [','.join(map(str, range(1, 33))), '33'])
+                         [','.join(map(str, range(1, 51))), '51'])
         self.assertEqual(self.db.execute('SELECT plan_id,attempt,status FROM network_job_runs').fetchall(),
                          [(first, 1, 'completed')])
         self.assertEqual(len([c for c in self.broker_calls if 'tcp_full' in c]), 1)
@@ -277,7 +287,8 @@ class FullScanRecoveryTests(unittest.TestCase):
             with self.assertRaises(pm.OperatorError):
                 pm.run_full_tcp_scan(self.db, 1, self.target)
             events = diagnostics.read_events()
-        self.assertEqual(self.scan()[0], 'failed')
+        self.assertEqual(self.scan()[0], 'partial')
+        self.assertEqual(json.loads(self.scan()[1]),[22,8080])
         self.assertTrue(any(e['kind'] == 'scan.result' and e['status'] == 'failed' for e in events))
         self.assertFalse(any(e['kind'] == 'scan.followups' for e in events))
         self.assertEqual(self.executor_calls, [])

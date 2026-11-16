@@ -66,7 +66,11 @@ def limits(spec,budgets):
 
 def selected(context,role):
     assignment=context.get('specialist_assignment') or {}
-    return profile(role,assignment.get('profile'))
+    spec=profile(role,assignment.get('profile'))
+    if context.get('target_availability',{}).get('network_allowed') is False:
+        from orchestrator.target_availability import LOCAL_TOOLS
+        spec={**spec,'tools':sorted(LOCAL_TOOLS if spec['tools']=='inherit' else LOCAL_TOOLS.intersection(spec['tools']))}
+    return spec
 
 
 def specialist(context,role,step_limit,poc_budget):

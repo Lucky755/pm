@@ -1325,6 +1325,39 @@ def poc_argv(poc_file, interp, uid, gid, workdir):
             'local': local, **poc_file_metadata(local, uid)}
 
 
+def network_diagnostic(task,target):
+    config,_,_=session_invoker(task);check_target(target,config['allowed'])
+    result=cmd('/usr/sbin/ip','-j','route','get',target,timeout=3)
+    routes=json.loads(result.stdout);device=routes[0].get('dev') if routes else None
+    if not device or not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}',device):raise ValueError('No usable route')
+    file=Path('/sys/class/net')/device/'operstate'
+    return {'status':'observed','route_dev':device,'configured_egress':config.get('egress'),
+        'route_matches':device==config.get('egress'),'interface_state':file.read_text().strip() if file.is_file() else 'unknown',
+        'probe':'local route/interface lookup only; no ping or target packets','host_state':'unknown'}
+
+
+def port_probe(target,port,protocol,timeout=2.0):
+    """One unprivileged observation; UDP silence is explicitly ambiguous."""
+    import errno,socket,time
+    from datetime import datetime,timezone
+    if protocol not in ('tcp','udp') or not 1<=int(port)<=65535 or not .01<=float(timeout)<=2:raise ValueError('Invalid probe')
+    started=time.monotonic();state='timeout';error=None
+    family=socket.AF_INET6 if ':' in target else socket.AF_INET
+    try:
+        with socket.socket(family,socket.SOCK_STREAM if protocol=='tcp' else socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout);sock.connect((target,port))
+            if protocol=='tcp':state='open'
+            else:
+                sock.send(b'\x00');sock.recv(2048);state='open'
+    except TimeoutError:state='open|filtered' if protocol=='udp' else 'timeout';error='TimeoutError'
+    except OSError as exc:
+        error=type(exc).__name__
+        state='closed' if exc.errno==errno.ECONNREFUSED else 'filtered' if exc.errno in (errno.EACCES,errno.EPERM) else 'timeout'
+    return {'port':port,'protocol':protocol,'state':state,'error_type':error,
+            'elapsed_seconds':round(time.monotonic()-started,3),'service_verified':False,
+            'probe_finished_at':datetime.now(timezone.utc).isoformat()}
+
+
 def tool_args(profile, target, port, ports, scheme, path="/", hostname="", capture_limit=HTTP_CAPTURE_BODY_LIMIT):
     ipv6=ipaddress.ip_address(target).version==6
     nmap6=['-6'] if ipv6 else []
@@ -1334,8 +1367,8 @@ def tool_args(profile, target, port, ports, scheme, path="/", hostname="", captu
         return str(int(raw))
     def valid_ports(raw):
         parts = raw.split(',')
-        if not 1 <= len(parts) <= 32:
-            raise ValueError('1..32 TCP ports required')
+        if not 1 <= len(parts) <= 50:
+            raise ValueError('1..50 TCP ports required')
         values = [valid_port(part) for part in parts]
         if len(set(values)) != len(values):
             raise ValueError('Duplicate TCP port')
@@ -1345,12 +1378,16 @@ def tool_args(profile, target, port, ports, scheme, path="/", hostname="", captu
         # no UDP, no NSE scripts, no credential attacks). Exact target is still
         # enforced by the root-owned per-task /32 firewall and owner checks.
         return ['/usr/bin/nmap', *nmap6, '-sT', '-Pn', '-n', '--min-rate', '1000',
-                '--open', '--max-retries', '1', '--host-timeout', '240s',
+                '--max-retries', '1', '--host-timeout', '240s',
                 '-p-', target]
+    if profile=='udp_ports':
+        selected=valid_ports(ports)
+        if len(selected.split(','))>8:raise ValueError('UDP operation supports 1..8 ports')
+        return ['/usr/bin/python3','/usr/local/sbin/pm-netguard','port-worker','--target',target,'--ports',selected]
     if profile in ('tcp_ports', 'service_versions'):
         selected = valid_ports(ports)
         if profile == 'tcp_ports':
-            return ['/usr/bin/nmap', *nmap6, '-sT', '-Pn', '-n', '--open', '--max-retries', '1',
+            return ['/usr/bin/nmap', *nmap6, '-sT', '-Pn', '-n', '--max-retries', '1',
                     '--host-timeout', '25s', '-p', selected, target]
         return ['/usr/bin/nmap', *nmap6, '-sT', '-sV', '--version-light', '-Pn', '-n', '--open',
                 '--max-retries', '1', '--host-timeout', '30s', '-p', selected, target]
@@ -1741,7 +1778,7 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
                 raise ValueError('Hostname not approved for this NetGuard task')
         args = tool_args(profile, target, port, ports, scheme, path, hostname, capture_limit)
         run_timeout = 250 if profile == 'tcp_full' else 48
-        stdout_limit = 270336 if profile == 'http_document' else 24000
+        stdout_limit = 8*1024*1024 if profile=='tcp_full' else 270336 if profile == 'http_document' else 24000
     if profile not in ('exec', 'poc_run') and not Path(args[0]).is_file():
         output({'status': 'error', 'kind': 'tool_missing', 'reason_category': 'tool_missing',
                 'error': f'Executable unavailable: {args[0]}', 'task_id': task,
@@ -3646,6 +3683,8 @@ def main():
     sub.add_parser('capabilities')
     sub.add_parser('http-worker')
     sub.add_parser('browser-engine')
+    route=sub.add_parser('network-diagnostic');route.add_argument('--task-id',type=int,required=True);route.add_argument('--target',required=True)
+    worker=sub.add_parser('port-worker');worker.add_argument('--target',required=True);worker.add_argument('--ports',required=True)
     sub.add_parser('burp-reader')
     bu=sub.add_parser('burp-read');bu.add_argument('--task-id',type=int,required=True)
     bw=sub.add_parser('browser-worker');bw.add_argument('--task-id',type=int,required=True);bw.add_argument('--session-id',required=True)
@@ -3759,6 +3798,12 @@ def main():
         elif args.command in ('burp-read','burp-reader'):
             value=json.loads(sys.stdin.read(65537));output(burp_status(args.task_id,value) if args.command=='burp-read' else burp_reader(value))
         elif args.command=='browser-config':output(browser_configure(args.task_id,args.runtime,args.chromium,args.proxy_port,args.bridge_port,args.ca))
+        elif args.command=='network-diagnostic':output(network_diagnostic(args.task_id,args.target))
+        elif args.command=='port-worker':
+            if os.geteuid()==0:raise PermissionError('Port worker must be unprivileged')
+            selected=[int(p) for p in args.ports.split(',')]
+            if not 1<=len(selected)<=8:raise ValueError('Invalid UDP batch')
+            output({'observations':[port_probe(args.target,p,'udp') for p in selected]})
         elif args.command=='browser-engine':browser_engine()
         elif args.command=='browser-worker':browser_worker(args.task_id,args.session_id)
         elif args.command=='browser':
