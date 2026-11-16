@@ -98,7 +98,7 @@ def endpoint(db,task_id,value,target=None):
 
 
 def build(db,task_id,request,session_id,state):
-    allowed={'url','target','method','headers','cookies','auth','query','body','body_b64','json','form','files','ssrf','timeout','tls_verify'}
+    allowed={'url','target','method','headers','cookies','auth','query','body','body_b64','json','form','files','ssrf','timeout','tls_verify','proxy'}
     if not isinstance(request,dict) or set(request)-allowed or 'url' not in request:raise ValueError('Unknown or missing HTTP request field')
     url,target=endpoint(db,task_id,request['url'],request.get('target'))
     path=url['request_path'];query=pairs(request.get('query',[]))
@@ -183,7 +183,8 @@ def build(db,task_id,request,session_id,state):
     spec=broker.http_spec({'method':request.get('method','GET').upper(),'target':target,'scheme':url['scheme'],
         'hostname':url['host'],'port':url['port'],'path':path,'headers':headers,'body_b64':base64.b64encode(body).decode(),
         'session_id':session_id,'limit_bytes':artifacts.response_limit(db,task_id),'timeout':request.get('timeout',25),
-        'tls_verify':request.get('tls_verify',True),'ssrf':route})
+        'tls_verify':request.get('tls_verify',True),'ssrf':route,
+        **({'proxy':request['proxy']} if request.get('proxy') else {})})
     return spec,url
 
 
@@ -215,7 +216,7 @@ def execute(db,task_id,request,session_id='default'):
             fresh=spec['method'] in ('GET','HEAD','OPTIONS')
             # A new session label/response limit is not another target operation.
             # Effective authorization/cookies are already in the actual headers.
-            signature_spec={k:v for k,v in spec.items() if k not in ('timeout','limit_bytes','session_id','ssrf','body_b64')}
+            signature_spec={k:v for k,v in spec.items() if k not in ('timeout','limit_bytes','session_id','ssrf','body_b64','proxy')}
             signature_spec['body_sha256']=hashlib.sha256(base64.b64decode(spec['body_b64'])).hexdigest()
             fingerprint=task_memory.digest(signature_spec)
             description={'signature':fingerprint,'resource':url['origin']+spec['path'],'operation':'http_request',
@@ -242,6 +243,8 @@ def execute(db,task_id,request,session_id='default'):
             metadata={'request_ref':request_ref,'response_ref':response_ref,'elapsed_seconds':payload['elapsed_seconds'],
                 'transport_complete':payload['transport_complete'],'body_truncated':payload['body_truncated'],
                 'wire_truncated':payload['wire_truncated'],'request_write_completed':payload['request_write_completed'],
+                'transport_proxy':payload.get('transport_proxy'),'proxy_instance_id':payload.get('proxy_instance_id'),
+                'proxy_request_nonce':payload.get('proxy_request_nonce'),
                 'status_code':payload['status_code'],'error_type':payload.get('error_type'),'session_version':version,
                 'server_outcome':'uninterpreted; HTTP status does not establish authentication or goal success'}
             if head and payload['status_code'] is not None:
@@ -302,7 +305,8 @@ def execute(db,task_id,request,session_id='default'):
             method='GET';body_arg={}
         else:headers.extend(p for p in spec['headers'] if p[0].lower()=='content-type')
         request={'url':next_url['request_url'],'method':method,'headers':headers,**body_arg,
-                 'timeout':spec['timeout'],'tls_verify':spec['tls_verify']}
+                 'timeout':spec['timeout'],'tls_verify':spec['tls_verify'],
+                 **({'proxy':spec['proxy']} if spec.get('proxy') else {})}
 
 
 def read(db,task_id,exchange_id,part='body',offset=0,limit=4096):

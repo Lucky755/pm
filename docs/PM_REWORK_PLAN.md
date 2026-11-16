@@ -92,6 +92,8 @@
 | SSRF и pivoting | ограниченный GET через приложение с проверкой назначения/контекста; target loopback не является Kali; pivoting-вопрос связан с ресурсом и не расширяет scope молча | [публичный MCP и временные captures](../tests/test_resource_scope.py), [ограничения](RESOURCE_SCOPE.md#ssrf) |
 | Смена адреса той же машины | тот же task ID/файлы/цели/история; старые данные сохраняют адрес/неизвестную живость; проверка известных соединений без нового tcp_full/плана; unknown-running не воспроизводится | [реальные PM change-ip/resume](../tests/test_resource_scope.py), [legacy successor](../tests/test_console_v5.py) |
 | Диагностика | общий run_id, JSONL, процесс/MCP-корреляция и очистка диагностических сводок | [диагностика](../tests/test_run_diagnostics.py), [границы процессов](../tests/test_diagnostic_integration.py), [SDK/MCP loopback](../tests/test_coordinated_runtime.py) |
+| JS-браузер | Playwright/Chromium, scoped HTTP IPC, отдельные users/storage, общий session manager, DOM/HTTP-материалы | [реальный локальный JS/CSRF](../tests/test_browser_runtime.py), [границы](BROWSER_BURP.md) |
+| Burp Professional | PM Montoya bridge v3, guarded task-local Proxy, пассивные оригиналы в памяти отдельно от fresh sending | [контракт MCP](../tests/test_burp_adapter.py), [локальный proxy/CONNECT](../tests/test_burp_proxy_runtime.py), [компиляция реального API](../tests/check_burp_java.py); **живой Pro недоступен, не проверен** |
 
 Общий менеджер [сессий задачи](SESSIONS.md) сохраняет полезные PTY/SSH/callback
 между ролями; общая очистка удалена из run_role. Проверка живости отделена от
@@ -120,9 +122,9 @@
    работа использует сохранённые предложения и ответы; не менять expected_flags,
    scope и бюджеты ради успешного завершения. Полноценные независимые направления
    и автоматическое распознавание новых обстоятельств после отказа не реализованы.
-6. Модель ресурсов реализована в текущем этапе. Ещё не реализованы универсальные
-   SSRF/браузерные сценарии, UI изменения root-грантов после pivoting-вопроса,
-   сохранение живых сессий и параллельное исполнение. Живой kernel/VPN/IPv6
+6. Модель ресурсов и поддержанные сессии реализованы; базовый JS-браузер описан
+   ниже. Ещё не реализованы универсальные SSRF/браузерные сценарии, UI изменения
+   root-грантов после pivoting-вопроса и параллельное исполнение. Живой kernel/VPN/IPv6
    требует отдельной разрешённой проверки; offline-политика не подменяет её.
 
 Для каждого пункта нужны отдельные критерии и проверка текущей версии кода.
@@ -650,3 +652,76 @@ POST без повтора, новые session labels, password guard и отс�
 считаются пройденными. Полный браузер/OIDC/NTLM/HTTP2/HTTP3, CONNECT/upgrade и
 произвольные SSRF-протоколы не реализованы. Общий координатор, parallel workflow
 этапа 15, рабочие задачи/SQLite/отчёты/доказательства этим этапом не менялись.
+
+## Управляемый JavaScript-браузер и Burp — реализовано от `168ad6e`
+
+`pm_browser` выполняет конкретное open/fill/click/wait/read через настоящий
+Playwright/Chromium. Отдельные пользовательские contexts сохраняют cookies,
+localStorage/IndexedDB/sessionStorage, назначение и ресурс. Общий менеджер
+сессий отвечает за квоту десяти, исключительное владение и handoff после
+чтения; окончание роли не закрывает полезный браузер. Явный restore после
+остановки worker начинает пустую страницу со storage, без replay завершённого
+submit. Неизвестный исход не снимается чтением DOM и не перезапускается.
+
+У браузера/Node нет прямой сети: исходник broker запускает их как task user в
+пустом netns/bubblewrap. Сетевые Chromium Fetch events через Playwright CDPSession
+и IPC используют существующий
+scoped HTTP worker задачи с pinning/Host/SNI, проверкой каждого redirect/JS
+fetch, ограничениями комнаты и общим HTTP-бюджетом. DOM сохраняется отдельно
+от оригинальных запросов/ответов, времени, ресурса, сессии и result_id.
+`pm_browser_read`/`pm_material_read` читают сохранённое без сети. UI-completed,
+HTTP 200 или снимок экрана не подтверждают вход, доступ или цель.
+
+Профиль `browser-web` подключает только нужную процедуру и инструменты,
+сохраняя исходное задание/поручение в полном и сжатом промптах. Встроенные
+service workers, WebSockets, file chooser/downloads и произвольный evaluate
+не предоставлены. Бюджеты, ограничения полноты и путь конфигурации описаны в
+[BROWSER_BURP.md](BROWSER_BURP.md). Playwright закреплён на 1.58.0, проверен
+установленный Chromium 156.0.8078.47; Harness не обновлялся. Проверка окружения
+и её тест учитывают новую зависимость без ослабления прежних проверок.
+
+Burp здесь **не установлен**. По официальным документам Montoya и реальному
+API JAR 2026.7 реализовано PM-расширение bridge v3: history/request handler и
+guarded Proxy, а не придуманный vendor REST/MCP. Операторский выделенный Pro
+должен работать в namespace задачи; произвольный host proxy не используется.
+Одноразовая HMAC-квитанция фиксирует конкретный запрос, не весь интернет.
+`pm_burp status/import/read` отделены от активной отправки HTTP/browser через
+`proxy=burp`. История сохраняется с исходным instance/message ID, приватными
+HTTP messages, хэшами и material refs; повторный импорт не создаёт новое
+свидетельство и не смешивает авторизованных пользователей. Старый metadata
+Evidence Hub сохранён. При отсутствии Pro/bridge/guard — burp_unavailable;
+базовый браузер продолжает работать без него.
+
+Реальный локальный JS-тест проходит вход с cookies/CSRF POST и чтение DOM,
+изоляцию пользователей, передачу роли, scope/redirect, сохранённые оригиналы,
+пассивное чтение, restore без replay, unknown, symlink и взаимное исключение.
+Подменена только привилегированная namespace/launcher-граница, не браузер,
+ответы HTTP или SQLite/artifact persistence. Отдельно проверяются контракт
+публичного Burp MCP с подменённым broker, настоящий локальный forward proxy /
+TLS CONNECT/SNI/CA и javac+Python→Java HMAC/path/one-use против реального
+Montoya JAR. **Все три — не испытание живого Burp Professional**.
+
+Установленный root broker, рабочие задачи/SQLite/отчёты/доказательства не
+менялись. Не проверены реальный Pro/его TLS interception, namespace/VPN/kernel
+и живая CTF-цель; платный API не вызывался. Автоматическая корреляция исходного
+Burp message с техническим flag proof ещё не реализована: proxy capture
+маркируется и не становится автоматически оригинальным target proof;
+операторское подтверждение флага доступно по прежним правилам. Не заявлены
+универсальный браузер/OIDC/NTLM/HTTP2/HTTP3 или параллельный workflow этапа 15.
+
+Реальная регрессия redirect выявила пропуск промежуточных запросов в обычном
+BrowserContext.route; выбран поддержанный CDPSession/Fetch с перехватом каждого
+перехода. Отдельная регрессия реального переполнения временной artifact-квоты
+сохраняет execution_outcome=completed отдельно от capture_import_failed,
+неизменные исходные HTTP-квитанции переживают следующий DOM-read. Их task/session/
+SHA256 проверяются; автоматическое восстановление импорта/повтор действий не
+добавлены. HTTP proxy сохраняется на redirect и не создаёт новое разрешение
+повторить POST при смене транспорта.
+
+Итоговый `.venv/bin/python tests/run_offline.py --runtime`: **690 unittest** и
+шесть legacy-скриптов, ноль ошибок и пропусков. Браузер — 11 настоящих локальных
+runtime-сценариев; Burp — шесть MCP/launcher-контрактов, четыре локальных proxy /
+CONNECT/MCP-сценария и отдельная javac-проверка с реальным Montoya JAR.
+Обе self-test, compileall, Node syntax, environment check, pip check и
+`git diff --check` проходят. Десять ручных API/инфраструктурных экспериментов и
+живой Burp не запускались и не считаются пройденными.

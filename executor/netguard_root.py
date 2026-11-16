@@ -1906,8 +1906,9 @@ def capture_process(argv, body_limit=None, *, acquisition=False, process_env=Non
 
 def http_spec(raw):
     fields={'method','target','scheme','hostname','port','path','headers','body_b64','session_id','limit_bytes','timeout','tls_verify','ssrf'}
-    if not isinstance(raw,dict) or set(raw)!=fields:raise ValueError('Invalid HTTP request schema')
+    if not isinstance(raw,dict) or set(raw) not in (fields,fields|{'proxy'}):raise ValueError('Invalid HTTP request schema')
     spec=dict(raw)
+    if spec.get('proxy') not in (None,'burp'):raise ValueError('Unsupported HTTP proxy')
     if not isinstance(spec['method'],str) or not re.fullmatch(r'[A-Z][A-Z0-9-]{0,31}',spec['method']) or spec['method']=='CONNECT':raise ValueError('Unsupported HTTP method/tunnel')
     spec['target']=str(ipaddress.ip_address(spec['target']))
     parsed=resource_url(http_origin(spec['scheme'],spec['hostname'],spec['port'])+spec['path'])
@@ -1923,7 +1924,7 @@ def http_spec(raw):
         if not isinstance(pair,list) or len(pair)!=2 or not all(isinstance(v,str) for v in pair):raise ValueError('Header must be a name/value pair')
         name,value=pair
         if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+",name) or any(ord(c)<32 and c!='\t' or ord(c)==127 for c in value):raise ValueError('Invalid HTTP header characters')
-        if name.lower() in ('host','content-length','transfer-encoding','connection','expect','upgrade','proxy-authorization'):raise ValueError('Use URL authority and supported body framing')
+        if name.lower() in ('host','content-length','transfer-encoding','connection','expect','upgrade','proxy-authorization','x-pentest-master-scope'):raise ValueError('Use URL authority and supported body framing')
         if name.lower() in ('content-type','authorization','cookie'):
             if name.lower() in single_headers:raise ValueError('Ambiguous duplicate request header')
             single_headers.add(name.lower())
@@ -1973,7 +1974,7 @@ def http_spec(raw):
     return spec
 
 
-def http_transport(raw):
+def http_transport(raw,proxy=None):
     """One real HTTP/1.1 exchange, pinned socket + original headers, no redirects.
 
     Runs as the task user inside its namespace. No writable project imports,
@@ -2038,10 +2039,26 @@ def http_transport(raw):
     connection=connection_type(spec['hostname'],spec['port'],**options)
     connection.response_class=Response
     connection._create_connection=lambda address,timeout,*a,**kw:socket.create_connection((spec['target'],spec['port']),timeout)
+    if spec.get('proxy')=='burp':
+        if not proxy:raise ValueError('Burp proxy is not configured for this task namespace')
+        if spec['scheme']=='https':
+            # Numeric CONNECT pins the destination; TLS still uses original SNI.
+            def connect_proxy():
+                tunnel=http.client.HTTPConnection('127.0.0.1',proxy['port'],timeout=spec['timeout'])
+                tunnel.set_tunnel(spec['target'],spec['port']);tunnel.connect()
+                context=ssl.create_default_context(cafile=proxy.get('ca')) if spec['tls_verify'] else ssl._create_unverified_context()
+                connection.sock=context.wrap_socket(tunnel.sock,server_hostname=spec['hostname']);tunnel.sock=None
+            connection.connect=connect_proxy
+        else:connection._create_connection=lambda address,timeout,*a,**kw:socket.create_connection(('127.0.0.1',proxy['port']),timeout)
     authority=('['+spec['hostname']+']' if ':' in spec['hostname'] else spec['hostname'])+':'+str(spec['port'])
     headers=[['Host',authority],['Connection','close'],*spec['headers']]
+    if spec.get('proxy')=='burp':headers.append(['X-Pentest-Master-Scope',proxy['grant']])
     if body or spec['method'] in ('POST','PUT','PATCH'):headers.append(['Content-Length',str(len(body))])
-    request=(spec['method']+' '+spec['path']+' HTTP/1.1\r\n'+''.join(k+': '+v+'\r\n' for k,v in headers)+'\r\n').encode('latin-1')+body
+    destination=spec['path']
+    if spec.get('proxy')=='burp' and spec['scheme']=='http':
+        address='['+spec['target']+']' if ':' in spec['target'] else spec['target']
+        destination=f'http://{address}:{spec["port"]}'+spec['path']
+    request=(spec['method']+' '+destination+' HTTP/1.1\r\n'+''.join(k+': '+v+'\r\n' for k,v in headers)+'\r\n').encode('latin-1')+body
     response=None;received=bytearray();head=b'';complete=False;error=None;status=None;limited=False;sent=False
     try:
         connection.connect();connection.sock.sendall(request);sent=True
@@ -2061,6 +2078,8 @@ def http_transport(raw):
         if response is not None:response.close()
         connection.close()
     return {'http_protocol':1,'request_sha256':tool_digest(spec),'request_b64':base64.b64encode(request).decode(),
+        'transport_proxy':spec.get('proxy'),'proxy_instance_id':(proxy or {}).get('instance_id'),
+        'proxy_request_nonce':(proxy or {}).get('nonce'),
         'request_write_completed':sent,
         'wire_b64':base64.b64encode(bytes(response.recording.raw) if response else b'').decode(),
         'wire_truncated':response.recording.truncated if response else False,
@@ -2071,9 +2090,20 @@ def http_transport(raw):
 
 
 def http_process(v,config,spec):
+    extra=[];proxy=None
+    if spec.get('proxy')=='burp':
+        settings=config.get('browser',{}).get('burp')
+        if not settings:raise ToolError('burp_unavailable','Burp proxy is not configured in this task namespace')
+        proxy={'port':settings['proxy_port']}
+        health=burp_read(config,v,'/health',{})
+        if health.get('protocol')!=3 or health.get('edition')!='PROFESSIONAL' or health.get('guarded_proxy') is not True:raise ToolError('burp_unavailable','Burp Professional bridge v3/guard is unavailable')
+        proxy['grant'],proxy['nonce']=burp_grant(spec,burp_token(config));proxy['instance_id']=health['instance_id']
+        if settings.get('ca'):
+            if hashlib.sha256(Path(settings['ca']).read_bytes()).hexdigest()!=settings['ca_sha256']:raise ValueError('Burp CA changed; operator reconfiguration required')
+            extra=['--dir','/run','--ro-bind',settings['ca'],'/run/pm-burp-ca.pem'];proxy['ca']='/run/pm-burp-ca.pem'
     command=isolated_command(v['name'],config['owner'],config['uid'],config['gid'],
-        ['/usr/bin/python3','/usr/local/sbin/pm-netguard','http-worker'])
-    result=subprocess.run(command,input=json.dumps(spec),text=True,capture_output=True,timeout=spec['timeout']+5)
+        ['/usr/bin/python3','/usr/local/sbin/pm-netguard','http-worker'],extra)
+    result=subprocess.run(command,input=json.dumps({'spec':spec,'proxy':proxy} if proxy else spec),text=True,capture_output=True,timeout=spec['timeout']+5)
     payload=json.loads(result.stdout)
     if result.returncode or not isinstance(payload,dict) or payload.get('request_sha256')!=tool_digest(spec):raise ValueError('HTTP worker protocol failure')
     return payload
@@ -2093,6 +2123,64 @@ def http_run(task,raw):
         not all(docker_rule_exists(rule) for rule in docker_forward_rules(v,config))):raise EgressError('Task Docker forwarding rules missing')
     cmd('/usr/sbin/nft','list','table','inet',v['table']);cmd('/usr/sbin/nft','list','table','ip',v['nat'])
     return http_process(v,config,spec)
+
+
+def burp_grant(spec,token):
+    import hmac
+    authority=('['+spec['hostname']+']' if ':' in spec['hostname'] else spec['hostname'])+':'+str(spec['port'])
+    header={k.lower():value for k,value in spec['headers']};nonce=os.urandom(16).hex()
+    payload='\n'.join((spec['method'],spec['target'],str(spec['port']),spec['scheme'],authority,spec['path'],
+        hashlib.sha256(base64.b64decode(spec['body_b64'])).hexdigest(),
+        hashlib.sha256(header.get('authorization','').encode()).hexdigest(),hashlib.sha256(header.get('cookie','').encode()).hexdigest(),
+        nonce,str(int(time.time())+120))).encode()
+    return (base64.urlsafe_b64encode(payload).decode().rstrip('=')+'.'+base64.urlsafe_b64encode(hmac.new(token.encode(),payload,hashlib.sha256).digest()).decode().rstrip('='),nonce)
+
+
+def burp_token(config):
+    home=Path(pwd.getpwuid(config['uid']).pw_dir)
+    path=home/'.config/pentest-master/burp-bridge.token'
+    if path.is_symlink() or not path.is_file():raise ToolError('burp_unavailable','Burp bridge token missing; start the dedicated instance and load the extension')
+    info=path.stat()
+    if info.st_uid!=config['uid'] or info.st_mode&0o077:raise PermissionError('Unsafe Burp bridge token')
+    token=path.read_text().strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]{40,100}',token):raise ValueError('Invalid Burp bridge token')
+    return token
+
+
+def burp_read(config,v,path,params):
+    settings=config.get('browser',{}).get('burp')
+    if not settings:raise ToolError('burp_unavailable','Task-local Burp proxy/bridge is not configured')
+    command=isolated_command(v['name'],config['owner'],config['uid'],config['gid'],
+        ['/usr/bin/python3','/usr/local/sbin/pm-netguard','burp-reader'])
+    result=subprocess.run(command,input=json.dumps({'port':settings['bridge_port'],'path':path,'params':params,'token':burp_token(config)}),text=True,capture_output=True,timeout=12)
+    reply=json.loads(result.stdout)
+    if result.returncode or not isinstance(reply,dict):raise ToolError('burp_unavailable','Burp bridge unavailable')
+    return reply
+
+
+def burp_reader(raw):
+    if os.geteuid()==0:raise PermissionError('Burp reader must be unprivileged')
+    import http.client
+    if raw['path'] not in ('/health','/messages'):raise ValueError('Unsupported read-only Burp endpoint')
+    conn=http.client.HTTPConnection('127.0.0.1',callback_port(raw['port']),timeout=8)
+    try:
+        conn.request('GET',raw['path']+('?' +urlencode(raw['params']) if raw['params'] else ''),headers={'X-Pentest-Master-Token':raw['token']})
+        response=conn.getresponse();data=response.read(40*1024*1024+1)
+        if response.status!=200 or len(data)>40*1024*1024:raise ValueError('Burp read refused or oversized')
+        return json.loads(data)
+    finally:conn.close()
+
+
+def burp_status(task,raw):
+    session_invoker(task);v,config=owned_config(task)
+    action=raw.get('action','status')
+    if action=='status':return burp_read(config,v,'/health',{})
+    if action!='history':raise ValueError('Burp adapter has no active send endpoint; use scoped HTTP proxy')
+    url=resource_url(raw['url']);target=browser_endpoint(config,url)
+    after=raw.get('after',0);limit=raw.get('limit',1)
+    if type(after) is not int or after<0 or type(limit) is not int or not 1<=limit<=3:raise ValueError('Invalid Burp history range')
+    return burp_read(config,v,'/messages',{'host':target,'hostname':url['host'],'port':url['port'],
+        'scheme':url['scheme'],'path_prefix':url['path'],'after':after,'limit':limit})
 
 
 def ip_in_allowed(ip, allowed):
@@ -2473,6 +2561,322 @@ def callback_close(task, port=None):
     return {'status': 'closed', 'task_id': task, 'killed': killed}
 
 
+def browser_configure(task,runtime,chromium,proxy_port=0,bridge_port=17779,ca=''):
+    if ca and not proxy_port:raise ValueError('Burp CA requires a Proxy listener')
+    config,_,_=session_invoker(task);v,_=owned_config(task)
+    runtime=Path(runtime).resolve();binary=Path(chromium).resolve()
+    if not (runtime/'bin/python').is_file() or not list((runtime/'lib').glob('python*/site-packages/playwright')):raise ValueError('Playwright runtime missing')
+    info=binary.stat()
+    if info.st_uid!=0 or info.st_mode&0o022 or not os.access(binary,os.X_OK):raise ValueError('Chromium must be root-owned and not writable')
+    settings={'runtime':str(runtime),'chromium':str(binary)}
+    if proxy_port:
+        settings['burp']={'proxy_port':callback_port(proxy_port),'bridge_port':callback_port(bridge_port)}
+        if ca:
+            path=Path(ca).resolve();info=path.stat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0,config['uid']) or info.st_mode&0o022
+                    or info.st_uid==0 and not info.st_mode&0o004):raise ValueError('Unsafe or unreadable Burp CA file')
+            settings['burp'].update(ca=str(path),ca_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    config['browser']=settings;replace_config(v,config)
+    return {'status':'configured','browser_protocol':1,'browser':settings}
+
+
+def browser_engine_command(task,config):
+    # No page can contact Kali or a target directly: the browser's netns is
+    # empty. Only the root-controlled HTTP callback can perform target I/O.
+    v,_=owned_config(task);settings=config.get('browser')
+    if not settings:raise ToolError('browser_unavailable','Configure the task Playwright runtime and Chromium first')
+    argv=isolated_command(v['name'],config['owner'],config['uid'],config['gid'],
+        ['/opt/pm-browser/bin/python','/usr/local/sbin/pm-netguard','browser-engine'],
+        ['--dir','/opt','--ro-bind',settings['runtime'],'/opt/pm-browser'],workdir=task_workdir(task,config))
+    argv.remove('--share-net')
+    return argv
+
+
+def browser_open(task,raw,owner='',owner_pid=0):
+    config,owner,pid=session_invoker(task,owner,owner_pid)
+    if not config.get('browser'):raise ToolError('browser_unavailable','Browser runtime is not configured')
+    if not isinstance(raw,dict) or set(raw)!={'url','username','purpose','proxy'}:raise ValueError('Browser needs url, username, purpose and proxy')
+    url=resource_url(raw['url']);browser_endpoint(config,url)
+    if not isinstance(raw['username'],str) or not 1<=len(raw['username'])<=120 or not isinstance(raw['purpose'],str) or not 1<=len(raw['purpose'])<=1000:raise ValueError('Browser user/purpose required')
+    if raw['proxy'] not in (None,'burp') or raw['proxy']=='burp' and not config['browser'].get('burp'):raise ToolError('burp_unavailable','Task-local Burp is not configured')
+    if raw['proxy']=='burp':
+        health=burp_status(task,{'action':'status'})
+        if health.get('protocol')!=3 or health.get('edition')!='PROFESSIONAL' or not health.get('guarded_proxy'):raise ToolError('burp_unavailable','Dedicated Burp Professional bridge v3 is unavailable')
+    with session_lock(task):
+        entries=session_list(task)['sessions']
+        if sum(s.get('running') is not False for s in entries)>=SESSION_MAX:raise ValueError('Task session limit reached')
+        sid=new_session_id(session_dir(task));work=task_workdir(task,config)
+        tool_write_file(work,f'browser/{sid}/session-id',sid.encode(),config)
+        meta={'task_id':task,'session_id':sid,'pid':0,'socket':str(session_dir(task)/f'{sid}.sock'),
+            'log':str(session_dir(task)/f'{sid}.log'),'workdir':str(work),'idle':SESSION_IDLE,'created':int(time.time()),
+            'owner':owner,'owner_pid':pid,'owner_birth':process_birth(pid) if pid else '',
+            'resource':url['request_url'],'username':raw['username'],'purpose':raw['purpose'],'transport':'browser',
+            'proxy':raw['proxy'],'pending_unknown':False}
+        tool_store(session_dir(task)/f'{sid}.json',meta)
+        return start_browser_worker(task,meta)
+
+
+def start_browser_worker(task,meta):
+    sid=meta['session_id'];owner=meta.get('owner','')
+    with open(meta['log'],'ab') as log:
+        process=subprocess.Popen([os.path.realpath(sys.argv[0]),'browser-worker','--task-id',str(task),'--session-id',sid],
+            stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True,
+            env={'PATH':'/usr/bin:/bin','HOME':'/root','LC_ALL':'C'})
+    meta.update(pid=process.pid,process_birth=process_birth(process.pid));tool_store(session_dir(task)/f'{sid}.json',meta)
+    for _ in range(200):
+        if Path(meta['socket']).is_socket():
+            try:
+                health=session_request(meta,{'op':'status'},timeout=2)
+                if health.get('running'):return {**health,'status':'opened','session_id':sid,'owner':owner,
+                    'resource':meta['resource'],'username':meta['username'],'purpose':meta['purpose'],'transport':'browser'}
+            except (OSError,RuntimeError):pass
+        if process.poll() is not None:break
+        time.sleep(.05)
+    return {'status':'unknown','session_id':sid,'running':None,'reason_category':'browser_unavailable','error':'Browser worker did not become ready; inspect its log, no automatic reopen'}
+
+
+def browser_endpoint(config,url):
+    if url.get('kind')!='url':raise ValueError('Browser requires an HTTP(S) resource')
+    policy=config.get('resource_policy')
+    origin=next((o for o in (policy or {}).get('origins',[]) if o['origin']==url['origin']),None)
+    target=origin['addresses'][0] if origin else url['host']
+    check_target(target,config['allowed'])
+    authorize_resource(policy,'http',target,scheme=url['scheme'],hostname=url['host'],port=url['port'],path=url['request_path'])
+    if not policy and url['host']!=target and url['host'] not in config.get('hostnames',[]):raise ValueError('Unapproved browser hostname')
+    return target
+
+
+def browser_restore(task,sid,owner='',owner_pid=0):
+    config,owner,pid=session_invoker(task,owner,owner_pid)
+    with session_lock(task):
+        meta=session_meta(task,sid)
+        if meta.get('transport')!='browser':raise ValueError('Not a browser session')
+        if session_alive(meta):raise ValueError('Browser is alive; reuse the existing session')
+        if meta.get('pending_unknown'):raise ValueError('Interrupted browser action requires review; restoration never replays it')
+        birth=process_birth(meta.get('owner_pid',0))
+        if meta.get('owner') not in ('',owner) and birth and birth==meta.get('owner_birth'):raise ValueError('Browser owned by another live agent')
+        browser_endpoint(config,resource_url(meta['resource']))
+        if sum(s.get('running') is not False for s in session_list(task)['sessions'])>=SESSION_MAX:raise ValueError('Task session limit reached')
+        Path(meta['socket']).unlink(missing_ok=True)
+        meta.update(last_owner=meta.get('owner') or meta.get('last_owner'),owner='',owner_pid=0,owner_birth='')
+        return start_browser_worker(task,meta)
+
+
+def browser_action_spec(value):
+    if not isinstance(value,dict):raise ValueError('Browser action must be an object')
+    action=value.get('action')
+    fields={'open':{'action','url'},'fill':{'action','selector','value'},'click':{'action','selector'},
+            'wait':{'action','selector','timeout_ms'},'read':{'action','read_selector'}}
+    if not isinstance(action,str) or action not in fields or set(value)-fields[action]:raise ValueError('Unsupported browser action/fields')
+    if action=='open' and resource_url(value.get('url','')).get('kind')!='url':raise ValueError('Browser requires HTTP(S) navigation')
+    if action in ('fill','click','wait'):
+        if not isinstance(value.get('selector'),str) or not 1<=len(value['selector'])<=1000:raise ValueError('Selector required')
+    if action=='fill' and (not isinstance(value.get('value'),str) or len(value['value'])>8192):raise ValueError('Invalid fill value')
+    if 'read_selector' in value and (not isinstance(value['read_selector'],str) or not 1<=len(value['read_selector'])<=1000):raise ValueError('Invalid read selector')
+    if 'timeout_ms' in value and (type(value['timeout_ms']) is not int or not 1<=value['timeout_ms']<=12000):raise ValueError('Browser wait budget exceeded')
+    return value
+
+
+def browser_result(task,sid,receipt_id=''):
+    session_invoker(task);sid=session_id_valid(sid)
+    if receipt_id and not re.fullmatch(r'[a-f0-9]{64}',receipt_id):raise ValueError('Invalid browser receipt ID')
+    file=session_dir(task)/(f'{sid}.{receipt_id}.http-receipt' if receipt_id else f'{sid}.browser-result')
+    if not file.exists():return {'status':'unavailable','reason':'No saved browser receipt'}
+    value=tool_load(file)
+    if receipt_id and (value.get('task_id')!=task or value.get('session_id')!=sid or
+            tool_digest({k:v for k,v in value.items() if k!='receipt_id'})!=receipt_id):raise ValueError('Browser receipt integrity mismatch')
+    return value
+
+
+def browser_action(task,sid,action,owner='',owner_pid=0,max_requests=0):
+    config,owner,pid=session_invoker(task,owner,owner_pid)
+    action=browser_action_spec(action)
+    if action['action']=='open':browser_endpoint(config,resource_url(action['url']))
+    if type(max_requests) is not int or not 0<=max_requests<=24:raise ValueError('Invalid browser HTTP budget')
+    with session_lock(task):
+        meta=session_meta(task,sid)
+        if meta.get('transport')!='browser':raise ValueError('Session is not a browser')
+        if not session_alive(meta):return {'status':'disconnected','session_id':sid,'running':False}
+        other=meta.get('owner','');birth=process_birth(meta.get('owner_pid',0))
+        if other and other!=owner and birth and birth==meta.get('owner_birth'):return {'status':'blocked','kind':'session_busy','execution_started':False}
+        if other!=owner and meta.get('last_owner') not in (None,'',owner) and action.get('action') not in ('read','wait'):
+            return {'status':'blocked','kind':'session_read_required','execution_started':False,'error':'Read retained browser state after handoff before controlling it'}
+        if meta.get('pending_unknown') and action.get('action') not in ('read','wait'):return {'status':'blocked','reason_category':'outcome_unknown','execution_started':False,'error':'Previous browser action outcome unknown; inspect retained state, no automatic replay'}
+        prior_unknown=meta.get('pending_unknown',False)
+        meta.update(owner=owner,owner_pid=pid,owner_birth=process_birth(pid),pending_unknown=True)
+        tool_store(session_dir(task)/f'{sid}.json',meta)
+        records=[];denials=[];used=0;sock=socket.socket(socket.AF_UNIX);sock.settimeout(45)
+        ledger_file=BASE/f'browser-http-{task}.json'
+        ledger=tool_load(ledger_file) if ledger_file.exists() else {}
+        try:
+            sock.connect(meta['socket']);stream=sock.makefile('rwb',buffering=0)
+            stream.write((json.dumps({'op':'browser','action':action})+'\n').encode())
+            while True:
+                raw=stream.readline(40*1024*1024+1)
+                if not raw or len(raw)>40*1024*1024:raise ValueError('Browser IPC incomplete or oversized')
+                message=json.loads(raw)
+                if message.get('kind')!='http':
+                    result=message;break
+                item=message['request'];response={'status':'blocked','reason':
+                    'Browser action material budget exhausted' if used>=32*1024*1024 else 'HTTP request budget exhausted'}
+                if len(records)<max_requests and used<32*1024*1024:
+                    try:
+                        url=resource_url(item['url']);target=browser_endpoint(config,url)
+                        if item.get('body_complete') is False:raise ValueError('Browser request body unavailable; no sending')
+                        headers=[[k,v] for k,v in item['headers'] if k.lower() not in ('host','content-length','connection','accept-encoding','transfer-encoding','expect','upgrade','proxy-authorization')]
+                        spec=http_spec({'method':item['method'],'target':target,'scheme':url['scheme'],'hostname':url['host'],
+                            'port':url['port'],'path':url['request_path'],'headers':headers,'body_b64':item['body_b64'],
+                            'session_id':sid,'limit_bytes':HTTP_CAPTURE_BODY_LIMIT,'timeout':12,'tls_verify':True,'ssrf':None,
+                            **({'proxy':'burp'} if meta.get('proxy')=='burp' else {})})
+                        fingerprint=tool_digest({k:v for k,v in spec.items() if k not in ('session_id','limit_bytes','timeout','proxy')})
+                        previous=ledger.get(fingerprint)
+                        if previous and (previous=='unknown' or spec['method'] not in ('GET','HEAD','OPTIONS')):raise ValueError('Browser HTTP repeat or unknown outcome; no replay')
+                        ledger[fingerprint]='unknown';tool_store(ledger_file,ledger)
+                        response=http_run(task,spec);used+=len(json.dumps(response))+len(json.dumps(spec))
+                        ledger[fingerprint]='finished' if response['transport_complete'] else 'unknown';tool_store(ledger_file,ledger)
+                        record={'task_id':task,'session_id':sid,'spec':spec,'response':response,'observed_at':time.time()}
+                        record['receipt_id']=tool_digest(record)
+                        # Immutable originals survive failed frontend import and
+                        # subsequent DOM reads. They are not capability result IDs.
+                        tool_store(session_dir(task)/f'{sid}.{record["receipt_id"]}.http-receipt',record)
+                        records.append(record)
+                        # Private receipt remains available after lost frontend output.
+                        tool_store(session_dir(task)/f'{sid}.browser-result',{'session_id':sid,'network':records,'status':'unknown'})
+                        if used>32*1024*1024:response={'status':'blocked','reason':'Browser action material budget exhausted'}
+                    except (ValueError,OSError,RuntimeError,subprocess.SubprocessError) as exc:
+                        response={'status':'blocked','reason':str(exc)[:160] if isinstance(exc,ValueError) else type(exc).__name__+': scoped HTTP unavailable'}
+                if response.get('status')=='blocked':
+                    denials.append(response.get('reason','HTTP denied'))
+                    if len(denials)>24:raise ValueError('Browser denied-request budget exhausted')
+                stream.write((json.dumps(response)+'\n').encode())
+            meta['pending_unknown']=prior_unknown or result.get('status') not in ('completed','closed')
+            tool_store(session_dir(task)/f'{sid}.json',meta)
+        except (OSError,ValueError,RuntimeError) as exc:result={'status':'unknown','reason_category':'outcome_unknown','error':type(exc).__name__}
+        finally:sock.close()
+        result={**result,'session_id':sid,'running':session_alive(meta),'owner':owner,'transport':'browser',
+            'username':meta['username'],'purpose':meta['purpose'],'resource':meta['resource'],'network':records,'network_denials':denials}
+        tool_store(session_dir(task)/f'{sid}.browser-result',result)
+        return result
+
+
+def browser_worker(task,sid):
+    ensure_root();_,config=owned_config(task);meta=session_meta(task,sid)
+    process=subprocess.Popen(browser_engine_command(task,config),stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1)
+    process.stdin.write(json.dumps({'chromium':config['browser']['chromium'],'directory':'/work/browser/'+sid})+'\n');process.stdin.flush()
+    ready=process.stdout.readline()
+    if not ready or json.loads(ready).get('status')!='ready':raise RuntimeError('Browser engine startup failed')
+    listener=socket.socket(socket.AF_UNIX);listener.bind(meta['socket']);os.chmod(meta['socket'],0o600);listener.listen(4)
+    listener.settimeout(SESSION_IDLE)
+    try:
+        while process.poll() is None:
+            try:connection,_=listener.accept()
+            except socket.timeout:break
+            with connection:
+                stream=connection.makefile('rwb',buffering=0)
+                request=json.loads(stream.readline(65537))
+                op=request.get('op')
+                if op in ('status','read'):
+                    reply={'status':'running','running':True,'worker_pid':os.getpid(),'worker_birth':process_birth(os.getpid())}
+                    stream.write((json.dumps(reply)+'\n').encode());continue
+                if op=='close':
+                    stream.write(b'{"status":"closed","running":false}\n');break
+                if op!='browser':stream.write(b'{"status":"blocked","error":"Use pm_browser typed actions"}\n');continue
+                process.stdin.write(json.dumps(request['action'])+'\n');process.stdin.flush()
+                while True:
+                    line=process.stdout.readline(40*1024*1024+1)
+                    if not line:raise RuntimeError('Browser engine exited during an action')
+                    stream.write(line.encode());item=json.loads(line)
+                    if item.get('kind')!='http':break
+                    response=stream.readline(40*1024*1024+1)
+                    if not response:raise RuntimeError('Browser caller disconnected; action outcome unknown')
+                    process.stdin.write(response.decode());process.stdin.flush()
+    finally:
+        listener.close();Path(meta['socket']).unlink(missing_ok=True)
+        process.stdin.close()
+        try:process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:process.wait(timeout=5)
+            except subprocess.TimeoutExpired:process.kill();process.wait()
+
+
+def browser_engine():
+    if os.geteuid()==0:raise PermissionError('Browser engine must be unprivileged')
+    from playwright.sync_api import sync_playwright
+    from email.parser import BytesParser
+    initial=json.loads(sys.stdin.readline());directory=Path(initial['directory']);directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+    os.environ['HOME']=str(directory)
+    for key,leaf in (('XDG_CONFIG_HOME','.config'),('XDG_CACHE_HOME','.cache')):
+        folder=directory/leaf;folder.mkdir(mode=0o700,exist_ok=True);os.environ[key]=str(folder)
+    def send(value):print(json.dumps(value,ensure_ascii=True),flush=True)
+    with sync_playwright() as playwright:
+        browser=playwright.chromium.launch(executable_path=initial['chromium'],headless=True,
+            args=['--no-sandbox','--disable-dev-shm-usage','--disable-background-networking',
+                  '--force-webrtc-ip-handling-policy=disable_non_proxied_udp','--proxy-server=http://127.0.0.1:9','--proxy-bypass-list=<-loopback>'])
+        state_file=directory/'state.json'
+        state=json.loads(state_file.read_text()) if state_file.exists() else None
+        context=browser.new_context(storage_state=state,service_workers='block',accept_downloads=False)
+        session_file=directory/'session-storage.json'
+        session_storage=json.loads(session_file.read_text()) if session_file.exists() else {}
+        context.add_init_script('(()=>{const pmSaved='+json.dumps(session_storage)+'; if(pmSaved[location.origin]) for(const [k,v] of Object.entries(pmSaved[location.origin]))sessionStorage.setItem(k,v);})();')
+        context.set_default_timeout(12000)
+        # BrowserContext.route deliberately skips redirected requests. Chromium's
+        # supported CDP Fetch layer pauses EVERY hop before any network I/O.
+        # Network remains empty even if an unsupported target escapes interception.
+        page=context.new_page();cdp=context.new_cdp_session(page)
+        cdp.send('Network.enable');cdp.send('Network.setCacheDisabled',{'cacheDisabled':True})
+        def route_request(event):
+            request=event['request'];entries=request.get('postDataEntries')
+            complete=True
+            if entries is not None and all('bytes' in entry for entry in entries):
+                body=b''.join(base64.b64decode(entry['bytes'],validate=True) for entry in entries)
+            elif 'postData' in request:body=request['postData'].encode()
+            else:body=b'';complete=not request.get('hasPostData',False)
+            send({'kind':'http','request':{'url':request['url'],'method':request['method'],
+                'headers':[[k,v] for k,v in request['headers'].items()],
+                'body_b64':base64.b64encode(body).decode(),'body_complete':complete}})
+            response=json.loads(sys.stdin.readline())
+            if not response.get('transport_complete') or response.get('body_truncated'):
+                cdp.send('Fetch.failRequest',{'requestId':event['requestId'],'errorReason':'BlockedByClient'});return
+            head=base64.b64decode(response['headers_b64'])
+            matches=list(re.finditer(rb'(?m)^HTTP/1\.[01] [0-9]{3}[^\r\n]*\r?\n',head))
+            fields=BytesParser().parsebytes(head[matches[-1].end():]);headers=[]
+            for k,v in fields.items():
+                k=k.lower()
+                if k in ('content-length','transfer-encoding','connection'):continue
+                headers.append({'name':k,'value':v})
+            cdp.send('Fetch.fulfillRequest',{'requestId':event['requestId'],'responseCode':response['status_code'],
+                'responseHeaders':headers,'body':response['body_b64']})
+        cdp.on('Fetch.requestPaused',route_request)
+        cdp.send('Fetch.enable',{'patterns':[{'urlPattern':'*','requestStage':'Request'}]})
+        context.route_web_socket('**/*',lambda ws:ws.close())
+        page.on('dialog',lambda dialog:dialog.dismiss())
+        send({'status':'ready'})
+        for line in sys.stdin:
+            try:
+                action=json.loads(line);kind=action['action']
+                if kind=='open':page.goto(action['url'],wait_until='domcontentloaded')
+                elif kind=='fill':page.locator(action['selector']).fill(action['value'])
+                elif kind=='click':page.locator(action['selector']).click(no_wait_after=True)
+                elif kind=='wait':page.locator(action['selector']).wait_for(state='visible',timeout=action.get('timeout_ms',12000))
+                elif kind!='read':raise ValueError('Unsupported browser action')
+                text=page.locator(action.get('read_selector','body')).inner_text(timeout=3000)
+                full=page.content().encode();limited=len(full)>2*1024*1024
+                (directory/'dom.html').write_bytes(full[:2*1024*1024])
+                temporary=directory/'state.tmp';context.storage_state(path=temporary,indexed_db=True);os.replace(temporary,state_file)
+                values=page.locator('input,textarea,select').evaluate_all('(nodes)=>nodes.map(n=>({id:n.id,name:n.name,type:n.type,value:n.value,checked:n.checked}))')
+                if page.url.startswith(('http://','https://')):
+                    current=page.evaluate('()=>({origin:location.origin,values:Object.fromEntries(Object.entries(sessionStorage))})')
+                    session_storage[current['origin']]=current['values'];session_file.write_text(json.dumps(session_storage))
+                send({'status':'completed','observed_url':page.url,'title':page.title(),'text':text[:6000],
+                    'dom_b64':base64.b64encode(full[:2*1024*1024]).decode(),
+                    'text_truncated':len(text)>6000,'dom_truncated':limited,'dom_sha256':hashlib.sha256(full[:2*1024*1024]).hexdigest(),
+                    'state_sha256':tool_digest([json.loads(state_file.read_text()),session_storage,values]),
+                    'interpretation':'observed DOM only; action completion is not authentication or goal confirmation'})
+            except Exception as exc:send({'status':'unknown','reason_category':'outcome_unknown','error_type':type(exc).__name__})
+        context.close();browser.close()
+
+
 def session_dir(task):
     """Root-only directory holding one task's interactive sessions."""
     SESSIONS_BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2530,7 +2934,7 @@ def session_alive(meta):
         cmdline = Path(f'/proc/{pid}/cmdline').read_bytes().decode('utf-8', 'replace')
     except OSError:
         return False
-    return ('session-worker' in cmdline and str(meta.get('session_id','')) in cmdline
+    return (any(mode in cmdline for mode in ('session-worker','browser-worker')) and str(meta.get('session_id','')) in cmdline
             and (not meta.get('process_birth') or meta['process_birth']==process_birth(pid)))
 
 
@@ -3241,6 +3645,17 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('capabilities')
     sub.add_parser('http-worker')
+    sub.add_parser('browser-engine')
+    sub.add_parser('burp-reader')
+    bu=sub.add_parser('burp-read');bu.add_argument('--task-id',type=int,required=True)
+    bw=sub.add_parser('browser-worker');bw.add_argument('--task-id',type=int,required=True);bw.add_argument('--session-id',required=True)
+    bc=sub.add_parser('browser-config');bc.add_argument('--task-id',type=int,required=True)
+    bc.add_argument('--runtime',required=True);bc.add_argument('--chromium',required=True)
+    bc.add_argument('--proxy-port',type=int,default=0);bc.add_argument('--bridge-port',type=int,default=17779);bc.add_argument('--ca',default='')
+    br=sub.add_parser('browser');br.add_argument('--task-id',type=int,required=True)
+    br.add_argument('--action',choices=('open','restore','control','result'),required=True);br.add_argument('--session-id',default='')
+    br.add_argument('--receipt-id',default='')
+    br.add_argument('--owner',default='');br.add_argument('--owner-pid',type=int,default=0);br.add_argument('--max-requests',type=int,default=0)
     http_parser=sub.add_parser('http')
     http_parser.add_argument('--task-id',type=int,required=True)
     s = sub.add_parser('setup')
@@ -3327,6 +3742,7 @@ def main():
         if args.command == 'capabilities':
             output({'capture_protocol': 1,'resource_policy_protocol':1,'ipv6':True, 'tool_protocol': TOOL_PROTOCOL,
                     'http_protocol':1,'http_header_limit':HTTP_HEADER_LIMIT,
+                    'browser_protocol':1,'burp_proxy_protocol':1,
                     'session_protocol':2,'pivot_protocol':1,'transfer_protocol':1,
                     'system_tools': SYSTEM_TOOLS, 'privileged_scan_profiles': list(RAW_SCAN_PROFILES),
                     'profiles': ['http_capture', 'exec', 'poc_run', 'research', 'session', *RAW_SCAN_PROFILES],
@@ -3340,12 +3756,27 @@ def main():
                     'poc_interpreters': list(POC_INTERPRETERS),
                     'callback': {'ports_min': 1024, 'max_bytes': CALLBACK_MAX_BYTES},
                     'capture_limit_bytes': HTTP_CAPTURE_BODY_LIMIT,'capture_limits':list(HTTP_CAPTURE_LIMITS)})
+        elif args.command in ('burp-read','burp-reader'):
+            value=json.loads(sys.stdin.read(65537));output(burp_status(args.task_id,value) if args.command=='burp-read' else burp_reader(value))
+        elif args.command=='browser-config':output(browser_configure(args.task_id,args.runtime,args.chromium,args.proxy_port,args.bridge_port,args.ca))
+        elif args.command=='browser-engine':browser_engine()
+        elif args.command=='browser-worker':browser_worker(args.task_id,args.session_id)
+        elif args.command=='browser':
+            if args.action=='result':
+                output(browser_result(args.task_id,args.session_id,args.receipt_id))
+            elif args.action=='restore':output(browser_restore(args.task_id,args.session_id,args.owner,args.owner_pid))
+            else:
+                raw=sys.stdin.read(65537)
+                if len(raw)>65536:raise ValueError('Browser action input too large')
+                value=json.loads(raw)
+                output(browser_open(args.task_id,value,args.owner,args.owner_pid) if args.action=='open' else
+                    browser_action(args.task_id,args.session_id,value,args.owner,args.owner_pid,args.max_requests))
         elif args.command in ('http','http-worker'):
             if args.command=='http-worker' and os.geteuid()==0:raise PermissionError('HTTP worker must run as the unprivileged task user')
             text=sys.stdin.read(20*1024*1024+1)
             if len(text)>20*1024*1024:raise ValueError('HTTP input budget exceeded')
             raw=json.loads(text)
-            output(http_run(args.task_id,raw) if args.command=='http' else http_transport(raw))
+            output(http_run(args.task_id,raw) if args.command=='http' else http_transport(raw['spec'],raw.get('proxy')) if 'spec' in raw else http_transport(raw))
         elif args.command == 'setup': setup(args.task_id, args.owner, args.allow, args.egress,
                                           json.loads(args.resource_policy) if args.resource_policy else None)
         elif args.command == 'teardown': teardown(args.task_id)

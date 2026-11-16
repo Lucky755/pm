@@ -244,6 +244,23 @@ def source_state(db,task_id,capability_log):
     for exchange in rows(db,'pm_http_exchanges',task_id):
         put('checks','http_exchange:'+str(exchange['id']),{k:exchange[k] for k in
             ('id','session_id','parent_id','method','url','target','request_sha256','operation_id','phase','artifact_id','created_at')})
+    for action in rows(db,'pm_browser_actions',task_id):
+        result=json.loads(action['result_json'])
+        essential={k:result[k] for k in ('observed_url','title','dom_ref','dom_sha256','state_sha256','http_exchanges','network_result_ids','network_denials','interpretation','error_type','execution_outcome','reason_category','root_http_receipts') if k in result}
+        text=result.get('text','');essential.update(text_preview=text[:1000],text_characters=len(text),text_preview_truncated=len(text)>1000)
+        put('checks','browser_action:'+str(action['id']),{**{k:action[k] for k in ('id','session_id','operation_id','action','status','created_at')},'result':essential})
+        if result.get('dom_ref'):
+            put('materials','browser_dom:'+str(action['id']),{**result['dom_ref'],'kind':'browser_dom','action_id':action['id'],
+                'session_id':action['session_id'],'source':'observed renderer DOM; not independent target evidence'})
+    for message in rows(db,'pm_burp_messages',task_id):
+        prefix='burp:'+message['instance_id']+':'+str(message['message_id'])
+        meta=json.loads(message['metadata_json'])
+        put('checks',prefix,{
+            **{k:message[k] for k in ('instance_id','message_id','url','target')},**json.loads(message['metadata_json']),
+            'source':'passive_burp_history','fresh_observation':False})
+        for part in ('request','response'):
+            put('materials',prefix+':'+part,{**meta[part+'_ref'],'kind':'burp_original','source':'passive_burp_history',
+                'instance_id':message['instance_id'],'message_id':message['message_id'],'part':part,'fresh_observation':False})
     if exists(db,'network_job_runs') and exists(db,'network_phase_plans'):
         for row in db.execute('SELECT r.id,r.status,r.result_json,p.id,p.profile,p.parameters_json '
                               'FROM network_job_runs r JOIN network_phase_plans p ON p.id=r.plan_id '
@@ -383,6 +400,19 @@ def material(db,task_id,reference,capability_log):
         row=db.execute('SELECT result_json FROM pm_tcp_full_scan_attempts WHERE id=? AND task_id=? AND target=?',
                        (int(reference.split(':')[1]),task_id,target)).fetchone()
         if row and row[0] is not None:return row[0].encode()
+    match=re.fullmatch(r'browser_dom:(\d+)',reference)
+    if match and exists(db,'pm_browser_actions'):
+        row=db.execute('SELECT result_json FROM pm_browser_actions WHERE task_id=? AND id=?',(task_id,int(match[1]))).fetchone()
+        if row:
+            from orchestrator import http_artifacts
+            return http_artifacts.load_material(task_id,json.loads(row[0])['dom_ref'])
+    match=re.fullmatch(r'burp:([a-f0-9-]{36}):(\d+):(request|response)',reference)
+    if match and exists(db,'pm_burp_messages'):
+        row=db.execute('SELECT metadata_json FROM pm_burp_messages WHERE task_id=? AND instance_id=? AND message_id=?',
+            (task_id,match[1],int(match[2]))).fetchone()
+        if row:
+            from orchestrator import http_artifacts
+            return http_artifacts.load_material(task_id,json.loads(row[0])[match[3]+'_ref'])
     if re.fullmatch(r'http_artifact:\d+',reference):
         from orchestrator import http_artifacts
         aid=int(reference.split(':')[1])

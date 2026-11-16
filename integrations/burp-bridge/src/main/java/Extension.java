@@ -1,6 +1,10 @@
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.proxy.ProxyHttpRequestResponse;
+import burp.api.montoya.proxy.http.ProxyRequestHandler;
+import burp.api.montoya.proxy.http.InterceptedRequest;
+import burp.api.montoya.proxy.http.ProxyRequestReceivedAction;
+import burp.api.montoya.proxy.http.ProxyRequestToBeSentAction;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
@@ -25,9 +29,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Pentest Master Burp Bridge v2. Read-only, metadata-only API. */
+/** PM-owned bridge v3. Montoya 2026.7, read API + guarded standard Proxy. */
 public class Extension implements BurpExtension {
-    private static final int PORT = 17779;
+    private static final int PORT = Integer.getInteger("pm.bridge.port",17779);
     private static final int MAX_LIMIT = 100;
     private MontoyaApi api;
     private HttpServer server;
@@ -35,6 +39,8 @@ public class Extension implements BurpExtension {
     private String secret;
     private final String instanceId = UUID.randomUUID().toString();
     private Path tokenFile;
+    private ScopeGuard scopeGuard;
+    private burp.api.montoya.core.Registration proxyRegistration;
 
     @Override
     public void initialize(MontoyaApi montoya) {
@@ -44,6 +50,18 @@ public class Extension implements BurpExtension {
             byte[] random = new byte[32];
             new SecureRandom().nextBytes(random);
             secret = Base64.getUrlEncoder().withoutPadding().encodeToString(random);
+            scopeGuard=new ScopeGuard(secret);
+            proxyRegistration=api.proxy().registerRequestHandler(new ProxyRequestHandler() {
+                public ProxyRequestReceivedAction handleRequestReceived(InterceptedRequest request) {
+                    return scopeGuard.allows(request,false) ? ProxyRequestReceivedAction.doNotIntercept(request) : ProxyRequestReceivedAction.drop();
+                }
+                public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest request) {
+                    if(!scopeGuard.allows(request,true))return ProxyRequestToBeSentAction.drop();
+                    String[] fields=new String(Base64.getUrlDecoder().decode(request.headerValue(ScopeGuard.HEADER).split("\\.")[0]),StandardCharsets.UTF_8).split("\n",-1);
+                    request.annotations().setNotes("PM:"+fields[9]);
+                    return ProxyRequestToBeSentAction.continueWith(request.withRemovedHeader(ScopeGuard.HEADER));
+                }
+            });
             tokenFile = Path.of(System.getProperty("user.home"), ".config", "pentest-master", "burp-bridge.token");
             Files.createDirectories(tokenFile.getParent());
             Path temp = Files.createTempFile(tokenFile.getParent(), "bridge-", ".tmp",
@@ -56,11 +74,12 @@ public class Extension implements BurpExtension {
             server = HttpServer.create(new InetSocketAddress("127.0.0.1", PORT), 0);
             server.createContext("/health", this::health);
             server.createContext("/history", this::history);
+            server.createContext("/messages", this::messages);
             workers = Executors.newFixedThreadPool(2);
             server.setExecutor(workers);
             server.start();
             api.extension().registerUnloadingHandler(this::stop);
-            api.logging().logToOutput("[Pentest Master] Burp Bridge v2 listening on 127.0.0.1:" + PORT);
+            api.logging().logToOutput("[Pentest Master] Bridge v3: dedicated guarded Proxy; read API 127.0.0.1:" + PORT);
         } catch (Exception ex) {
             stop();
             api.logging().logToError("[Pentest Master] Bridge startup failed: " + ex.getMessage());
@@ -69,6 +88,7 @@ public class Extension implements BurpExtension {
     }
 
     private void stop() {
+        if(proxyRegistration!=null && proxyRegistration.isRegistered())proxyRegistration.deregister();
         if (server != null) server.stop(0);
         if (workers != null) workers.shutdownNow();
         try {
@@ -146,7 +166,43 @@ public class Extension implements BurpExtension {
     private void health(HttpExchange x) throws IOException {
         if (!authenticated(x)) return;
         reply(x, 200, "{\"status\":\"running\",\"component\":\"burp_bridge\","
-            + "\"mode\":\"metadata_read_only\",\"instance_id\":" + escape(instanceId) + "}");
+            + "\"mode\":\"read_only\",\"protocol\":3,\"guarded_proxy\":"+(proxyRegistration!=null && proxyRegistration.isRegistered())+",\"montoya\":\"2026.7\","
+            + "\"edition\":"+escape(api.burpSuite().version().edition().toString())+",\"burp_version\":"+escape(api.burpSuite().version().toString())+",\"instance_id\":" + escape(instanceId) + "}");
+    }
+
+    private void messages(HttpExchange x) throws IOException {
+        if(!authenticated(x))return;
+        try {
+            var params=query(x.getRequestURI().getRawQuery());String host=params.get("host"), name=params.get("hostname"), prefix=params.getOrDefault("path_prefix","/");
+            String scheme=params.get("scheme");int port=Integer.parseInt(params.get("port"));
+            int after=Integer.parseInt(params.getOrDefault("after","0")),limit=Integer.parseInt(params.getOrDefault("limit","1"));
+            if(host==null || name==null || !host.matches("[0-9a-fA-F:.]+") || !name.matches("[a-zA-Z0-9.:-]+") || port<1 || port>65535 || after<0 || limit<1 || limit>3 || !prefix.startsWith("/") || !("http".equals(scheme)||"https".equals(scheme))){reply(x,400,"{\"error\":\"invalid_scope\"}");return;}
+            StringBuilder result=new StringBuilder("{\"status\":\"ok\",\"protocol\":3,\"instance_id\":").append(escape(instanceId)).append(",\"entries\":[");
+            int count=0,skipped=0,encoded=0,scanned=after;boolean more=false;
+            for(var item:api.proxy().history().stream().sorted(java.util.Comparator.comparingInt(ProxyHttpRequestResponse::id)).toList()) {
+                var request=item.finalRequest();var service=request.httpService();
+                String authority=request.headerValue("Host");
+                if(authority==null)continue;
+                var parsed=java.net.URI.create(scheme+"://"+authority);int actualPort=parsed.getPort()<0?(scheme.equals("https")?443:80):parsed.getPort();
+                if(item.id()<=after || !host.equals(service.host()) || port!=service.port() || service.secure()!=scheme.equals("https") || !name.equalsIgnoreCase(parsed.getHost()) || actualPort!=port || !request.path().split("\\?",2)[0].startsWith(prefix))continue;
+                if(count>=limit){more=true;break;}
+                byte[] req=request.toByteArray().getBytes();byte[] resp=item.hasResponse()?item.originalResponse().toByteArray().getBytes():new byte[0];
+                int cap=9*1024*1024;
+                if(req.length>cap || resp.length>cap){skipped++;scanned=item.id();continue;}
+                int size=4*((req.length+2)/3+(resp.length+2)/3);
+                if(encoded+size>32*1024*1024){more=true;break;}
+                encoded+=size;scanned=item.id();
+                if(count++>0)result.append(',');
+                result.append("{\"id\":").append(item.id()).append(",\"target\":").append(escape(host))
+                    .append(",\"url\":").append(escape(scheme+"://"+authority+request.path()))
+                    .append(",\"method\":").append(escape(request.method())).append(",\"observed_at\":").append(escape(item.time().toString()))
+                    .append(",\"pm_request_nonce\":").append(escape(item.annotations().hasNotes() && item.annotations().notes().matches("PM:[0-9a-f]{32}")?item.annotations().notes().substring(3):""))
+                    .append(",\"format\":\"montoya_http_message\",\"request_b64\":").append(escape(Base64.getEncoder().encodeToString(req)))
+                    .append(",\"response_b64\":").append(escape(Base64.getEncoder().encodeToString(resp))).append('}');
+            }
+            reply(x,200,result.append("],\"count\":").append(count).append(",\"skipped_oversize\":").append(skipped)
+                .append(",\"scanned_through_id\":").append(scanned).append(",\"has_more\":").append(more).append('}').toString());
+        } catch(Exception ex){reply(x,400,"{\"error\":\"history_read_failed\"}");}
     }
 
     private void history(HttpExchange x) throws IOException {

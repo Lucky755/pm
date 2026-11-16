@@ -60,6 +60,18 @@ class InstructionTests(unittest.TestCase):
             with self.subTest(role=role,profile=profile),self.assertRaisesRegex(ValueError,'unknown_profile'):
                 rules.profile(role,profile)
 
+    def test_browser_assignment_keeps_task_and_only_its_procedure(self):
+        context=self.case.context('Investigate app.lab only; no brute force or password changes.')
+        context['specialist_assignment']={'profile':'browser-web','question':'Submit the CSRF form as alice',
+            'expected_result':'Quote the account DOM and original HTTP references',
+            'references':['http_artifact:7'],'data':[{'reference':'http_artifact:7','value':'known scoped form'}]}
+        for prompt in self.case.prompts(context,'access',context['specialist_assignment']['question']):
+            for text in (context['intent'],'Submit the CSRF form as alice','Quote the account DOM',
+                         'http_artifact:7','pm_browser(','pm_browser_read(','<procedure id="browser-web">'):
+                self.assertIn(text,prompt)
+            self.assertNotIn('<procedure id="http-capture">',prompt)
+            self.assertNotIn('pm_poc_run(',prompt)
+
     def test_documented_tools_exist_and_all_profiles_define_the_contract(self):
         tree=ast.parse((rules.ROOT.parent/'mcp/server.py').read_text())
         actual={node.name for node in tree.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))

@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 EXPECTED={'deepseek-harness-sdk':'0.2.1rc2','deepseek-harness-runtime-bin':'0.2.1rc2',
-          'mcp':'1.26.0','pydantic':'2.14.2'}
+          'mcp':'1.26.0','pydantic':'2.14.2','playwright':'1.58.0'}
 
 
 def check():

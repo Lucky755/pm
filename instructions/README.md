@@ -51,6 +51,7 @@
 |---|---|---|---|
 | recon/vuln/access/verify | нет автоматически | наследует существующую доступность | наследует бюджет вызова |
 | http-surface | http-capture | свежий HTTP с method/body/web-session, capture и чтение/память, без net_exec/PoC/PTY | 6 / 1 / 8192 |
+| browser-web | browser-web | JS open/fill/click/wait/read, отдельный пользователь/владелец, HTTP и пассивный Burp; без net_exec/PoC/PTY | 12 / 1 / 8192 |
 | capture-audit | capture-audit | только чтение сохранённых данных и заметки, без GET | 4 / 1 / 8192 |
 | access-triage | access-triage | net_exec/session и чтение/память, без PoC/research/callback | 8 / 1 / 8192 |
 
@@ -97,6 +98,7 @@ ACCESS и использование материалов внутри зада�
 сохранённые цели и expected_flags остаются обязательными. См.
 [очередь](../docs/OPERATOR_QUESTIONS.md) и
 [подтверждение флагов](../docs/FLAG_CONFIRMATION.md).
-Живые сессии и параллельный координатор пока не сохраняются. Запрет смены
+Полезные сессии сохраняются общим [менеджером](../docs/SESSIONS.md), включая
+[браузерные](../docs/BROWSER_BURP.md); параллельный координатор не реализован. Запрет смены
 паролей действует в инструкциях и поддержанных технических проверках;
 универсальный анализ произвольного SSH/PoC не доказан.

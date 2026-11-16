@@ -1616,11 +1616,112 @@ def pm_net_exec(
 
 @mcp.tool()
 @diagnostics.tool
+def pm_browser(task_id:int,action:str,session_id:str='',action_json:str='{}',url:str='',username:str='',purpose:str='',proxy:str='')->str:
+    """Managed JavaScript browser, with scoped PM HTTP as its only network path.
+
+    open creates an isolated user context (no navigation); control JSON has
+    action=open(url), fill(selector,value), click(selector), wait(selector), read.
+    Retain the ID between roles and read after handoff. Different users need
+    different sessions. status/release/close use the common session manager.
+    proxy=burp requires operator-configured task-local Burp; empty works without it.
+    """
+    from orchestrator import browser,task_sessions
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked','error':'Wrong task'})
+    try:
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            if action=='open':payload=browser.open_session(db,task_id,url,username,purpose,proxy or None)
+            elif action=='restore':
+                payload=browser.call(task_id,'restore',session_id=session_id)
+                task_sessions.record_result(db,task_id,'open',payload,session_id=session_id);db.commit()
+            elif action=='control':payload=browser.execute(db,task_id,session_id,json.loads(action_json),log=CAPABILITY_LOG/f'task_{task_id}.jsonl')
+            elif action in ('status','release','close'):
+                payload=task_sessions.call(task_id,'read' if action=='status' else action,session_id)
+                task_sessions.record_result(db,task_id,'read' if action=='status' else action,payload,session_id=session_id);db.commit()
+            else:raise ValueError('Invalid browser action')
+            if action=='control':
+                ids=[]
+                from orchestrator import http_artifacts
+                for eid in payload.get('http_exchanges',[]):
+                    saved=db.execute('SELECT result_id FROM pm_browser_network WHERE task_id=? AND session_id=? AND exchange_id=?',(task_id,session_id,eid)).fetchone()
+                    existing=saved[0] if saved else None
+                    if existing:ids.append(existing);continue
+                    row=db.execute('SELECT target,artifact_id,metadata_json FROM pm_http_exchanges WHERE id=? AND task_id=?',(eid,task_id)).fetchone()
+                    if not row or row[1] is None:continue
+                    meta=json.loads(row[2]);body,info=http_artifacts.load(db,task_id,row[1])
+                    text=http_artifacts.decode_body(body,info.get('headers',{}))[0]
+                    data={'task_id':task_id,'target':row[0],'artifact_id':row[1],'artifact_ref':'http_artifact:'+str(row[1]),
+                        'status':'completed' if meta['transport_complete'] else 'incomplete','exit_code':0 if meta['transport_complete'] else 1,
+                        'browser_session_id':session_id,'exchange_id':eid,'stdout':http_artifacts.diagnostic_text(text[:4096]),
+                        'stdout_truncated':len(text)>4096,'observed_at':meta['observed_at']}
+                    reference=log_capability('http_capture',task_id,data,0)
+                    db.execute('UPDATE pm_browser_network SET result_id=? WHERE task_id=? AND exchange_id=?',(reference,task_id,eid));ids.append(reference)
+                db.commit();payload['network_result_ids']=ids
+                if payload.get('http_exchanges'):
+                    from orchestrator import task_memory
+                    with task_memory.atomic(db):
+                        row=db.execute('SELECT id,result_json FROM pm_browser_actions WHERE task_id=? AND session_id=? AND id=?',(task_id,session_id,payload.get('browser_action_id'))).fetchone()
+                        if row:
+                            saved_result=json.loads(row[1]);saved_result['network_result_ids']=ids
+                            db.execute('UPDATE pm_browser_actions SET result_json=? WHERE id=?',(json.dumps(saved_result),row[0]))
+                        task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='browser_evidence_references')
+    except browser.CaptureImportError as exc:payload=exc.payload
+    except (ValueError,KeyError,TypeError) as exc:payload={'status':'blocked','reason_category':getattr(exc,'category','policy'),'reason':str(exc)[:160]}
+    except (OSError,sqlite3.Error,subprocess.SubprocessError) as exc:payload={'status':'unknown','reason_category':'outcome_unknown','error_type':type(exc).__name__}
+    rid=log_capability('browser',task_id,payload,0)
+    return tool_response({**payload,'result_id':rid})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_browser_read(task_id:int,session_id:str,offset:int=0,limit:int=10,action_id:int=0)->str:
+    """Read saved browser observations only. No live DOM/JS, target, browser or Burp calls."""
+    from orchestrator import browser
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked','error':'Wrong task'})
+    if offset<0 or not 1<=limit<=65536:return tool_response({'status':'blocked','error':'Invalid range'})
+    with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True,timeout=10)) as db:
+        rows=browser.observations(db,task_id,session_id)
+        if action_id:
+            from orchestrator import http_artifacts
+            row=next((r for r in rows if r['id']==action_id),None)
+            if not row or not row['result'].get('dom_ref'):return tool_response({'status':'blocked','error':'No saved DOM for this task/session/action'})
+            body=http_artifacts.load_material(task_id,row['result']['dom_ref']);chunk=body[offset:offset+limit]
+            return tool_response({'status':'completed','provenance':'local','data_b64':base64.b64encode(chunk).decode(),
+                'bytes':len(body),'has_more':offset+len(chunk)<len(body)})
+        size=min(limit,20)
+        return tool_response({'status':'completed','provenance':'local','observations':rows[offset:offset+size],
+            'has_more':offset+size<len(rows)})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_burp(task_id:int,action:str='status',url:str='',after:int=0,limit:int=1)->str:
+    """Burp Professional capability and passive history import/read.
+
+    This PM-owned Montoya bridge is not a native Burp REST/MCP API. No target
+    requests are sent by status/import/read. Fresh requests use HTTP/browser
+    proxy=burp with the configured guarded task-local Proxy listener.
+    """
+    from orchestrator import burp_adapter
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked','error':'Wrong task'})
+    try:
+        if action=='status':payload=burp_adapter.status(task_id)
+        elif action=='import':
+            with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:payload=burp_adapter.import_history(db,task_id,url,after,limit)
+        elif action=='read':
+            with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True,timeout=10)) as db:
+                payload={'status':'completed','provenance':'local','messages':burp_adapter.read(db,task_id)}
+        else:raise ValueError('Invalid Burp action')
+    except (ValueError,OSError,sqlite3.Error) as exc:payload={'status':'blocked','reason':str(exc)[:160]}
+    return tool_response(payload)
+
+
+@mcp.tool()
+@diagnostics.tool
 def pm_http_request(task_id:int,request_json:str,session_id:str='default')->str:
     """Fresh task-scoped HTTP exchange with methods, bodies, cookies and uploads.
 
     JSON fields: url,method,headers,query,cookies,auth,body/body_b64/json/form/files,
-    ssrf,timeout,tls_verify. Files name task /work paths. No implicit response
+    ssrf,timeout,tls_verify,proxy(optional burp). Files name task /work paths. No implicit response
     cache. Redirects are checked individually; credentials are origin/session
     bound. HTTP completion/status does not confirm login or a research goal.
     Use pm_http_read for saved original ranges, not another network operation.
@@ -1629,8 +1730,12 @@ def pm_http_request(task_id:int,request_json:str,session_id:str='default')->str:
     started=time.monotonic()
     try:
         if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):raise ValueError('Wrong HTTP task')
+        request=json.loads(request_json)
+        if isinstance(request,dict) and request.get('proxy')=='burp':
+            from orchestrator import burp_adapter
+            if burp_adapter.status(task_id)['status']!='available':raise ValueError('burp_unavailable: dedicated Burp Professional bridge v3 is required')
         with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
-            payload=http_client.execute(db,task_id,json.loads(request_json),session_id)
+            payload=http_client.execute(db,task_id,request,session_id)
     except http_client.HTTPExecutionError as exc:
         payload={'status':'unknown','reason_category':'outcome_unknown','reason':str(exc),'task_id':task_id}
     except (ValueError,TypeError,KeyError) as exc:

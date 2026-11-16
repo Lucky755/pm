@@ -42,6 +42,9 @@ def collect(db, task_id, *, artifact_id=None):
         if not isinstance(metadata,dict) or not isinstance(metadata.get('headers',{}),dict):
             errors.append({'capture_ref':ref,'reason':'capture_metadata_invalid'})
             continue
+        if metadata.get('transport_proxy')=='burp':
+            errors.append({'capture_ref':ref,'reason':'proxy_target_provenance_requires_original_history_correlation'})
+            continue # Operator platform confirmation remains available, without another request.
         object_path = re.fullmatch(r'(.*/\.git)/objects/([0-9a-f]{2})/([0-9a-f]{38})', path)
         proof = {'kind': 'http_capture', 'task_id': task_id, 'target': target,
                  'capture_ref': ref, 'capture_refs':[ref], 'path': path, 'capture_sha256': capture_sha,

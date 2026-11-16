@@ -2767,6 +2767,18 @@ def op_callback_config(args):
         line(json.dumps(result,ensure_ascii=False,indent=2));return result
 
 
+def op_browser_config(args):
+    from orchestrator.coordinated_attack import task_lock
+    if args.burp_ca and not args.burp_proxy_port:raise OperatorError('--burp-ca требует --burp-proxy-port')
+    with task_lock(args.task_id),connect() as db:
+        task_target(db,args.task_id)
+        command=['browser-config','--task-id',str(args.task_id),'--runtime',str(Path(args.runtime).resolve()),
+            '--chromium',str(Path(args.chromium).resolve())]
+        if args.burp_proxy_port:command+=['--proxy-port',str(args.burp_proxy_port),'--bridge-port',str(args.burp_bridge_port)]
+        if args.burp_ca:command+=['--ca',str(Path(args.burp_ca).resolve())]
+        result,_=sudo_checked(command);line(json.dumps(result,ensure_ascii=False,indent=2));return result
+
+
 def op_hosts(args):
     with connect() as db:
         target = configure(db, args.task_id, args)
@@ -3206,6 +3218,11 @@ def parser_main():
     callback.add_argument('--interface',required=True);callback.add_argument('--advertise')
     callback.add_argument('--reason',required=True)
     callback.add_argument('--attempt-limit',type=int,choices=range(1,11),help='Явное изменение общего лимита вариантов этой трассы (по умолчанию 3)')
+    browser=sub.add_parser('browser-config',help='Настроить Playwright/Chromium и необязательный task-local Burp; не запускает браузер/цель')
+    browser.add_argument('task_id',type=int);browser.add_argument('--runtime',required=True)
+    browser.add_argument('--chromium',default='/usr/lib/chromium/chromium')
+    browser.add_argument('--burp-proxy-port',type=int,default=0);browser.add_argument('--burp-bridge-port',type=int,default=17779)
+    browser.add_argument('--burp-ca')
     status = sub.add_parser('status', help='Показать краткий отчёт')
     status.add_argument('task_id', type=int)
     close = sub.add_parser('close', help='Удалить NetGuard правила и namespace')
@@ -3540,6 +3557,7 @@ def main():
         elif args.command == 'status': op_status(args)
         elif args.command == 'questions': op_questions(args)
         elif args.command == 'callback-config':op_callback_config(args)
+        elif args.command == 'browser-config':op_browser_config(args)
         elif args.command == 'http-artifacts': op_http_artifacts(args)
         elif args.command == 'http-reparse': op_http_reparse(args)
         elif args.command == 'http-policy': op_http_policy(args)

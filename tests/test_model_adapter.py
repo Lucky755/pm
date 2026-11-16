@@ -93,7 +93,8 @@ class AdapterTests(unittest.TestCase):
         with patch.object(check_environment,'version',return_value='other-version'):
             result=check_environment.check()
         self.assertFalse(result['compatible'])
-        self.assertEqual(len([e for e in result['errors'] if e.startswith('untested_version:')]),4)
+        self.assertEqual({e for e in result['errors'] if e.startswith('untested_version:')},
+                         {'untested_version:'+name for name in check_environment.EXPECTED})
         self.assertFalse(list(self.root.iterdir()))
 
 
