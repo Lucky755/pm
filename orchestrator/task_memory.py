@@ -242,6 +242,21 @@ def source_state(db,task_id,capability_log):
             'sha256':artifact['sha256'],'bytes':artifact['bytes_saved'],'target':target,
             'path':artifact['path'],'port':artifact['port'],'complete':artifact['complete'],
             'source':{'table':'pm_http_artifacts','id':artifact['id']}})
+    for item in rows(db,'pm_file_materials',task_id):
+        ref='file_material:'+str(item['id']);metadata=json.loads(item['metadata_json'])
+        put('materials',ref,{'kind':'file_material','sha256':item['sha256'],'bytes':item['bytes'],
+            'name':item['name'],'complete':bool(item['complete']),'metadata':metadata,
+            'source_ref':item['source_ref'],'parent_id':item['parent_id'],'fresh_observation':False})
+        put('relations','derived:'+ref,{'from':ref,'to':item['source_ref'],'kind':'local_material_derivation','fresh_observation':False})
+        for index,candidate in enumerate(metadata.get('credential_candidates',[])):
+            put('credentials',ref+':candidate:'+str(index),{**candidate,'material_ref':ref,'trust':'candidate','access_implied':False})
+    for item in rows(db,'pm_material_processing',task_id):
+        result=json.loads(item['result_json']);ref='material_processing:'+str(item['id'])
+        put('checks',ref,{'phase':'finished','outcome':item['status'],'input_ref':item['input_ref'],
+            'input_sha256':item['input_sha256'],'complete':result['complete'],'kind':result['kind'],
+            'errors':result.get('errors',[]),'fresh_observation':False})
+        for index,relation in enumerate(result.get('relations',[])):
+            put('relations',ref+':'+str(index),relation)
     for session in rows(db,'pm_http_sessions',task_id):
         put('sessions','web_session:'+session['name'],{'kind':'http','name':session['name'],
             'version':session['version'],'active_exchange_id':session['active_exchange_id'],
@@ -386,6 +401,9 @@ def material(db,task_id,reference,capability_log):
     found=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()
     if not found:raise ValueError('Unknown task')
     target=found[0]
+    if re.fullmatch(r'file_material:\d+',reference):
+        from orchestrator import material_processing
+        return material_processing.load(db,task_id,reference)
     if re.fullmatch(r'result:[\w-]+',reference):
         record=next((r for r in capability_records(task_id,capability_log,target) if 'result:'+r['id']==reference),None)
         if record:return capability_text(record).encode()
@@ -511,7 +529,7 @@ def context(db,task_id,capability_log,*,references=(),question=''):
     materials=source.pop('materials');relevant=[]
     tokens=set(re.findall(r'[\w./:-]{3,}',question.casefold()))
     for ref,item in materials.items():
-        rank=0 if ref in references else 1 if tokens & set(re.findall(r'[\w./:-]{3,}',str(item.get('summary',item.get('path',''))).casefold())) else 2
+        rank=0 if ref in references else 1 if tokens & set(re.findall(r'[\w./:-]{3,}',str(item.get('summary',item.get('name',item.get('path','')))).casefold())) else 2
         if rank<2:relevant.append((rank,ref,item))
     chunks=[]
     for _,ref,item in sorted(relevant)[:4]:

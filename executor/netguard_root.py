@@ -93,6 +93,10 @@ CALLBACK_DIR = Path('/var/lib/pentest-master/callbacks')
 TOOL_PROTOCOL = 1
 TOOL_MAX_BYTES = 16 * 1024 * 1024
 SYSTEM_TOOLS = {'nmap': '/usr/bin/nmap', 'curl': '/usr/bin/curl', 'jq': '/usr/bin/jq'}
+SYSTEM_TOOLS.update({'file':'/usr/bin/file','git':'/usr/bin/git','binutils':'/usr/bin/objdump',
+    'poppler-utils':'/usr/bin/pdftotext','tesseract-ocr':'/usr/bin/tesseract',
+    'tesseract-ocr-eng':'/usr/share/tesseract-ocr/5/tessdata/eng.traineddata',
+    'tesseract-ocr-rus':'/usr/share/tesseract-ocr/5/tessdata/rus.traineddata'})
 APT_CACHE = Path('/var/cache/apt/archives')
 TOOL_ENV = {'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','DEBIAN_FRONTEND':'noninteractive'}
 RAW_SCAN_PROFILES = ('nmap_syn', 'nmap_udp', 'nmap_os')
@@ -248,6 +252,8 @@ def tool_prepare(task, raw):
         manifest.update(destination=SYSTEM_TOOLS[spec['name']], invocation=[SYSTEM_TOOLS[spec['name']]],
             privileges='root: configured APT package and listed dependencies, including package scripts; no arbitrary PoC',
             actions=['download listed archives, verify SHA256', 'APT install exact version with --no-download in a networkless namespace'])
+        if spec['name'] in ('tesseract-ocr-eng','tesseract-ocr-rus'):
+            manifest['invocation']=['/usr/bin/tesseract','-l',spec['name'].rsplit('-',1)[1]]
     else:
         relative = ('docs' if spec['kind'] == 'documentation' else 'tools')+'/'+spec['name']+'/'+spec['filename']
         invocation = [] if spec['kind'] == 'documentation' else (

@@ -87,6 +87,12 @@ pm_task_memory to page the complete index/state and pm_material_read for relevan
 original byte ranges. Preserve the original reference/hash. Report only actually
 supplied/analyzed ranges in material_analysis; delivery is not analysis, and
 agent-reported analysis is not a new target observation or proof of a claim.
+For supplied files use pm_material_process to select processing from actual
+bytes, not the extension or guessed binary contents. Read derived materials
+with their original source chain. A further useful file from the same repository
+does not require a repeated disclosure checkpoint. Report credential candidates
+as candidates until a permitted check proves server acceptance/access. A flag
+candidate from any file/transport follows the saved operator confirmation queue.
 An asset dead on this address needs new evidence before rechecking. An inherited
 dead asset is only a prior-address hint; a scoped recheck must identify the open
 hypothesis it tests and obey the executor's single-recheck gate.

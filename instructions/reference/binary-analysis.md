@@ -14,3 +14,9 @@ and ACCESS prompt. It is not connected automatically to a profile. No universal
 binary exploitation procedure or particular offsets/layouts have been verified
 by PM's offline tests. Develop and validate a specialized procedure separately
 before adding it to the active catalog.
+
+The separate material-analysis profile now provides tested static binutils
+structure/disassembly and preserved source links. Ghidra is a suitable optional
+reverse engineering/decompilation tool; Hydra tests network authentication and
+is never an alternative binary analyzer. The local processor does not execute
+specimens or claim exploitability from strings/disassembly alone.

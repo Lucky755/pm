@@ -133,7 +133,7 @@ Finish with ONE JSON object and no other text:
                   "cost": "0 local read | 1 one scoped request | 2 multi-step | 3 unknown",
                   "reason": "required for dropped"}],
   "probe": {"result_id": "verify direct probe or original saved capture result ID",
-            "artifact_ref": "http_artifact:ID for local audit, otherwise empty",
+            "artifact_ref": "http_artifact:ID or file_material:ID for local audit, otherwise empty",
             "quote": "exact saved body excerpt for a local audit without findings"},
   "access_level": "none|exec|user|privileged",
   "access_signal": "none|credential|execution|shell",
@@ -1712,6 +1712,12 @@ def report_probe_records(task_id):
                                                  ('task_id','target','status','exit_code','artifact_id','error_type','server_outcome','status_code','question_id')
                                                  if key in result}},
                 }
+                if record.get('tool') in ('material_process','material_import'):
+                    items=result.get('outputs',[]) if record['tool']=='material_process' else [result.get('material') or {}]
+                    records[record.get('id')]['capture_record']['result'].update(
+                        processing_id=result.get('processing_id'),material_refs=[
+                            {k:item[k] for k in ('reference','sha256','bytes') if k in item}
+                            for item in items if isinstance(item,dict)])
     except FileNotFoundError:
         pass
     return records
@@ -1735,6 +1741,19 @@ def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *,
         finding.pop('verification_status',None)
         probe = finding.get('probe') if isinstance(finding.get('probe'), dict) else {}
         result_id=probe.get('result_id')
+        artifact_ref=finding.get('artifact_ref') or probe.get('artifact_ref')
+        if isinstance(artifact_ref,str) and artifact_ref.startswith('file_material:'):
+            from orchestrator import material_processing
+            audit,error=material_processing.audit(db,task_id,(all_records.get(result_id,{}) if isinstance(result_id,str) else {}).get('capture_record'),
+                artifact_ref,finding.get('quote'),CAPABILITY_LOG/f'task_{task_id}.jsonl')
+            if finding.get('result_id') not in (None,'',result_id) or probe.get('artifact_ref') not in (None,'',artifact_ref):
+                audit,error=None,'material_audit_conflicting_references'
+            if audit:
+                finding.update(evidence_reused=True,verification_status='local_audit',result_id=result_id,
+                    artifact_ref=artifact_ref,verification_warning='Проверена цитата локального материала; это не новое наблюдение и не подтверждение доступа/интерпретации.')
+                accepted.append(finding);local_audits.append(audit)
+            else:unverified.append({**finding,'verification_status':'untested','verification_reason':error})
+            continue
         if role=='verify' and isinstance(result_id,str) and result_id in prior_ids:
             artifact_ref=finding.get('artifact_ref') or probe.get('artifact_ref')
             audit,error=flag_evidence.audit_saved_capture(db,task_id,result_id,
@@ -1794,8 +1813,13 @@ def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *,
         probe = report.get('probe') or {}
         record = records.get(probe.get('result_id')) if isinstance(probe.get('result_id'), str) else None
         result_id=probe.get('result_id')
-        audited=False
-        if isinstance(result_id,str) and result_id in prior_ids:
+        audited=any(item['result_id']==result_id and probe.get('artifact_ref') in (None,'',item['artifact_ref']) for item in local_audits)
+        if isinstance(probe.get('artifact_ref'),str) and probe['artifact_ref'].startswith('file_material:'):
+            from orchestrator import material_processing
+            audit,error=material_processing.audit(db,task_id,(all_records.get(result_id,{}) if isinstance(result_id,str) else {}).get('capture_record'),
+                probe['artifact_ref'],probe.get('quote'),CAPABILITY_LOG/f'task_{task_id}.jsonl')
+            if audit:local_audits.append(audit);audited=True
+        elif isinstance(result_id,str) and result_id in prior_ids:
             if probe.get('quote'):
                 audit,error=flag_evidence.audit_saved_capture(db,task_id,result_id,
                     all_records.get(result_id,{}).get('capture_record'),probe['quote'],probe.get('artifact_ref'))

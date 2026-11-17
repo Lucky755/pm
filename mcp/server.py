@@ -770,7 +770,7 @@ def capability_provenance(tool, payload, command):
     if tool in ('session', 'network_probe', 'privileged_scan', 'http_get', 'http_headers',
                 'http_path', 'http_document', 'http_capture'):
         return 'network'
-    if tool in ('write_poc', 'read_file', 'grep', 'unpack', 'capability_read', 'tool_request', 'tool_acquire'):
+    if tool in ('write_poc', 'read_file', 'grep', 'unpack', 'capability_read', 'tool_request', 'tool_acquire','material_process','material_import'):
         return 'local'
     return 'unknown'
 
@@ -1222,6 +1222,65 @@ def pm_material_read(task_id:int,reference:str,offset:int=0,limit:int=4096,sha25
         return tool_response({'status':'completed','provenance':'local_read',**chunk})
     except (sqlite3.Error,ValueError,OSError) as exc:
         return tool_response({'status':'blocked','error_type':type(exc).__name__})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_material_import(task_id:int,path:str)->str:
+    """Snapshot one regular task-workspace file (<=64 MiB), never a host path.
+
+    Source bytes are preserved. Directories can be supplied as a saved archive;
+    no checkout, specimen execution, remote Git clone or submodule/LFS fetch.
+    """
+    from orchestrator import material_processing as files
+    from executor.netguard_root import WORK_BASE
+    try:
+        if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):raise ValueError('Wrong task')
+        parts=path.split('/')
+        if not path or len(path)>4096 or any(p in ('','..','.') for p in parts):raise ValueError('Expected a relative workspace file')
+        directory=os.open(WORK_BASE/str(task_id),os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:
+            for component in parts[:-1]:
+                child=os.open(component,os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory);os.close(directory);directory=child
+            fd=os.open(parts[-1],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+            with os.fdopen(fd,'rb') as stream:
+                info=os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid():raise ValueError('Unsafe workspace file')
+                data=stream.read(files.MAX_BYTES+1)
+        finally:os.close(directory)
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            item=files.save(db,task_id,data,name=path,source_ref='workspace:'+path,metadata={'origin':'workspace_snapshot','network_origin':'unknown'})
+            task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='material_import');db.commit()
+        payload={'status':'completed','task_id':task_id,'material':item,'fresh_observation':False}
+    except (ValueError,OSError,sqlite3.Error) as exc:payload={'status':'blocked','reason':str(exc)[:200],'execution_started':False}
+    rid=log_capability('material_import',task_id,payload,0)
+    return tool_response({**payload,'result_id':rid})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_material_process(task_id:int,reference:str,operation:str='auto',options_json:str='{}')->str:
+    """Actual-type local text/archive/PDF/OCR/static-binary/Git processing.
+
+    options: encoding, object_id, ocr, language, page_start/page_end (<=8 OCR
+    pages), related:[{reference,path}] for original Git pack/index/loose data.
+    No network, supplied executable execution, checkout, LFS/submodule fetch.
+    Missing supported analyzers request the operator through pm_tool_request.
+    Read outputs by file_material:ID with pm_material_read; local derivations
+    do not establish working credentials, access, flags or independent evidence.
+    """
+    from orchestrator import material_processing as files
+    try:
+        if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):raise ValueError('Wrong task')
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            payload=files.process(db,task_id,reference,CAPABILITY_LOG/f'task_{task_id}.jsonl',operation=operation,options=json.loads(options_json))
+            task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='material_processing');db.commit()
+        if payload.get('required_tool'):
+            request=json.loads(pm_tool_request(task_id,json.dumps(payload['required_tool'])))
+            payload['operator_question']={k:request.get(k) for k in ('status','question_id','tool_request','reason_category','error')}
+    except (ValueError,OSError,sqlite3.Error) as exc:payload={'status':'blocked','reason':str(exc)[:200],'execution_started':False}
+    rid=log_capability('material_process',task_id,payload,0)
+    return tool_response({**payload,'result_id':rid})
 
 
 @mcp.tool()

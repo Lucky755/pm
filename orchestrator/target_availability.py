@@ -13,7 +13,8 @@ from orchestrator import diagnostics
 
 STATES=('active','temporary_error','services_unavailable','confirmed_unavailable','deactivated')
 LOCAL_TOOLS=frozenset(('pm_capability_read','pm_evidence_index','pm_task_memory','pm_material_read',
-    'pm_http_read','pm_browser_read','pm_observations','pm_worknote','pm_tool_status','pm_tool_read','pm_port_status'))
+    'pm_http_read','pm_browser_read','pm_observations','pm_worknote','pm_tool_status','pm_tool_read','pm_port_status',
+    'pm_material_process','pm_material_import','pm_tool_request'))
 
 def initialize(db):
     db.execute('''CREATE TABLE IF NOT EXISTS pm_target_availability (

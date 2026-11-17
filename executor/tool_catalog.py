@@ -331,6 +331,9 @@ sed|sed|processing|local_read|Text transformation
 awk|awk|processing|local_read|Text processing
 find|find|processing|local_read|File discovery
 file|file|processing|local_read|File identification
+pdftotext|pdftotext|processing|local_read|PDF text extraction (Poppler)
+pdftoppm|pdftoppm|processing|local_read|PDF page rendering (Poppler)
+tesseract|tesseract|processing|local_read|OCR transcription (requires language data)
 sha256sum|sha256sum|processing|local_read|File hashing
 7z|7z,7zz|processing|local_read|Archive inspection
 unzip|unzip|processing|local_read|ZIP extraction

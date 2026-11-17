@@ -53,6 +53,7 @@
 | http-surface | http-capture | свежий HTTP с method/body/web-session, capture и чтение/память, без net_exec/PoC/PTY | 6 / 1 / 8192 |
 | browser-web | browser-web | JS open/fill/click/wait/read, отдельный пользователь/владелец, HTTP и пассивный Burp; без net_exec/PoC/PTY | 12 / 1 / 8192 |
 | saved-analysis | saved-analysis | сохранённые материалы/память/заметки/port status, без сети и session reconciliation | 6 / 1 / 8192 |
+| material-analysis | material-analysis | локальная обработка сохранённых файлов, чтение/память/вопрос инструмента, без сети/PoC/PTY | 8 / 1 / 8192 |
 | capture-audit | capture-audit | только чтение сохранённых данных и заметки, без GET | 4 / 1 / 8192 |
 | access-triage | access-triage | net_exec/session и чтение/память, без PoC/research/callback | 8 / 1 / 8192 |
 
@@ -91,6 +92,10 @@ pm_net_exec отсутствуют; навязанный вызов pm_session �
 [reference/binary-analysis.md](reference/binary-analysis.md) — тематическая
 справка вместо прежних общих CTF-эвристик. Она не подключается к активному
 профилю и не называется проверенной эксплуатационной процедурой.
+Новый material-analysis подключает отдельную проверенную процедуру
+[локальной обработки](procedures/material-analysis.md): реальные binutils/Git/
+Poppler; optional OCR требует установленного Tesseract и языков. Saved-analysis
+также может обрабатывать сохранённые файлы и запрашивать недостающий анализатор.
 
 ACCESS и использование материалов внутри задания не требуют отдельного
 одобрения; специальный классификатор находок отключён как gate. Новые кандидаты

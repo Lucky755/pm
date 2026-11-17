@@ -184,7 +184,10 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
     for section in ('port_states','port_availability'):
         values=semantic_set({k:r[k] for k in ('protocol','port','state')} for r in inventory[section] if r['state']!='unchecked')
         if values:port_knowledge[section]=values
-    return {'version':2,**port_knowledge,**({'operator_answers':semantic_set(answers)} if answers else {}),
+    local_materials=semantic_set({'sha256':item['sha256'],'complete':bool(item['complete'])}
+        for item in task_memory.rows(db,'pm_file_materials',task_id))
+    return {'version':2,**port_knowledge,**({'local_materials':local_materials} if local_materials else {}),
+            **({'operator_answers':semantic_set(answers)} if answers else {}),
             **({'tools':semantic_set(tools)} if tools else {}),
             **({'flag_reviews':semantic_set(proposals)} if proposals else {}),**resource_state,'intent':context['intent'],'target':context['target'],
             'goals':[{k:g.get(k) for k in ('key','title','role','weight','status')} for g in goals['objectives']],
