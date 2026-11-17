@@ -23,7 +23,8 @@ EVENT_DIR = Path(__file__).resolve().parents[1] / 'storage/run_events'
 _context = ContextVar('pm_diagnostics', default=None)
 _action = ContextVar('pm_diagnostic_action', default=None)
 _secrets = set()
-_relay_runs = set()
+_relay_runs = {}
+_relay_lock = threading.Lock()
 ENV_KEYS = ('PM_RUN_ID', 'PM_EVENT_DIR', 'PM_ACTION_ID', 'PM_TASK_ID',
             'PM_ROLE', 'PM_ITERATION', 'PM_EVENT_CONTEXT_FILE')
 
@@ -562,43 +563,38 @@ class Observer:
 
 @contextmanager
 def relay():
-    """Render MCP events while a synchronous SDK request is in progress."""
-    ctx = context()
-    if ctx['run_id'] in _relay_runs:
-        yield
-        return
-    _relay_runs.add(ctx['run_id'])
-    seen = {e['event_id'] for e in read_events(ctx)}
-    stop = threading.Event()
-    def poll():
-        while True:
-            for event in read_events(ctx):
-                if event['event_id'] not in seen:
-                    seen.add(event['event_id'])
-                    if event.get('visible'):
-                        display(event)
-            if stop.wait(0.1):
-                break
-    thread = threading.Thread(target=poll, daemon=True)
-    try:
-        thread.start()
-    except RuntimeError as exc:
-        _relay_runs.discard(ctx['run_id'])
-        warning(exc)
-        yield
-        return
-    try:
-        yield
+    """One reference-counted console relay per manual run, including workers."""
+    ctx=context();run_id=ctx['run_id']
+    with _relay_lock:
+        state=_relay_runs.get(run_id)
+        if state:
+            state['users']+=1
+        else:
+            state={'users':1,'seen':{e['event_id'] for e in read_events(ctx)},'stop':threading.Event()}
+            def drain():
+                for event in read_events(ctx):
+                    if event['event_id'] not in state['seen']:
+                        state['seen'].add(event['event_id'])
+                        if event.get('visible'):display(event)
+            def poll():
+                while True:
+                    drain()
+                    if state['stop'].wait(.1):break
+            state.update(drain=drain,thread=threading.Thread(target=poll,daemon=True))
+            try:state['thread'].start()
+            except RuntimeError as exc:warning(exc);state=None
+            if state:_relay_runs[run_id]=state
+    try:yield
     finally:
-        stop.set()
-        thread.join()
-        for event in read_events(ctx):
-            if event['event_id'] not in seen and event.get('visible'):
-                display(event)
-        _relay_runs.discard(ctx['run_id'])
+        if state:
+            with _relay_lock:
+                state['users']-=1
+                if not state['users']:
+                    state['stop'].set();state['thread'].join();state['drain']()
+                    _relay_runs.pop(run_id,None)
 
 
-def model_call(session, prompt, *, diagnostic_reason=None, **kwargs):
+def model_call(session, prompt, *, diagnostic_reason=None, event_context_file=None, **kwargs):
     if not active():
         return session.run(prompt, **kwargs)
     if diagnostic_reason == 'json_repair':
@@ -607,7 +603,7 @@ def model_call(session, prompt, *, diagnostic_reason=None, **kwargs):
         if '\nCompact history (full outputs stay stored by result_id):' in prompt:
             emit('context.switch', reason='request_uses_compact_history', representation='compact')
         # The environment handed to an already running MCP process is immutable.
-        path = os.environ.get('PM_EVENT_CONTEXT_FILE') or child_env()['PM_EVENT_CONTEXT_FILE']
+        path = event_context_file or os.environ.get('PM_EVENT_CONTEXT_FILE') or child_env()['PM_EVENT_CONTEXT_FILE']
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             temp = Path(path + '.tmp')

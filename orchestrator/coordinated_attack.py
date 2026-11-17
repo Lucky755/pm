@@ -77,7 +77,7 @@ def ensure_schema(db):
             details_json TEXT NOT NULL, created_at TEXT NOT NULL);
     ''')
     columns = {r[1] for r in db.execute('PRAGMA table_info(pm_coordinator_steps)')}
-    for column in ('knowledge_before_sha256','knowledge_after_sha256','assignment_json','report_reviewed_at'):
+    for column in ('knowledge_before_sha256','knowledge_after_sha256','assignment_json','report_reviewed_at','runtime_sessions_json','cancel_requested_at'):
         if column not in columns:
             db.execute(f'ALTER TABLE pm_coordinator_steps ADD COLUMN {column} TEXT')
     checkpoints.initialize(db)
@@ -152,6 +152,8 @@ def knowledge_state(db, task_id, context, mapped, essential, goals, results, con
         "AND status IN ('confirmed','refuted') AND probe_result_id<>'' AND quote<>''",(task_id,))]
     assets = [list(row) for row in db.execute(
         'SELECT kind,key,status,evidence_quote,origin_target,objective_key FROM pm_assets WHERE task_id=?',(task_id,))]
+    assets.extend(['published_candidate',key,value] for key,value in task_memory.current(db,task_id)['state']['credentials'].items()
+        if not value.get('source_owned'))
     triage = {key:{k:value[k] for k in ('summary','quote')}
               for key,value in essential['triage']['categories'].items()}
     services = [{**{k:entry[k] for k in ('target','protocol','port','state')},
@@ -274,6 +276,7 @@ def snapshot(db, task_id, expect):
     success = stop in ('flag_confirmed','goal_confirmed','objectives_done')
     knowledge = knowledge_state(db,task_id,context,mapped,essential,goals,results,confirmed)
     memory=task_memory.context(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
+    for ref,value in memory['state']['credentials'].items():refs.setdefault(ref,value)
     for ref,value in memory['material_index'].items():refs.setdefault(ref,value)
     budget_state=research_budgets.listing(db,task_id)
     from orchestrator import check_series
@@ -309,8 +312,9 @@ def parse_decision(value, state, roles):
     if not isinstance(decision, dict) or not FIELDS<=set(decision) or set(decision)-FIELDS-OPTIONAL_FIELDS:
         raise DecisionRejected('decision_fields', missing=sorted(FIELDS-set(decision)) if isinstance(decision,dict) else sorted(FIELDS),
                                unexpected_count=len(set(decision)-FIELDS) if isinstance(decision,dict) else 0)
-    if decision['action'] not in ('run_role','wait_operator','stop'):
+    if decision['action'] not in ('run_role','wait_operator','stop','await_specialists'):
         raise ValueError('decision_action')
+    if decision['action']=='await_specialists' and not state.get('active_specialists'):raise ValueError('no_active_specialists')
     for field, limit in (('question',1200),('reason',500),('expected_result',600)):
         if not isinstance(decision[field], str) or not decision[field].strip() or len(decision[field]) > limit:
             raise DecisionRejected('decision_' + field, field=field, character_limit=limit)
@@ -430,6 +434,9 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             "When target_availability.network_allowed is false, use saved-analysis only: a concrete local question over saved materials, no fresh probes. One useful local result is followed by waiting for restoration. "
             "Interpret unusual responses from saved bytes; missing fixed-rule classification is not a stop reason. "
             "Choose exactly ONE concrete question for ONE allowed role/profile, enqueue a necessary operator question, or stop. "
+            "When active_specialists is supplied, independent service branches may run concurrently. Never duplicate active work. "
+            "Use action=await_specialists with role/profile/stop_kind=null to await useful running specialists without an operator question. "
+            "Publish discovered credential candidates through pm_publish_candidate; candidates are data, not access. VERIFY resolves a specific ambiguity only. "
             "Operator questions are only pivoting, tool installation/acquisition or documentation, budget, flag_confirmation. "
             "Use branch_id=service reference with boundaries.resource_refs=[branch_id] for a resource branch, or task for a global dependency. "
             "Pending questions block only their branch; continue useful independent service branches within budgets. "
@@ -450,7 +457,7 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             "previous_steps separates report quality from execution_outcome. operator_requested_replan with "
             "not_started and no approval is a cancellation before execution, not an SSH failure. "
             "Return ONLY JSON with exactly these fields: "
-            '{"action":"run_role|wait_operator|stop","role":"recon|vuln|access|verify or null",'
+            '{"action":"run_role|wait_operator|stop|await_specialists","role":"recon|vuln|access|verify or null",'
             '"profile":"registered specialist profile for run_role, otherwise null",'
             '"boundaries":{"task_id":"current task integer","target":"current saved target",'
             '"intent_ref":"intent","resource_refs":["one or more known_resources keys"]},'
@@ -492,7 +499,7 @@ def steps(db, task_id):
 
 def update_step(db, step_id, status, **fields):
     values = {'status':status,'updated_at':now(),**fields}
-    with db:
+    with task_memory.atomic(db):
         db.execute('UPDATE pm_coordinator_steps SET ' + ','.join(key+'=?' for key in values) + ' WHERE id=?',
                    (*values.values(), step_id))
         tid=db.execute('SELECT task_id FROM pm_coordinator_steps WHERE id=?',(step_id,)).fetchone()[0]
@@ -501,7 +508,7 @@ def update_step(db, step_id, status, **fields):
 
 
 def insert_step(db, run_id, task_id, decision, state, budgets, status='planned', error=''):
-    with db:
+    with task_memory.atomic(db):
         step_no = db.execute('SELECT COALESCE(MAX(step_no),0)+1 FROM pm_coordinator_steps WHERE task_id=?', (task_id,)).fetchone()[0]
         iteration = None
         if decision.get('action') == 'run_role':
@@ -605,6 +612,7 @@ def step_view(row):
             'report_state':('saved' if row.get('report_path') and os.path.isfile(row['report_path']) else
                             'missing' if row.get('report_path') else 'reserved' if row.get('report_iteration') else 'none'),
             'approved_at':row.get('approved_at'),'report_quality':row.get('report_quality'),
+            'runtime_sessions':json.loads(row.get('runtime_sessions_json') or '[]'),'cancel_requested_at':row.get('cancel_requested_at'),
             'report_reviewed_at':row.get('report_reviewed_at'),'raw_report_path':row.get('raw_report_path'),
             'execution_outcome':report_integrity.step_execution(row),
             'report_consistency':row.get('report_consistency'),
@@ -621,6 +629,7 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
                     ('decision_budget_exhausted:','invalid_saved_transition')) else {}),
             'status':status, 'succeeded':state['success_verified'] and status=='completed',
             'task_id':task_id,'coordinator_run_id':run_id,'stop_reason':reason,
+            'specialist_limit':state.get('specialist_limit',1),
             'expected_flags':expect,'confirmed_flags':state['confirmed_flags'],
             'target_availability':state['target_availability'],
             'research_budgets':research_budgets.listing(db,task_id),'directions':state.get('directions',[]),
@@ -631,11 +640,76 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
             'steps':[step_view(row) for row in rows]}
 
 
+def complete_specialist(db,task_id,run_id,step_id,decision,iteration,expect_flags,*,branch_local=False):
+    raw=db.execute('SELECT report_json,role FROM pm_agent_action_reports WHERE task_id=? AND role=? AND iteration=?',
+                   (task_id,decision['role'],iteration)).fetchone()
+    if not raw:
+        raise RuntimeError('Role returned without a saved report')
+    report=json.loads(raw[0])
+    if report_integrity.quality(report)['status']=='damaged':
+        state=snapshot(db,task_id,expect_flags)
+        unknown=(report.get('execution_outcome') or {}).get('status','unknown')=='unknown'
+        update_step(db,step_id,'failed',report_path=report.get('report_path'),
+                    error='report_damaged',outcome_uncertain=int(unknown),
+                    knowledge_after_sha256=state['knowledge_sha256'])
+        with db:
+            db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
+        diagnostics.emit('coordinator.pause',step_id=step_id,reason='report_damaged',
+                         reason_category='report_format',report_path=report.get('report_path'),
+                         raw_report_path=report.get('raw_report_path'),
+                         execution_outcome=report.get('execution_outcome'))
+        return state,'role_report_damaged_requires_review'
+    if report.get('stage_aborted'):
+        raise RuntimeError('Role saved only an aborted report')
+    if report.get('report_incomplete'):
+        state=snapshot(db,task_id,expect_flags)
+        unknown=(report.get('execution_outcome') or {}).get('status','unknown')=='unknown'
+        update_step(db,step_id,'failed',report_path=report.get('report_path'),
+                    error='report_incomplete',outcome_uncertain=int(unknown),
+                    knowledge_after_sha256=state['knowledge_sha256'])
+        with db:
+            db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
+        diagnostics.emit('coordinator.pause',step_id=step_id,coordinator_run_id=run_id,
+                         reason='report_incomplete',report_path=report.get('report_path'),outcome_uncertain=unknown,
+                         reason_summary='Отчёт неполон или противоречив; требуется проверка оператором. Исход исполнения сохранён отдельно.')
+        return state,'role_report_incomplete_requires_review'
+    from orchestrator import check_series
+    unknown_checks=[d for d in check_series.state(db,task_id) if d['state']=='unknown' and
+        (not branch_local or not d['plan_step'] or d['plan_step']==step_id)]
+    if unknown_checks:
+        state=snapshot(db,task_id,expect_flags)
+        update_step(db,step_id,'failed',report_path=report.get('report_path'),
+            error='internal_check_outcome_unknown',outcome_uncertain=1,knowledge_after_sha256=state['knowledge_sha256'])
+        with db:db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
+        diagnostics.emit('coordinator.pause',task_id=task_id,step_id=step_id,
+            reason='internal_check_outcome_unknown',identifiers={'direction_ids':[d['id'] for d in unknown_checks]})
+        return state,'internal_check_outcome_unknown'
+    dependencies=[q for q in operator_questions.listing(db,task_id,pending=True)
+        if q['id'] in report.get('operator_dependencies',[]) and (q.get('tool_request') or q.get('pivot_request') or q.get('budget_request'))]
+    if dependencies:
+        with db:
+            for question in dependencies:
+                db.execute('UPDATE pm_operator_questions SET step_id=? WHERE id=? AND step_id IS NULL',(step_id,question['id']))
+        state=snapshot(db,task_id,expect_flags)
+        update_step(db,step_id,'waiting_operator',report_path=report.get('report_path'),
+            error='budget_dependency_pending' if any(q.get('budget_request') for q in dependencies) else 'tool_dependency_pending',outcome_uncertain=0,knowledge_after_sha256=state['knowledge_sha256'])
+        if not operator_questions.available(state):return state,'operator_questions_pending'
+        return state,None
+    registry=flag_verify.scan(task_id,db=db)
+    objectives.process_report(db,task_id,report,registry)
+    flag_review.reconcile(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
+    state=snapshot(db,task_id,expect_flags)
+    update_step(db,step_id,'completed',report_path=report.get('report_path'),
+                knowledge_after_sha256=state['knowledge_sha256'])
+    return state,None
+
+
 @diagnostics.stage
 def run(task_id, *, roles=actions.ROLES, max_steps=15, decision_retries=1,
         poc_budget=15, step_limit=25, max_tokens=None, expect_flags=2, api_key=None,
         key_provider=None, continue_run=False, approve_step=None, abandon_running_step=None,
-        model=None, role_runner=None):
+        model=None, role_runner=None, max_specialists=None):
+    if max_specialists is not None and (type(max_specialists) is not int or not 1<=max_specialists<=10):raise ValueError('Specialist concurrency must be 1..10')
     if not 1 <= max_steps <= MAX_STEPS or not 0 <= decision_retries <= MAX_RETRIES:
         raise ValueError('Coordinator budget out of range')
     if approve_step is not None:
@@ -684,7 +758,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=15, decision_retries=1,
             cursor = db.execute('SELECT id,target,status,stop_reason,pause_step_id FROM pm_coordinator_runs WHERE task_id=?',(task_id,))
             run_id,target,run_status,old_reason,pause_id = cursor.fetchone()
             def finish(reason,status='completed'):
-                return result_view(db,run_id,task_id,state,expect_flags,reason,status)
+                return result_view(db,run_id,task_id,{**state,'specialist_limit':max_specialists or 1},expect_flags,reason,status)
             if state['success_verified']:
                 return finish(state['verified_stop_reason'])
             if target != state['task']['target']:
@@ -708,6 +782,8 @@ def run(task_id, *, roles=actions.ROLES, max_steps=15, decision_retries=1,
                     return finish('interrupted_running_step','waiting_operator')
                 update_step(db,running['id'],'failed',outcome_uncertain=1,error='operator_abandoned_unknown_outcome')
                 diagnostics.emit('coordinator.pause_resolved', step_id=running['id'], reason='operator_reviewed_unknown_outcome')
+                if any(row['status']=='running' for row in steps(db,task_id)):
+                    return finish('interrupted_running_step','waiting_operator')
             elif abandon_running_step is not None:
                 raise ValueError('No matching running step')
             # A question step is an intent to ask, never an executed specialist.
@@ -738,6 +814,10 @@ def run(task_id, *, roles=actions.ROLES, max_steps=15, decision_retries=1,
                 return finish(old_reason,'waiting_operator')
             with db:
                 db.execute("UPDATE pm_coordinator_runs SET status='running',pause_step_id=NULL WHERE id=?",(run_id,))
+            if max_specialists is not None:
+                from orchestrator import specialist_workflow
+                return specialist_workflow.drive(db,task_id,run_id,roles,budgets,max_steps,decision_retries,
+                    expect_flags,model,key,role_runner,max_specialists)
             for _ in range(max_steps):
                 state = snapshot(db,task_id,expect_flags)
                 if state['success_verified']:return finish(state['verified_stop_reason'])
@@ -867,65 +947,8 @@ def run(task_id, *, roles=actions.ROLES, max_steps=15, decision_retries=1,
                     role_runner(task_id,decision['role'],decision['question'],iteration,
                                 effective['poc_budget'],effective['step_limit'],api_key=key(),max_tokens=effective['max_tokens'],
                                 assignment=assignment)
-                    raw=db.execute('SELECT report_json,role FROM pm_agent_action_reports WHERE task_id=? AND role=? AND iteration=?',
-                                   (task_id,decision['role'],iteration)).fetchone()
-                    if not raw:
-                        raise RuntimeError('Role returned without a saved report')
-                    report=json.loads(raw[0])
-                    if report_integrity.quality(report)['status']=='damaged':
-                        state=snapshot(db,task_id,expect_flags)
-                        unknown=(report.get('execution_outcome') or {}).get('status','unknown')=='unknown'
-                        update_step(db,step_id,'failed',report_path=report.get('report_path'),
-                                    error='report_damaged',outcome_uncertain=int(unknown),
-                                    knowledge_after_sha256=state['knowledge_sha256'])
-                        with db:
-                            db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
-                        diagnostics.emit('coordinator.pause',step_id=step_id,reason='report_damaged',
-                                         reason_category='report_format',report_path=report.get('report_path'),
-                                         raw_report_path=report.get('raw_report_path'),
-                                         execution_outcome=report.get('execution_outcome'))
-                        return finish('role_report_damaged_requires_review','waiting_operator')
-                    if report.get('stage_aborted'):
-                        raise RuntimeError('Role saved only an aborted report')
-                    if report.get('report_incomplete'):
-                        state=snapshot(db,task_id,expect_flags)
-                        unknown=(report.get('execution_outcome') or {}).get('status','unknown')=='unknown'
-                        update_step(db,step_id,'failed',report_path=report.get('report_path'),
-                                    error='report_incomplete',outcome_uncertain=int(unknown),
-                                    knowledge_after_sha256=state['knowledge_sha256'])
-                        with db:
-                            db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
-                        diagnostics.emit('coordinator.pause',step_id=step_id,coordinator_run_id=run_id,
-                                         reason='report_incomplete',report_path=report.get('report_path'),outcome_uncertain=unknown,
-                                         reason_summary='Отчёт неполон или противоречив; требуется проверка оператором. Исход исполнения сохранён отдельно.')
-                        return finish('role_report_incomplete_requires_review','waiting_operator')
-                    from orchestrator import check_series
-                    unknown_checks=[d for d in check_series.state(db,task_id) if d['state']=='unknown']
-                    if unknown_checks:
-                        state=snapshot(db,task_id,expect_flags)
-                        update_step(db,step_id,'failed',report_path=report.get('report_path'),
-                            error='internal_check_outcome_unknown',outcome_uncertain=1,knowledge_after_sha256=state['knowledge_sha256'])
-                        with db:db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
-                        diagnostics.emit('coordinator.pause',task_id=task_id,step_id=step_id,
-                            reason='internal_check_outcome_unknown',identifiers={'direction_ids':[d['id'] for d in unknown_checks]})
-                        return finish('internal_check_outcome_unknown','waiting_operator')
-                    dependencies=[q for q in operator_questions.listing(db,task_id,pending=True)
-                        if q['id'] in report.get('operator_dependencies',[]) and (q.get('tool_request') or q.get('pivot_request') or q.get('budget_request'))]
-                    if dependencies:
-                        with db:
-                            for question in dependencies:
-                                db.execute('UPDATE pm_operator_questions SET step_id=? WHERE id=? AND step_id IS NULL',(step_id,question['id']))
-                        state=snapshot(db,task_id,expect_flags)
-                        update_step(db,step_id,'waiting_operator',report_path=report.get('report_path'),
-                            error='budget_dependency_pending' if any(q.get('budget_request') for q in dependencies) else 'tool_dependency_pending',outcome_uncertain=0,knowledge_after_sha256=state['knowledge_sha256'])
-                        if not operator_questions.available(state):return finish('operator_questions_pending','waiting_operator')
-                        continue
-                    registry=flag_verify.scan(task_id,db=db)
-                    objectives.process_report(db,task_id,report,registry)
-                    flag_review.reconcile(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
-                    state=snapshot(db,task_id,expect_flags)
-                    update_step(db,step_id,'completed',report_path=report.get('report_path'),
-                                knowledge_after_sha256=state['knowledge_sha256'])
+                    state,reason=complete_specialist(db,task_id,run_id,step_id,decision,iteration,expect_flags)
+                    if reason:return finish(reason,'waiting_operator')
                 except KeyboardInterrupt:
                     # Keep running: tools may already have changed the target.
                     update_step(db,step_id,'running',outcome_uncertain=1,error='interrupted_unknown_outcome')

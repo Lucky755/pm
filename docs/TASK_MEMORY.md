@@ -274,3 +274,18 @@ HTTP-материалы остаются в прежнем хранилище; r
 Поддержанные Basic/path/traversal серии отделены от dispatch MCP и результата
 направления. Протокол PoC self-report не является универсальным измерением
 произвольного кода. См. [контракт и ограничения](RESEARCH_BUDGETS.md).
+
+
+## Параллельные специалисты: этап 15
+
+Запись использует BEGIN IMMEDIATE до чтения текущей версии/ключа операции;
+вложенные savepoints не коммитят чужую транзакцию. Read-only сборка остаётся
+savepoint без захвата writer. Одновременные MCP pm_publish_candidate сохраняют
+проверенные по оригиналу кандидаты отдельно от server acceptance/access; stale
+CAS возвращается явно. SDK session_id/mode проецируются из существующих
+pm_coordinator_steps в память; это метаданные исполнения, не доказательство
+живого подключения. Состояние задач не дублируется в новом workflow-хранилище.
+Изолированная ошибка внутренней проверки связана с owning coordinator step.
+[Контракт/14 тестов](../tests/test_specialist_workflow.py) и
+[реальный конкурентный SDK/MCP](../tests/test_specialist_workflow_runtime.py),
+[границы реализации](SPECIALIST_WORKFLOW.md).

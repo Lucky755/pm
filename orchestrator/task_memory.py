@@ -31,21 +31,27 @@ def exists(db,table):return bool(db.execute('SELECT 1 FROM sqlite_master WHERE t
 
 
 @contextmanager
-def atomic(db):
+def atomic(db,*,write=True):
+    # Reserve the SQLite writer before reading a version/dedup key. Nested
+    # savepoints retain their caller's transaction; read-only contexts stay RO.
+    owns=write and not db.in_transaction
+    if owns:db.execute('BEGIN IMMEDIATE')
     name='memory_'+uuid.uuid4().hex
     db.execute('SAVEPOINT '+name)
     try:
         yield
         db.execute('RELEASE '+name)
+        if owns:db.commit()
     except BaseException:
         db.execute('ROLLBACK TO '+name);db.execute('RELEASE '+name)
+        if owns:db.rollback()
         raise
 
 
 def consistent_read(function):
     @wraps(function)
     def read(db,*args,**kwargs):
-        with atomic(db):return function(db,*args,**kwargs)
+        with atomic(db,write=False):return function(db,*args,**kwargs)
     return read
 
 
@@ -350,6 +356,11 @@ def source_state(db,task_id,capability_log):
             'decision':decision,'error':step['error'],'outcome_uncertain':bool(step['outcome_uncertain']),
             'budget':json.loads(step['budgets_json']),
             'approved_at':step.get('approved_at'),'report_path':step.get('report_path')})
+        for session in json.loads(step.get('runtime_sessions_json') or '[]'):
+            ref='harness:'+session['session_id']
+            if ref not in state['sessions'] or step['status']=='running':
+                put('sessions',ref,{**session,'kind':'harness','coordinator_step_id':step['id'],'step_status':step['status'],
+                    'liveness':'unknown; saved owner metadata is not a running process check'})
     for operation in rows(db,'pm_memory_operations',task_id):put('checks','operation:'+operation['id'],operation)
     return state
 

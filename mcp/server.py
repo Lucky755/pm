@@ -60,7 +60,7 @@ def guard_explicit_assets(task_id, assets, hypothesis_key='', new_evidence_id=''
     if not ASSET_DB.is_file():
         return 'Реестр активов недоступен'
     records = fact_state.capability_index(
-        task_id, ROOT / 'storage/capability_log' / f'task_{task_id}.jsonl')
+        task_id, CAPABILITY_LOG / f'task_{task_id}.jsonl')
     with sqlite3.connect(ASSET_DB, timeout=10) as db:
         db.execute('BEGIN IMMEDIATE')
         fact_state.ensure_schema(db)
@@ -814,6 +814,7 @@ def log_capability(tool, task_id, payload, elapsed, command=()):
         }
         if _memory_operation_id.get():record['memory_operation_id']=_memory_operation_id.get()
         if os.environ.get('PM_BUDGET_ROLE'):record['actor_role']=os.environ['PM_BUDGET_ROLE']
+        if os.environ.get('PM_COORDINATOR_STEP_ID'):record['coordinator_step_id']=int(os.environ['PM_COORDINATOR_STEP_ID'])
         record["input_flag_literals"] = sorted(set(re.findall(
             r"\b[A-Z][A-Z0-9_]{1,19}\{[A-Za-z0-9_!@#$%^&*+.:-]{3,120}\}",
             " ".join(full_argv)
@@ -1095,7 +1096,8 @@ def run_capability(command, timeout, tool="capability", task_id=None):
         with sqlite3.connect(ASSET_DB,timeout=10) as db:
             try:
                 research_budgets.ensure(db,task_id,'poc',os.environ.get('PM_BUDGET_ROLE','manual'),capability_log=CAPABILITY_LOG/f'task_{task_id}.jsonl')
-                research_budgets.consume(db,task_id,'poc',os.environ.get('PM_BUDGET_ROLE','manual'),unit='poc_executor_dispatch')
+                research_budgets.consume(db,task_id,'poc',os.environ.get('PM_BUDGET_ROLE','manual'),unit='poc_executor_dispatch',
+                    details={'coordinator_step_id':int(os.environ.get('PM_COORDINATOR_STEP_ID') or 0)})
                 db.commit()
             except research_budgets.Exhausted:
                 payload={'status':'blocked','execution_started':False,'reason_category':'poc_budget_exhausted','reason':'15 PoC dispatches reached; return results to coordinator'}
@@ -1186,6 +1188,36 @@ def run_capability(command, timeout, tool="capability", task_id=None):
     visible = dict(payload)
     visible.pop("poc_source_flag_literals", None)
     return tool_response(capability_digest(visible, record_id, tool))
+
+
+@mcp.tool()
+@diagnostics.tool
+@budget_guard
+def pm_publish_candidate(task_id:int,service_ref:str,username:str,secret:str,source_ref:str,quote:str,expected_version:int=-1)->str:
+    """Publish a source-linked credential candidate, never access or permission.
+
+    Existing task memory is the only store. Exact saved source bytes are
+    required; publication may wake another bounded specialist on that service.
+    """
+    from orchestrator import service_inventory
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked'})
+    try:
+        if not all(isinstance(v,str) and v and len(v)<=4096 for v in (username,secret,source_ref,quote)):raise ValueError('Bounded candidate/source required')
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db,task_memory.atomic(db):
+            target=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()[0]
+            known={f"service:{target}:{e['protocol']}:{e['port']}" for e in service_inventory.collect_full(db,task_id)['entries']}
+            if service_ref not in known:raise ValueError('Unknown current-task service')
+            original=task_memory.material(db,task_id,source_ref,CAPABILITY_LOG/f'task_{task_id}.jsonl')
+            if quote.encode() not in original or username not in quote or secret not in quote:raise ValueError('Candidate is absent from quoted saved source')
+            key='candidate:'+task_memory.digest([service_ref,username,secret])
+            head=task_memory.current(db,task_id);old=head['state']['credentials'].get(key)
+            value=old or {'kind':'credential_candidate','service_ref':service_ref,'username':username,'secret':secret,
+                'source_ref':source_ref,'quote':quote,'trust':'candidate','access_established':False}
+            version=task_memory.apply(db,task_id,head['version'] if expected_version==-1 else expected_version,
+                [{'section':'credentials','key':key,'value':value}],reason='specialist_candidate_publication',actor='specialist')
+        diagnostics.emit('memory.published',task_id=task_id,identifiers={'reference':key,'version':version})
+        return tool_response({'status':'completed','reference':key,'version':version,'trust':'candidate','access_established':False,'provenance':'local'})
+    except (ValueError,OSError,sqlite3.Error) as exc:return tool_response({'status':'blocked','execution_started':False,'reason_category':'candidate_publication_failed','error_type':type(exc).__name__})
 
 
 @mcp.tool()

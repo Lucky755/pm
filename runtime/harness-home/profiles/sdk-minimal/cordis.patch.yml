@@ -54,6 +54,7 @@
           - /home/lucky/pentest-master/mcp/server.py
         cwd: /home/lucky/pentest-master
         # A scoped nmap scan or PoC run needs minutes, not seconds. The broker
-        # still enforces its own hard limits (exec <= 180s, poc <= 180s).
-        toolCallTimeoutMs: 300000
+        # still enforces its own justified exec/PoC limit <= 600s. Include
+        # wrapper shutdown overhead without silently cancelling it at 300s.
+        toolCallTimeoutMs: 660000
         failOnStartupError: true

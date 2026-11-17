@@ -4,6 +4,7 @@ The standalone broker is the authority for terminals and their exclusive owner.
 SQLite preserves purpose, provenance, dependencies and lifecycle across roles.
 """
 from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ from orchestrator import diagnostics, task_memory
 
 BROKER='/usr/local/sbin/pm-netguard'
 MAX_SESSIONS=10
+_owner=ContextVar('pm_terminal_owner',default=None)
 
 
 def initialize(db):
@@ -33,7 +35,7 @@ def now():
     return stamp()
 
 
-def owner():return os.environ.get('PM_SESSION_OWNER') or 'operator:'+str(os.getpid())
+def owner():return _owner.get() or os.environ.get('PM_SESSION_OWNER') or 'operator:'+str(os.getpid())
 
 
 def listing(db,task_id):
@@ -128,9 +130,7 @@ def reconcile(db,task_id,*,execute=None,check_remote=True):
 
 @contextmanager
 def role_scope(db,task_id,purpose,*,check_remote=True):
-    previous={key:os.environ.get(key) for key in ('PM_SESSION_OWNER','PM_SESSION_PURPOSE')}
-    os.environ['PM_SESSION_OWNER']='role:'+uuid.uuid4().hex
-    os.environ['PM_SESSION_PURPOSE']=purpose[:1000]
+    token=_owner.set('role:'+uuid.uuid4().hex)
     try:
         if any(s['state']!='closed' for s in listing(db,task_id)):reconcile(db,task_id,check_remote=check_remote)
         yield
@@ -152,9 +152,7 @@ def role_scope(db,task_id,purpose,*,check_remote=True):
                     save(db,task_id,session['session_id'],{'status':result['status'],'running':result.get('running'), 'owner':''})
         except Exception as exc:
             diagnostics.emit('session.cleanup_failed',task_id=task_id,error_type=type(exc).__name__,reason='original_role_outcome_retained')
-        for key,value in previous.items():
-            if value is None:os.environ.pop(key,None)
-            else:os.environ[key]=value
+        _owner.reset(token)
 
 
 def record_result(db,task_id,action,payload,*,session_id='',resource='',username='',purpose='',retain=None):

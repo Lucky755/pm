@@ -1303,7 +1303,7 @@ def preflight_summary(task_id, target, ports, result):
     diagnostics.emit('preflight.summary',task_id=task_id,parameters={'target':target},status=status,reason=reason,**counts)
 
 
-COORDINATOR_OPTIONS = ('coordinator_steps','decision_retries','roles','poc_budget','step_limit','max_tokens')
+COORDINATOR_OPTIONS = ('coordinator_steps','decision_retries','roles','poc_budget','step_limit','max_tokens','max_specialists')
 
 
 def chosen_task_mode(db, args):
@@ -1344,7 +1344,7 @@ def validate_launch_options(args, mode, *, new=False):
     if getattr(args,'no_agents',False) or getattr(args,'no_decide',False) or getattr(args,'verbose',False):
         raise OperatorError('--no-agents, --no-decide и --verbose относятся к прежнему режиму')
     for name,default,lower,upper in (('coordinator_steps',15,1,32),('decision_retries',1,0,2),
-                                     ('poc_budget',15,1,15),('step_limit',25,1,25),('max_tokens',24000,1,64000)):
+                                     ('poc_budget',15,1,15),('step_limit',25,1,25),('max_tokens',24000,1,64000),('max_specialists',2,1,10)):
         value=getattr(args,name,None)
         if value is not None and not lower <= value <= upper:
             raise OperatorError(f'{name}: {lower}..{upper}')
@@ -1417,6 +1417,7 @@ def render_coordinator_result(result, args):
         line(json.dumps(result,ensure_ascii=False,indent=2))
         return result
     line('  Остановка: ' + safe_display(result['stop_reason']))
+    if result.get('specialist_limit'):line(f"  Предел специалистов: {result['specialist_limit']}; saved runtime ID не доказывает живой процесс.")
     for account in result.get('research_budgets',[]):
         line(f"  Бюджет {safe_display(account['category'])}/{safe_display(account['actor'])}: "
              f"{account['used']}/{account['limit']} · осталось {account['remaining']} · продлено +{account['granted']}"+
@@ -1498,6 +1499,8 @@ def render_coordinator_result(result, args):
 
 def run_task_coordinator(db, task_id, args):
     from orchestrator import coordinated_attack, objectives, attack_loop
+    from orchestrator import task_runtime
+    args.max_specialists=task_runtime.specialist_limit(db,task_id,getattr(args,'max_specialists',None))
     state=objectives.objective_status(db,task_id)
     expect=int(getattr(args,'expect_flags',None) or
                (state['expected_flags'] or len(state['objectives']) if state['primary'] else attack_loop.DEFAULT_EXPECTED_FLAGS))
@@ -1506,12 +1509,13 @@ def run_task_coordinator(db, task_id, args):
         return default if value is None else value
     if not getattr(args,'json',False):
         heading(f'Координатор — задача #{task_id}')
+        line(f'  Одновременно специалистов: до {args.max_specialists}; отдельный Harness runtime на направление.')
         line(f"  Срез до {option('coordinator_steps',15)} решений, исправлений ответа до {option('decision_retries',1)}; "
              f"начальный бюджет специалиста: {option('step_limit',25)} инструментов, {option('poc_budget',15)} PoC, "
              f"{option('max_tokens',24000)} токенов вывода.")
         line('  Сохранённый расход не обнуляется. Дополнительные 5 решений/основных шагов — через вопрос оператору.')
     result=coordinated_attack.run(task_id,roles=tuple(r.strip().lower() for r in option('roles','recon,vuln,access,verify').split(',')),
-        max_steps=option('coordinator_steps',15),decision_retries=option('decision_retries',1),
+        max_steps=option('coordinator_steps',15),decision_retries=option('decision_retries',1),max_specialists=option('max_specialists',2),
         poc_budget=option('poc_budget',15),step_limit=option('step_limit',25),max_tokens=option('max_tokens',24000),
         expect_flags=expect,key_provider=lambda:session_api_key(args,required=True),
         continue_run=getattr(args,'continue_coordinated',False),
@@ -2791,6 +2795,16 @@ def op_status(args):
             line('  Имена хоста: ' + ', '.join(json.loads(aliases[0])))
 
 
+def op_specialists(args):
+    from orchestrator import coordinated_attack,specialist_workflow,task_memory
+    with connect() as db:
+        task_target(db,args.task_id)
+        if getattr(args,'cancel',None) is not None:specialist_workflow.request_cancel(db,args.task_id,args.cancel)
+        rows=coordinated_attack.steps(db,args.task_id) if task_memory.exists(db,'pm_coordinator_steps') else []
+        result={'task_id':args.task_id,'steps':[coordinated_attack.step_view(row) for row in rows]}
+    line(json.dumps(result,ensure_ascii=False,indent=2));return result
+
+
 def op_questions(args):
     from orchestrator import coordinated_attack, operator_questions, agent_actions, flag_review, tool_requests,pivoting
     if getattr(args,'answer',None) is not None and getattr(args,'reconsider',None) is not None:
@@ -2799,7 +2813,7 @@ def op_questions(args):
         raise OperatorError('Выберите одно действие: ответ, пересмотр, --apply-tool или --apply-pivot')
     if getattr(args,'decision',None) and getattr(args,'answer',None) is None:
         raise OperatorError('--decision используется вместе с --answer')
-    with coordinated_attack.task_lock(args.task_id), connect() as db:
+    with connect() as db:
         task_target(db,args.task_id)
         log=flag_review.local_log(db,args.task_id,agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl')
         flag_review.reconcile(db,args.task_id,log)
@@ -2815,12 +2829,13 @@ def op_questions(args):
                 capability_log=log)
             db.commit()  # Permission is durable before external installation starts.
             if answered.get('tool_request') and args.decision=='approve':
-                tool_requests.acquire(db,args.task_id,answered['tool_request']['id'],authorize=True)
+                with coordinated_attack.task_lock(args.task_id):tool_requests.acquire(db,args.task_id,answered['tool_request']['id'],authorize=True)
             if answered.get('pivot_request') and args.decision=='approve':
-                pivoting.apply(db,args.task_id,answered['pivot_request']['id'],authorize=True)
+                with coordinated_attack.task_lock(args.task_id):pivoting.apply(db,args.task_id,answered['pivot_request']['id'],authorize=True)
         if getattr(args,'apply_tool',None) is not None:
-            tool_requests.acquire(db,args.task_id,args.apply_tool,authorize=True)
-        if getattr(args,'apply_pivot',None) is not None:pivoting.apply(db,args.task_id,args.apply_pivot,authorize=True)
+            with coordinated_attack.task_lock(args.task_id):tool_requests.acquire(db,args.task_id,args.apply_tool,authorize=True)
+        if getattr(args,'apply_pivot',None) is not None:
+            with coordinated_attack.task_lock(args.task_id):pivoting.apply(db,args.task_id,args.apply_pivot,authorize=True)
         rows=operator_questions.listing(db,args.task_id)
         if getattr(args,'json',False):line(json.dumps(rows,ensure_ascii=False,indent=2))
         else:
@@ -2915,7 +2930,7 @@ def attack_task(args):
             getattr(args,'continue_coordinated',False) or getattr(args,'approve_step',None) is not None
             or getattr(args,'abandon_running_step',None) is not None
             or getattr(args,'coordinator_steps',None) not in (None,15) or getattr(args,'decision_retries',None) not in (None,1)
-            or explicit & {'--coordinator-steps','--decision-retries'}):
+            or getattr(args,'max_specialists',None) is not None or explicit & {'--coordinator-steps','--decision-retries','--max-specialists'}):
         raise OperatorError('Параметры координатора требуют --coordinated')
     with connect() as db:
         from orchestrator import task_runtime
@@ -3324,6 +3339,8 @@ def parser_main():
     resume = sub.add_parser('resume', help='Продолжить существующую задачу')
     resume.add_argument('task_id', type=int)
     resume.add_argument('--reprobe', help='Однократно перепроверить 1..50 портов после ремонта сети, напр. 22,80')
+    specialists=sub.add_parser('specialists',help='Локальный просмотр шагов/сессий Harness и запрос отмены одного специалиста')
+    specialists.add_argument('task_id',type=int);specialists.add_argument('--cancel',type=int,help='ID активного шага; не повторяет его действия');specialists.add_argument('--json',action='store_true')
     questions = sub.add_parser('questions', help='Очередь: просмотр без сети; установка только после явного одобрения tool')
     questions.add_argument('task_id',type=int)
     questions.add_argument('--answer',type=int,help='ID ожидающего вопроса')
@@ -3369,6 +3386,7 @@ def parser_main():
                         help='Архивировать старый /work до teardown (не более 200 МБ)')
     attack = sub.add_parser('attack', help='Запустить ролевой цикл атаки (recon/vuln/access/verify)')
     attack.add_argument('task_id', type=int)
+    attack.add_argument('--max-specialists',type=int,default=None,help='Предел одновременных специалистов: 1..10; coordinated по умолчанию 2')
     attack.add_argument('--coordinated', action='store_true', help='Выбирать одну роль по сохранённому состоянию задачи')
     attack.add_argument('--coordinator-steps', type=int, default=15, help='Решений/шагов на ручной запуск (1..32)')
     attack.add_argument('--decision-retries', type=int, default=1, help='Исправлений ответа координатора (0..2)')
@@ -3417,6 +3435,7 @@ def parser_main():
         modes.add_argument('--coordinated',dest='coordinated',action='store_true',help='Разведка → координатор → одна выбранная роль')
         modes.add_argument('--legacy',dest='coordinated',action='store_false',help='Явно выбрать прежний Evidence Hub / DECIDE')
         cmd.set_defaults(coordinated=None)
+        cmd.add_argument('--max-specialists',type=int,default=None,help='Одновременно специалистов: 1..10, по умолчанию 2; отдельный runtime на направление')
         cmd.add_argument('--coordinator-steps',type=int,default=None,help='Шагов на вход: 1..32; общий бюджет 15, продление +5 через очередь')
         cmd.add_argument('--decision-retries',type=int,default=None,help='Исправлений решения: 0..2, по умолчанию 1')
         cmd.add_argument('--roles',default=None,help='Разрешённые роли координатора через запятую')
@@ -3683,6 +3702,7 @@ def main():
         elif args.command == 'resume': op_resume(args)
         elif args.command == 'status': op_status(args)
         elif args.command == 'questions': op_questions(args)
+        elif args.command == 'specialists': op_specialists(args)
         elif args.command == 'callback-config':op_callback_config(args)
         elif args.command == 'browser-config':op_browser_config(args)
         elif args.command == 'target-state':op_target_state(args)

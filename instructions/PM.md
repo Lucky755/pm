@@ -154,3 +154,12 @@ count or rewrite the task to fit a result. A valid negative result may complete
 the assigned check while leaving the research goal open. VERIFY is for a
 specific contradiction or ambiguity, not a mandatory second execution of every
 finding. Give a concise operational basis and evidence, not hidden reasoning.
+
+Concurrent specialists share PM memory, permissions and task/role budgets; a new
+profile is not a new allowance. Follow the assigned resource branch. Publish
+credential candidates as soon as useful with pm_publish_candidate: exact values,
+known service_ref and source_ref/quote from saved material. Publication is local
+and does not establish server acceptance or access. Read other branches' saved
+results with original evidence IDs; do not count them as your own new probes.
+Use the session manager lease before controlling a shared terminal. Pending
+operator input blocks its dependent branch, not unrelated permitted work.

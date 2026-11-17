@@ -229,20 +229,21 @@ def task_context(db, task_id):
 
 
 @contextmanager
-def action_policy_patch(step_limit=None, poc_budget=15, *, allowed_tools=None):
+def action_policy_patch(step_limit=None, poc_budget=15, *, allowed_tools=None, environment=None):
     """Runtime budgets and an optional intersection of tool permissions."""
     if not POLICY_PLUGIN.is_file():
         raise ValueError(f'Action policy missing: {POLICY_PLUGIN}')
-    previous = os.environ.get('PM_AGENT_STEP_LIMIT')
-    previous_poc = os.environ.get('PM_AGENT_POC_BUDGET')
-    previous_tools = os.environ.get('PM_AGENT_ALLOWED_TOOLS')
+    env=os.environ if environment is None else environment
+    previous = env.get('PM_AGENT_STEP_LIMIT')
+    previous_poc = env.get('PM_AGENT_POC_BUDGET')
+    previous_tools = env.get('PM_AGENT_ALLOWED_TOOLS')
     if allowed_tools is not None:
         if previous_tools:
             allowed_tools=sorted(set(allowed_tools)&set(json.loads(previous_tools)))
-        os.environ['PM_AGENT_ALLOWED_TOOLS']=json.dumps(allowed_tools)
+        env['PM_AGENT_ALLOWED_TOOLS']=json.dumps(allowed_tools)
     if step_limit:
-        os.environ['PM_AGENT_STEP_LIMIT'] = str(int(step_limit))
-    os.environ['PM_AGENT_POC_BUDGET'] = str(int(poc_budget))
+        env['PM_AGENT_STEP_LIMIT'] = str(int(step_limit))
+    env['PM_AGENT_POC_BUDGET'] = str(int(poc_budget))
     try:
         with tempfile.TemporaryDirectory(prefix='pm-action-policy-') as directory:
             path = Path(directory) / 'actions.patch.yml'
@@ -257,18 +258,18 @@ def action_policy_patch(step_limit=None, poc_budget=15, *, allowed_tools=None):
             yield str(path)
     finally:
         if previous_tools is None:
-            os.environ.pop('PM_AGENT_ALLOWED_TOOLS',None)
+            env.pop('PM_AGENT_ALLOWED_TOOLS',None)
         else:
-            os.environ['PM_AGENT_ALLOWED_TOOLS']=previous_tools
+            env['PM_AGENT_ALLOWED_TOOLS']=previous_tools
         if previous_poc is None:
-            os.environ.pop('PM_AGENT_POC_BUDGET', None)
+            env.pop('PM_AGENT_POC_BUDGET', None)
         else:
-            os.environ['PM_AGENT_POC_BUDGET'] = previous_poc
+            env['PM_AGENT_POC_BUDGET'] = previous_poc
         if step_limit:
             if previous is None:
-                os.environ.pop('PM_AGENT_STEP_LIMIT', None)
+                env.pop('PM_AGENT_STEP_LIMIT', None)
             else:
-                os.environ['PM_AGENT_STEP_LIMIT'] = previous
+                env['PM_AGENT_STEP_LIMIT'] = previous
 
 
 def capability_tail(task_id, limit=10, tail_chars=900):
@@ -2237,7 +2238,11 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
 
         def attempt(tokens, first_prompt):
             """One harness session: the first turn, then bounded recoveries."""
-            with persistent_stage_stats(prior_budget_used,prior_poc_used) as stats_path, action_policy_patch(step_limit, poc_budget, allowed_tools=spec['tools'] if spec['tools']!='inherit' else None) as policy, HarnessAdapter(mode='execute',
+            from orchestrator.model_adapter import _worker
+            private_policy=({key:os.environ[key] for key in ('PM_AGENT_ALLOWED_TOOLS',) if key in os.environ}
+                if _worker.get() else None)
+            allowed=spec['tools'] if spec['tools']!='inherit' else list(json.loads((instructions.ROOT/'tools.json').read_text()))
+            with persistent_stage_stats(prior_budget_used,prior_poc_used) as stats_path, action_policy_patch(step_limit, poc_budget, allowed_tools=allowed,environment=private_policy) as policy, HarnessAdapter(mode='execute',
                 profile='sdk-minimal',
                 patches=(policy,),
                 dsh_home=str(DSH_HOME),
@@ -2249,6 +2254,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
                 # SDK from api_key). EXPERIENTIAL_API_KEY is injected too so the
                 # same key stays available if the profile name is ever changed.
                 env=harness_env({'EXPERIENTIAL_API_KEY': key,
+                                 **(private_policy or {}),
                                  'PM_SESSION_OWNER':task_sessions.owner(),
                                  'PM_SESSION_PURPOSE':objective[:1000],
                                  'PM_BUDGET_ROLE':role,
@@ -2364,6 +2370,10 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
             degraded=report_integrity.quality(report)['status']=='damaged'
             if degraded or report.get('report_repaired'):
                 raw_response=str(getattr(result,'final_response','') or '').replace(key,'[СКРЫТО]')
+            step_id=(assignment or {}).get('coordinator_step_id')
+            foreign_ids={rid for rid,record in report_probe_records(task_id).items() if step_id and
+                (record.get('capture_record') or {}).get('coordinator_step_id') not in (None,step_id)}
+            prior_probe_ids|=foreign_ids
             execution=report_integrity.execution(report_probe_records(task_id),prior_probe_ids,tool_calls['calls'])
             report['execution_outcome']=execution
             if degraded:
@@ -2401,8 +2411,9 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
             # Settle a verified SDK dispatch count before testing completion of
             # an interim budget-limited report. This never repeats an operation.
             observed=research_budgets.get(db,task_id,'specialist',role)
-            for _ in range(max(0,(tool_calls.get('calls') or 0)-observed['used'])):
-                try:research_budgets.consume(db,task_id,'specialist',role,unit='sdk_dispatch_without_mcp_receipt')
+            recorded=(research_budgets.step_usage(db,task_id,'specialist',role,step_id)+prior_budget_used if step_id else observed['used'])
+            for _ in range(max(0,(tool_calls.get('calls') or 0)-recorded)):
+                try:research_budgets.consume(db,task_id,'specialist',role,unit='sdk_dispatch_without_mcp_receipt',details={'coordinator_step_id':step_id})
                 except research_budgets.Exhausted:break
             if not research_budgets.get(db,task_id,'specialist',role)['remaining']:
                 research_budgets.request(db,task_id,'specialist',role)
@@ -2435,14 +2446,15 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
             if tool_calls['calls'] is not None:tool_calls['calls']=max(0,tool_calls['calls']-prior_budget_used)
             steps_used = tool_calls['calls'] or 0
             observed=research_budgets.get(db,task_id,'specialist',role)
-            steps_used=max(steps_used,observed['used']-prior_budget_used)
+            own_used=(research_budgets.step_usage(db,task_id,'specialist',role,step_id) if step_id else observed['used']-prior_budget_used)
+            steps_used=max(steps_used,own_used)
             if tool_calls['calls'] is not None:tool_calls['calls']=steps_used
-            for _ in range(max(0,prior_budget_used+steps_used-observed['used'])):
-                try:research_budgets.consume(db,task_id,'specialist',role,unit='sdk_dispatch_without_mcp_receipt')
+            for _ in range(max(0,steps_used-own_used)):
+                try:research_budgets.consume(db,task_id,'specialist',role,unit='sdk_dispatch_without_mcp_receipt',details={'coordinator_step_id':step_id})
                 except research_budgets.Exhausted:break
             account=research_budgets.get(db,task_id,'specialist',role)
             report['budget_state']=account
-            report['poc_runs']=research_budgets.get(db,task_id,'poc',role)['used']-prior_poc_used
+            report['poc_runs']=(research_budgets.step_usage(db,task_id,'poc',role,step_id) if step_id else research_budgets.get(db,task_id,'poc',role)['used']-prior_poc_used)
             if not account['remaining']:
                 report['budget_question_id']=research_budgets.request(db,task_id,'specialist',role)['id']
             db.commit()

@@ -9,7 +9,11 @@ def saved(db, task_id):
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_task_runtime'").fetchone():
         return None
     row = db.execute('SELECT mode,recon_status,pause_reason FROM pm_task_runtime WHERE task_id=?',(task_id,)).fetchone()
-    return dict(zip(('mode','recon_status','pause_reason'),row)) if row else None
+    if not row:return None
+    limit=2
+    if any(r[1]=='max_specialists' for r in db.execute('PRAGMA table_info(pm_task_runtime)')):
+        limit=db.execute('SELECT max_specialists FROM pm_task_runtime WHERE task_id=?',(task_id,)).fetchone()[0]
+    return {**dict(zip(('mode','recon_status','pause_reason'),row)),'max_specialists':limit}
 
 
 def save_mode(db, task_id, mode):
@@ -26,6 +30,18 @@ def save_mode(db, task_id, mode):
     diagnostics.emit('state.change',task_id=task_id,table='pm_task_runtime',identifiers={'task_id':task_id},current_state=mode)
 
 
+def specialist_limit(db,task_id,value=None):
+    """Read without migration; an explicit execution setting is saved additively."""
+    if value is None:return (saved(db,task_id) or {}).get('max_specialists',2)
+    if type(value) is not int or not 1<=value<=10:raise ValueError('Specialist concurrency must be 1..10')
+    with db:
+        if not saved(db,task_id):save_mode(db,task_id,'coordinated')
+        if not any(r[1]=='max_specialists' for r in db.execute('PRAGMA table_info(pm_task_runtime)')):
+            db.execute('ALTER TABLE pm_task_runtime ADD COLUMN max_specialists INTEGER NOT NULL DEFAULT 2')
+        db.execute('UPDATE pm_task_runtime SET max_specialists=? WHERE task_id=?',(value,task_id))
+    return value
+
+
 def reconnaissance(db, task_id, status, reason=''):
     with db:
         db.execute('UPDATE pm_task_runtime SET recon_status=?,pause_reason=?,updated_at=? WHERE task_id=?',
@@ -38,7 +54,8 @@ def pause(db, task_id):
     """Read only: do not refresh evidence, instantiate SDKs or change checkpoints."""
     from orchestrator import coordinated_attack as coordinator, operator_questions, target_availability
     from orchestrator import research_budgets,check_series
-    work={"research_budgets":research_budgets.listing(db,task_id),"directions":check_series.state(db,task_id)}
+    work={"research_budgets":research_budgets.listing(db,task_id),"directions":check_series.state(db,task_id),
+        'specialist_limit':specialist_limit(db,task_id)}
     availability=target_availability.saved(db,task_id)
     exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_coordinator_runs'").fetchone()
     if exists:

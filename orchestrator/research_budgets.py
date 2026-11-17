@@ -138,6 +138,11 @@ def listing(db,task_id):
     return [get(db,task_id,c,a) for c,a in db.execute('SELECT category,actor FROM pm_research_budgets WHERE task_id=? ORDER BY category,actor',(task_id,))]
 
 
+def step_usage(db,task_id,category,actor,step_id):
+    return db.execute('SELECT COALESCE(SUM(amount),0) FROM pm_budget_events WHERE task_id=? AND category=? AND actor=? '
+        "AND json_extract(details_json,'$.coordinator_step_id')=?",(task_id,category,actor,step_id)).fetchone()[0]
+
+
 def reconnaissance(db,task_id,actor='task',*,unit='network_job'):
     ensure(db,task_id,'recon',actor)
     try:consume(db,task_id,'recon',actor,unit=unit);db.commit()
@@ -160,12 +165,21 @@ def tool_guard(database):
                     action=bound.arguments.get('action')
                     local_action=action in ('read','list','status','release','close')
                     step=int(os.environ.get('PM_COORDINATOR_STEP_ID') or 0)
+                    if step and task_memory.exists(db,'pm_coordinator_steps'):
+                        row=db.execute('SELECT status,cancel_requested_at,decision_json FROM pm_coordinator_steps WHERE task_id=? AND id=?',(task,step)).fetchone()
+                        if row and not local_action and function.__name__ not in FREE:
+                            from orchestrator import operator_questions
+                            if row[0]!='running' or row[1]:
+                                return json.dumps({'status':'blocked','execution_started':False,'reason_category':'specialist_cancelled_or_inactive'})
+                            decision=json.loads(row[2])
+                            if operator_questions.blocked(decision,{'operator_questions':operator_questions.listing(db,task)}):
+                                return json.dumps({'status':'waiting_operator','execution_started':False,'reason_category':'branch_waiting_operator'})
                     if function.__name__ in ACTIVE_TOOLS and not local_action and any(
                             d['state']=='exhausted' and (d['plan_step'] or 0)==step for d in check_series.state(db,task)):
                         return json.dumps({'status':'replan_required','execution_started':False,'reason_category':'direction_exhausted',
                             'reason':'Five unproductive units: return the saved results to the coordinator before more target actions'})
                     ensure(db,task,'specialist',actor)
-                    try:consume(db,task,'specialist',actor,details={'tool':function.__name__})
+                    try:consume(db,task,'specialist',actor,details={'tool':function.__name__,'coordinator_step_id':step})
                     except Exhausted:
                         q=request(db,task,'specialist',actor);db.commit()
                         return json.dumps({'status':'waiting_operator','execution_started':False,'question_id':q['id'],

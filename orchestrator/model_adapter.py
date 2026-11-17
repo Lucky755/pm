@@ -7,6 +7,8 @@ Raw final responses are private artifacts; diagnostics contain identifiers only.
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from contextvars import ContextVar
+from contextvars import copy_context
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import hashlib
 import json
@@ -22,6 +24,63 @@ ROOT=Path(__file__).resolve().parents[1]
 DEFAULT_HOME=ROOT/'runtime/harness-home'
 DEFAULT_CWD=ROOT/'runtime/workspace'
 _configuration=ContextVar('pm_model_configuration',default={})
+_worker=ContextVar('pm_owned_worker',default=None)
+
+
+class OwnedWorker:
+    """Cancellation boundary for one specialist; never cancels another runtime."""
+    def __init__(self,identifier,on_session=None):
+        self.id=identifier;self.on_session=on_session;self.stopped=threading.Event()
+        self.lock=threading.Lock();self.runtimes=set();self.future=None
+
+    def attach(self,runtime):
+        with self.lock:
+            if self.stopped.is_set():raise HarnessCallError('cancelled',uuid.uuid4().hex)
+            self.runtimes.add(runtime)
+
+    def cancel(self):
+        self.stopped.set()
+        with self.lock:runtimes=list(self.runtimes)
+        for runtime in runtimes:runtime.cancel()
+        return self.future.cancel() if self.future else True
+
+
+class OwnedWorkflow:
+    """SDK rc2 fallback behind the adapter: owned runtimes + SDK notifications.
+
+    Native subagents/workflow and session/cancel are unavailable in sdk-minimal.
+    Only ephemeral handles live here; PM's existing SQLite steps own durable state.
+    """
+    def __init__(self,limit=2):
+        if type(limit) is not int or not 1<=limit<=10:raise ValueError('Specialist concurrency must be 1..10')
+        self.limit=limit;self.pool=ThreadPoolExecutor(max_workers=limit,thread_name_prefix='pm-specialist');self.workers={}
+
+    def submit(self,identifier,function,*args,on_session=None,**kwargs):
+        if identifier in self.workers:raise ValueError('Worker already submitted')
+        if sum(not w.future.done() for w in self.workers.values())>=self.limit:raise ValueError('Specialist slots full')
+        worker=OwnedWorker(identifier,on_session);self.workers[identifier]=worker;context=copy_context()
+        def run():
+            token=_worker.set(worker)
+            try:
+                if worker.stopped.is_set():raise HarnessCallError('cancelled',uuid.uuid4().hex)
+                return function(*args,**kwargs)
+            finally:_worker.reset(token)
+        worker.future=self.pool.submit(context.run,run)
+        diagnostics.emit('specialist.start',step_id=identifier,parameters={'backend':'owned_harness_runtime','limit':self.limit})
+        return worker
+
+    def close(self):
+        for worker in self.workers.values():
+            if not worker.future.done():worker.cancel()
+        self.pool.shutdown(wait=True,cancel_futures=True)
+
+    def __enter__(self):return self
+    def __exit__(self,*_):self.close()
+
+
+def check_cancelled():
+    worker=_worker.get()
+    if worker and worker.stopped.is_set():raise HarnessCallError('cancelled',uuid.uuid4().hex)
 
 
 @contextmanager
@@ -118,9 +177,18 @@ class HarnessAdapter:
         self.options={'profile':'sdk-minimal','provider':'experiential','model':'glm-5.3-uncensored',
                       'dsh_home':str(DEFAULT_HOME),'cwd':str(DEFAULT_CWD),
                       'request_timeout_seconds':120,**options,**_configuration.get()}
+        self.options['env']={**_configuration.get().get('env',{}),**options.get('env',{})}
+        inherited=_configuration.get().get('env',{}).get('PM_AGENT_ALLOWED_TOOLS')
+        requested=options.get('env',{}).get('PM_AGENT_ALLOWED_TOOLS')
+        if inherited and requested:self.options['env']['PM_AGENT_ALLOWED_TOOLS']=json.dumps(sorted(set(json.loads(inherited))&set(json.loads(requested))))
+        if mode=='execute':
+            self.options['patches']=tuple(_configuration.get().get('patches',()))+tuple(options.get('patches',()))
         if mode=='execute' and not self.options.get('patches'):
             raise ValueError('Execution requires an explicit tool policy')
         self.options['env']=harness_env(self.options.get('env'))
+        if self.options['env'].get('PM_RUN_ID'):
+            self.options['env']['PM_EVENT_CONTEXT_FILE']=str(Path(self.options['env']['PM_EVENT_DIR'])/
+                (self.options['env']['PM_RUN_ID']+'.runtime-'+uuid.uuid4().hex+'.context.json'))
         self.timeout=float(self.options['request_timeout_seconds'])
         if self.timeout<=0:raise ValueError('Harness timeout must be positive')
         self.key=self.options.get('api_key')
@@ -129,6 +197,7 @@ class HarnessAdapter:
         self.close_lock=threading.Lock()
 
     def __enter__(self):
+        check_cancelled()
         from deepseek_harness import DeepSeekHarness
         if self.mode=='analysis':
             from orchestrator.evidence_pipeline import read_only_analysis_patch
@@ -147,7 +216,12 @@ class HarnessAdapter:
         try:
             self.native=DeepSeekHarness(**self.options)
             self.native.__enter__()
+            worker=_worker.get()
+            if worker:worker.attach(self)
         except Exception as exc:
+            if self.native is not None:
+                try:self.close()
+                except Exception as failure:diagnostics.warning(failure)
             self.stack.close()
             request_id=uuid.uuid4().hex
             try:save_record({'request_id':request_id,'mode':self.mode,'status':'configuration_or_start_failure',
@@ -170,15 +244,22 @@ class HarnessAdapter:
                 native,self.native=self.native,None
                 # Keep fake SDK boundaries compatible with the SDK context API.
                 native.__exit__(None,None,None)
+        worker=_worker.get()
+        if worker:
+            with worker.lock:worker.runtimes.discard(self)
 
     def cancel(self,*,timeout=False):
         self.cancelled=True;self.timed_out=timeout
         self.close()
 
     def start_session(self,session_id=None):
+        check_cancelled()
         if self.native is None:raise HarnessCallError('cancelled' if self.cancelled else 'closed',uuid.uuid4().hex)
         sid=session_id or 'pm-'+uuid.uuid4().hex
-        return AdapterSession(self,self.native.start_session(sid),sid)
+        result=AdapterSession(self,self.native.start_session(sid),sid)
+        worker=_worker.get()
+        if worker and worker.on_session:worker.on_session(sid,self.mode)
+        return result
 
     def resume_session(self,session_id):
         return AdapterSession(self,self.native.resume_session(session_id),session_id)
@@ -208,6 +289,7 @@ class AdapterSession:
                 'prompt_sha256':hashlib.sha256(str(prompt).encode()).hexdigest(),
                 'run_id':(diagnostics.context() or {}).get('run_id')}
         record.update({key:(diagnostics.context() or {}).get(key) for key in ('task_id','role','iteration')})
+        if _worker.get():record['coordinator_step_id']=_worker.get().id
         stable=str(prompt).split('<pm_dynamic_context>',1)[0]
         record.update(prompt_bytes=len(str(prompt).encode()),stable_prefix_sha256=hashlib.sha256(stable.encode()).hexdigest(),
                       stable_prefix_bytes=len(stable.encode()),usage_source='SDK reported values; missing fields unknown',
@@ -220,7 +302,8 @@ class AdapterSession:
         received=False
         try:
             kwargs={'on_notification':on_notification} if on_notification is not None else {}
-            raw=diagnostics.model_call(self.native,prompt,diagnostic_reason=diagnostic_reason,**kwargs)
+            raw=diagnostics.model_call(self.native,prompt,diagnostic_reason=diagnostic_reason,
+                event_context_file=self.owner.options.get('env',{}).get('PM_EVENT_CONTEXT_FILE'),**kwargs)
             received=True
             if self.owner.cancelled:
                 raise TimeoutError() if self.owner.timed_out else RuntimeError('Owned runtime cancelled')
