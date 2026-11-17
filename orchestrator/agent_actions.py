@@ -1719,9 +1719,16 @@ def report_probe_records(task_id):
                     'capture_record': {**{key:record.get(key) for key in
                                          ('id','task_id','tool','provenance')},
                                        'result':{key:result[key] for key in
-                                                 ('task_id','target','status','exit_code','artifact_id','error_type','server_outcome','status_code','question_id')
+                                                 ('task_id','target','status','exit_code','artifact_id','error_type','server_outcome',
+                                                  'status_code','question_id','transport_complete','exchange_id','checks_recorded')
                                                  if key in result}},
                 }
+                if record.get('tool')=='check_series' and isinstance(result.get('checks'),list):
+                    # Execution receipts only; credentials and full responses
+                    # remain in the original capability log, not this view.
+                    records[record.get('id')]['capture_record']['result']['checks']=[
+                        {'phase':item.get('phase')} if isinstance(item,dict) else {}
+                        for item in result['checks']]
                 if record.get('tool') in ('material_process','material_import'):
                     items=result.get('outputs',[]) if record['tool']=='material_process' else [result.get('material') or {}]
                     records[record.get('id')]['capture_record']['result'].update(

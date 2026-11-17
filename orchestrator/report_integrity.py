@@ -32,6 +32,23 @@ def quality(report):
     return {'status':'locally_repaired' if report.get('report_repaired') else 'valid','reason':None}
 
 
+def transport_completed(tool, payload):
+    """Typed operations have completion receipts rather than process exit codes.
+
+    These fields describe execution only. HTTP 200 or a series criterion never
+    establishes login, access or an operator's research goal here.
+    """
+    if tool=='http_capture':
+        return (payload.get('transport_complete') is True and
+                type(payload.get('exchange_id')) is int)
+    if tool=='check_series':
+        checks=payload.get('checks')
+        return (isinstance(checks,list) and bool(checks) and
+                payload.get('checks_recorded')==len(checks) and
+                all(isinstance(check,dict) and check.get('phase')=='finished' for check in checks))
+    return False
+
+
 def execution(records, prior_ids, calls=None):
     rows=[]
     fresh=[record for rid,record in records.items() if rid not in prior_ids]
@@ -45,7 +62,8 @@ def execution(records, prior_ids, calls=None):
                  'executor_error' if status in ('error','failed') and
                  payload.get('error_type') in ('executor_unavailable','executor_error','launch_error') else
                  'executed' if status in ('completed','ok') and type(code) is int and code==0 else
-                 'nonzero_exit' if status in ('completed','ok') and type(code) is int else 'unknown')
+                 'nonzero_exit' if status in ('completed','ok') and type(code) is int else
+                 'executed' if status in ('completed','ok') and transport_completed(record['tool'],payload) else 'unknown')
         responses=[]
         source=(record.get('capture_record') or {}).get('provenance')
         if source=='network' and status in ('completed','ok'):

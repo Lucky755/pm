@@ -1821,7 +1821,7 @@ def op_resume(args):
         if not args.coordinated and paused and (task_runtime.saved(db,args.task_id) or {}).get('mode')=='coordinated':
             raise OperatorError('Сначала разбери сохранённую паузу coordinated-режима; переключение режима её не отменяет')
         if not args.coordinated and paused and paused.get('operator_questions') and not continuation_requested(args):
-            if getattr(args,'_explicit_flags',set())-{'--legacy','--json'}:
+            if getattr(args,'_explicit_flags',set())-{'--legacy','--json','--diagnostic'}:
                 raise OperatorError('Сначала ответь на сохранённые вопросы; просмотр не применяет флаги запуска')
             return render_coordinator_result(paused,args)
         if not args.coordinated and paused and paused.get('coordinator_run_id'):
@@ -1837,7 +1837,7 @@ def op_resume(args):
                     raise OperatorError('Нет соответствующего running-шага')
                 if (not continuation_requested(args) or paused['stop_reason']=='interrupted_full_tcp_scan'
                         or running and getattr(args,'abandon_running_step',None)!=running['id']):
-                    explicit_flags=getattr(args,'_explicit_flags',set())-{'--coordinated','--json','--continue-coordinated'}
+                    explicit_flags=getattr(args,'_explicit_flags',set())-{'--coordinated','--json','--diagnostic','--continue-coordinated'}
                     if (explicit_flags or any(getattr(args,key,None) for key in ('reprobe','hostnames','egress','force_unreachable'))
                             or any(getattr(args,key,None) is not None for key in COORDINATOR_OPTIONS)):
                         raise OperatorError('Сначала явно продолжи сохранённую паузу')
