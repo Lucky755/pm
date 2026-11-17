@@ -1441,6 +1441,8 @@ def render_coordinator_result(result, args):
         line('  Отчёт неполон или противоречив; требует проверки оператором. Исход исполнения приведён отдельно. '
              'Автоматический повтор роли заблокирован.')
     line(f"  Исследовательская цель подтверждена: {result['succeeded']}")
+    if result['succeeded']:
+        line(f"  Выбранные советы/материалы можно сохранить явно: methods save {result['task_id']} / methods retain {result['task_id']} --file JSON. История автоматически не удаляется.")
     for question in result.get('operator_questions',[]):
         line(f"  Вопрос #{question['id']} [{question['status']}] · {safe_display(question['kind'])} · ветка {safe_display(question['branch_id'])}")
         line('    '+safe_display(question['question']))
@@ -2795,6 +2797,32 @@ def op_status(args):
             line('  Имена хоста: ' + ', '.join(json.loads(aliases[0])))
 
 
+def op_methods(args):
+    from orchestrator.method_library import Library
+    library=Library();command=args.method_command
+    if command=='list':
+        result=[{'id':versions[-1]['id'],'version':versions[-1]['version'],
+                 'status':versions[-1]['status'],'title':versions[-1]['content']['title']}
+                for versions in library.read()['methods'].values()]
+    elif command=='show':result=library.get(args.method_id,args.version)
+    elif command=='select':result=library.select(args.profile,args.problem)
+    elif command=='withdraw':result=library.withdraw(args.method_id,args.expected_version,args.reason)
+    else:
+        from orchestrator import agent_actions
+        supplied=json.loads(Path(args.file).read_text(encoding='utf-8'))
+        # Unlike connect(), this path performs no migrations or task writes.
+        with closing(sqlite3.connect(DB.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+            if command=='save':
+                if not isinstance(supplied,dict) or set(supplied)!={'method','evidence'}:raise ValueError('method_save_document')
+                result=library.save(db,args.task_id,supplied['method'],supplied['evidence'],
+                    agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl',
+                    expected_version=args.expected_version,reason=args.reason)
+            else:
+                result=library.retain(db,args.task_id,supplied,agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl')
+        diagnostics.emit('methods.saved',task_id=args.task_id,identifiers={k:result[k] for k in ('id','version') if k in result},reason=command)
+    line(json.dumps(result,ensure_ascii=False,indent=2));return result
+
+
 def op_specialists(args):
     from orchestrator import coordinated_attack,specialist_workflow,task_memory
     with connect() as db:
@@ -3339,6 +3367,15 @@ def parser_main():
     resume = sub.add_parser('resume', help='Продолжить существующую задачу')
     resume.add_argument('task_id', type=int)
     resume.add_argument('--reprobe', help='Однократно перепроверить 1..50 портов после ремонта сети, напр. 22,80')
+    methods=sub.add_parser('methods',help='Локальная библиотека успешных методов; сохранение только по явному выбору')
+    method_commands=methods.add_subparsers(dest='method_command',required=True)
+    method_commands.add_parser('list')
+    show=method_commands.add_parser('show');show.add_argument('method_id');show.add_argument('--version',type=int)
+    choose=method_commands.add_parser('select');choose.add_argument('--profile',required=True);choose.add_argument('--problem',required=True)
+    save=method_commands.add_parser('save');save.add_argument('task_id',type=int);save.add_argument('--file',required=True)
+    save.add_argument('--expected-version',type=int);save.add_argument('--reason',default='selected_successful_method')
+    withdraw=method_commands.add_parser('withdraw');withdraw.add_argument('method_id');withdraw.add_argument('--expected-version',type=int,required=True);withdraw.add_argument('--reason',required=True)
+    retain=method_commands.add_parser('retain');retain.add_argument('task_id',type=int);retain.add_argument('--file',required=True)
     specialists=sub.add_parser('specialists',help='Локальный просмотр шагов/сессий Harness и запрос отмены одного специалиста')
     specialists.add_argument('task_id',type=int);specialists.add_argument('--cancel',type=int,help='ID активного шага; не повторяет его действия');specialists.add_argument('--json',action='store_true')
     questions = sub.add_parser('questions', help='Очередь: просмотр без сети; установка только после явного одобрения tool')
@@ -3703,6 +3740,7 @@ def main():
         elif args.command == 'status': op_status(args)
         elif args.command == 'questions': op_questions(args)
         elif args.command == 'specialists': op_specialists(args)
+        elif args.command == 'methods': op_methods(args)
         elif args.command == 'callback-config':op_callback_config(args)
         elif args.command == 'browser-config':op_browser_config(args)
         elif args.command == 'target-state':op_target_state(args)

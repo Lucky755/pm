@@ -15,12 +15,14 @@ OFFLINE = OFFLINE | {'test_resource_scope', 'test_tool_requests', 'test_pivot_cl
 OFFLINE = OFFLINE | {'test_material_processing'}
 OFFLINE = OFFLINE | {'test_research_budgets'}
 OFFLINE = OFFLINE | {'test_specialist_workflow'}
+OFFLINE = OFFLINE | {'test_method_library'}
 SCRIPTS = frozenset(('test_burp_import', 'test_decision_agent', 'test_evidence_pipeline', 'test_evidence_recovery', 'test_master_scheduler', 'test_policy'))
 RUNTIME = frozenset(('test_model_adapter_runtime', 'test_coordinated_runtime', 'test_evidence_readonly_runtime', 'test_tool_download_runtime', 'test_task_sessions', 'test_session_runtime', 'test_http_client_runtime','test_browser_runtime'))
 RUNTIME = RUNTIME | {'test_burp_proxy_runtime'}
 RUNTIME = RUNTIME | {'test_port_research'}
 RUNTIME = RUNTIME | {'test_work_series_runtime'}
 RUNTIME = RUNTIME | {'test_specialist_workflow_runtime'}
+RUNTIME = RUNTIME | {'test_method_library_runtime'}
 MANUAL = frozenset(('test_agent_tool_selection', 'test_agent_v3_selection', 'test_approval_mcp', 'test_harness_mcp', 'test_local_tool_mcp', 'test_mcp_connection', 'test_network_mcp', 'test_pi_provider', 'test_shell_disabled', 'test_tool_v3_mcp'))
 
 
@@ -82,6 +84,7 @@ def run_suite(name, timeout=180):
     env.pop('PYTHONOPTIMIZE',None) # legacy assert scripts must actually execute assertions
     with tempfile.TemporaryDirectory(prefix='pm-suite-model-audit-') as directory:
         env['PM_MODEL_AUDIT_DIR']=directory
+        env['PM_METHOD_LIBRARY_DIR']=str(Path(directory)/'methods')
         env['PYTHONPATH']=storage_guard(directory)
         result=subprocess.run(command(name),cwd=ROOT,env=env,stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout)

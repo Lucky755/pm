@@ -1336,6 +1336,11 @@ def memory_block(db,context,objective):
     return '<target_availability>\n'+json.dumps(saved(db,context['task_id']),ensure_ascii=False)+'\n</target_availability>\n'+ '<task_memory>\n'+json.dumps(memory,ensure_ascii=False)+'\n</task_memory>'
 
 
+def method_library_block(context,role,objective):
+    from orchestrator.method_library import prompt_block
+    return prompt_block(context,role,objective)
+
+
 def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit=25):
     logs = capability_tail(context['task_id'])
     state = essential_state(db, context['task_id'])
@@ -1376,6 +1381,8 @@ Current objective of this round: {objective or 'advance the assessment as far as
 Round: {iteration}. PoC write/run budget for you: {poc_budget} attempts.
 
 {memory_block(db,context,objective)}
+
+{method_library_block(context,role,objective)}
 
 {tool_manual(context['task_id'], target, instructions.selected(context,role))}
 
@@ -1439,6 +1446,8 @@ hard budget of {step_limit} tool calls; the remaining budget arrives in
 budget_warning of the tool replies.
 
 {memory_block(db,context,objective)}
+
+{method_library_block(context,role,objective)}
 
 {tool_manual(context['task_id'], target, instructions.selected(context,role))}
 
