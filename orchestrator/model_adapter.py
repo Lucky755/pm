@@ -25,6 +25,34 @@ DEFAULT_HOME=ROOT/'runtime/harness-home'
 DEFAULT_CWD=ROOT/'runtime/workspace'
 _configuration=ContextVar('pm_model_configuration',default={})
 _worker=ContextVar('pm_owned_worker',default=None)
+_execution=ContextVar('pm_manual_execution',default=None)
+
+
+class OperatorStop(KeyboardInterrupt):pass
+
+
+class ExecutionControl:
+    """Stop model activity owned by this manual invocation, not task terminals."""
+    def __init__(self):self.stopped=threading.Event();self.lock=threading.Lock();self.runtimes=set()
+    def attach(self,runtime):
+        with self.lock:
+            if self.stopped.is_set():raise OperatorStop()
+            self.runtimes.add(runtime)
+    def stop(self):
+        if self.stopped.is_set():return
+        self.stopped.set()
+        with self.lock:runtimes=list(self.runtimes)
+        for runtime in runtimes:
+            try:runtime.cancel()
+            except Exception as exc:diagnostics.warning(exc)
+
+
+@contextmanager
+def execution_control():
+    control=ExecutionControl();token=_execution.set(control)
+    try:yield control
+    finally:
+        control.stop();_execution.reset(token)
 
 
 class OwnedWorker:
@@ -79,6 +107,7 @@ class OwnedWorkflow:
 
 
 def check_cancelled():
+    if _execution.get() and _execution.get().stopped.is_set():raise OperatorStop()
     worker=_worker.get()
     if worker and worker.stopped.is_set():raise HarnessCallError('cancelled',uuid.uuid4().hex)
 
@@ -216,13 +245,15 @@ class HarnessAdapter:
         try:
             self.native=DeepSeekHarness(**self.options)
             self.native.__enter__()
+            if _execution.get():_execution.get().attach(self)
             worker=_worker.get()
             if worker:worker.attach(self)
-        except Exception as exc:
+        except BaseException as exc:
             if self.native is not None:
                 try:self.close()
                 except Exception as failure:diagnostics.warning(failure)
             self.stack.close()
+            if not isinstance(exc,Exception):raise
             request_id=uuid.uuid4().hex
             try:save_record({'request_id':request_id,'mode':self.mode,'status':'configuration_or_start_failure',
                              'error_type':type(exc).__name__,'run_id':(diagnostics.context() or {}).get('run_id')})
@@ -247,6 +278,8 @@ class HarnessAdapter:
         worker=_worker.get()
         if worker:
             with worker.lock:worker.runtimes.discard(self)
+        if _execution.get():
+            with _execution.get().lock:_execution.get().runtimes.discard(self)
 
     def cancel(self,*,timeout=False):
         self.cancelled=True;self.timed_out=timeout
@@ -279,6 +312,7 @@ class AdapterSession:
     def __init__(self,owner,native,sid):self.owner,self.native,self.id=owner,native,sid
 
     def run(self,prompt,*,diagnostic_reason=None,on_notification=None,recovery_attempt=0):
+        check_cancelled()
         if recovery_attempt and self.owner.mode!='analysis':
             raise ValueError('Format recovery requires analysis mode')
         request_id=uuid.uuid4().hex;started=time.monotonic()
@@ -334,6 +368,7 @@ class AdapterSession:
             record.update(status=code,error_type=type(exc).__name__,duration_seconds=round(time.monotonic()-started,3))
             try:save_record(record)
             except OSError:pass # do not replace the original operation/model failure
+            check_cancelled()
             if isinstance(exc,KeyboardInterrupt):
                 self.owner.cancel();raise
             if not isinstance(exc,Exception):raise
@@ -342,6 +377,7 @@ class AdapterSession:
             timer.cancel()
             diagnostics.emit('model.request_end',request_id=request_id,session_id=self.id,
                              status=record['status'],statistics=record.get('statistics'),
+                             audit_path=str(audit_directory()/(request_id+'.json')),
                              duration_seconds=round(time.monotonic()-started,3))
 
 

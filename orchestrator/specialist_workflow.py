@@ -66,6 +66,7 @@ def drive(db,task_id,run_id,roles,budgets,max_steps,retries,expect,model,key,rol
     with model_adapter.OwnedWorkflow(limit) as workflow:
         try:
             while True:
+                model_adapter.check_cancelled()
                 for sid,item in list(active.items()):
                     saved=db.execute('SELECT cancel_requested_at FROM pm_coordinator_steps WHERE id=?',(sid,)).fetchone()
                     if saved[0] and not item.get('cancelled'):cancel(item,'operator_cancelled_specialist')
@@ -189,9 +190,14 @@ def drive(db,task_id,run_id,roles,budgets,max_steps,retries,expect,model,key,rol
                     effective['poc_budget'],effective['step_limit'],api_key=key(),max_tokens=effective['max_tokens'],assignment=assignment,
                     on_session=lambda sid,mode,step=step_id:session_started(task_id,step,sid,mode))
                 active[step_id]={'worker':worker,'step_id':step_id,'decision':decision,'iteration':iteration}
-        except BaseException:
+        except BaseException as exc:
             for item in active.values():
                 if not item.get('cancelled'):cancel(item,'interrupted_unknown_outcome')
+            if isinstance(exc,KeyboardInterrupt):
+                with task_memory.atomic(db):
+                    db.execute("UPDATE pm_coordinator_runs SET status='waiting_operator',stop_reason='interrupted',pause_step_id=?,updated_at=? WHERE id=?",
+                        (next(iter(active),None),c.now(),run_id))
+                diagnostics.stop('interrupted',unfinished_step_ids=sorted(active))
             raise
     state=snapshot()
     if any(q['status']=='pending' for q in state['operator_questions']):return finish('operator_questions_pending','waiting_operator')

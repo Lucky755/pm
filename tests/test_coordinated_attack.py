@@ -557,7 +557,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(launch.call_args.args[0].coordinator_steps,2)
 
     def test_decision_diagnostics_include_expected_result_without_thoughts(self):
-        with d.run('coordinator test',11):
+        with d.presentation('debug'),d.run('coordinator test',11):
             self.run_mode([decision('vuln','Check port 80?'),decision()])
             events=[e for e in d.read_events() if e['kind']=='coordinator.decision']
             self.assertEqual(events[0]['role'],'vuln')

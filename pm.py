@@ -749,17 +749,23 @@ def session_getpass(key):
 
 class ConciseProgress:
     """Display only operator-useful scheduler progress; preserve saved SQLite data."""
-    def __init__(self, stream=None):
-        self.pending = ''
+    def __init__(self, stream=None, diagnostic=None):
+        import threading
+        self.pending = {};self.lock=threading.RLock()
+        self.diagnostic=diagnostics.detailed() if diagnostic is None else diagnostic
         self.stream = stream if stream is not None else sys.stdout
     def write(self, chunk):
-        self.pending += str(chunk)
-        while '\n' in self.pending:
-            current, self.pending = self.pending.split('\n', 1)
-            self._one(current)
+        import threading
+        with self.lock:
+            ident=threading.get_ident();text=self.pending.get(ident,'')+str(chunk)
+            while '\n' in text:
+                current,text=text.split('\n',1);self._one(current)
+            self.pending[ident]=text
+        return len(chunk)
     def _one(self, text):
         text = text.strip()
-        if text.startswith(('[EVENT]', '[DIAG-ERROR]')):
+        if text.startswith('[EVENT]') and not self.diagnostic:return
+        if text.startswith(('[EVENT]', '[DIAG-ERROR]', '[PM]')):
             line('  ' + diagnostics.clean(text), stream=self.stream)
         elif text.startswith('[JOB]'):
             tone = 'success' if ': completed' in text else 'warning' if ': failed' in text else 'brand'
@@ -780,9 +786,10 @@ class ConciseProgress:
         elif text.startswith('[ОШИБКА]') or text.startswith('[ERROR]'):
             line('  ' + tint('[!]', 'danger', stream=self.stream) + ' ' + safe_display(text), stream=self.stream)
     def flush(self):
-        if self.pending:
-            self._one(self.pending)
-            self.pending = ''
+        with self.lock:
+            for text in self.pending.values():
+                if text:self._one(text)
+            self.pending.clear()
 
 
 def call_scheduler(db, task_id, target, args, *, prior_jobs=0):
@@ -1365,8 +1372,11 @@ def render_flag_candidate(question):
     candidate=question.get('flag_candidate')
     if not candidate:return
     line(f"    Кандидат #{candidate['id']} · цель {safe_display(candidate['objective_key'])}: {safe_display(candidate['objective_title'])}")
-    # JSON literals preserve whitespace and cannot inject terminal controls.
-    line('    Точное значение (JSON): '+json.dumps(candidate['value'],ensure_ascii=True))
+    if not any(key in candidate['value'] for key in diagnostics._secrets):
+        line('    Точное значение (JSON): '+json.dumps(candidate['value'],ensure_ascii=True))
+        if candidate['value'] and safe_display(candidate['value'])==candidate['value']:
+            line('    Для копирования: '+candidate['value'])
+    else:line('    Значение скрыто: содержит зарегистрированный API-ключ.')
     for source in candidate['sources']:
         line('    Источник: '+safe_display(source['source'])+' · способ: '+safe_display(source['method']))
     line('    Материалы: '+', '.join(safe_display(ref) for ref in candidate['materials']))
@@ -1416,9 +1426,10 @@ def render_coordinator_result(result, args):
     if getattr(args,'json',False):
         line(json.dumps(result,ensure_ascii=False,indent=2))
         return result
-    line('  Остановка: ' + safe_display(result['stop_reason']))
-    if result.get('specialist_limit'):line(f"  Предел специалистов: {result['specialist_limit']}; saved runtime ID не доказывает живой процесс.")
-    for account in result.get('research_budgets',[]):
+    from orchestrator.operator_console import reason,question_lines
+    line('  Остановка: ' + reason(result['stop_reason']))
+    if result.get('specialist_limit') and diagnostics.detailed():line(f"  Предел специалистов: {result['specialist_limit']}; saved runtime ID не доказывает живой процесс.")
+    for account in result.get('research_budgets',[]) if diagnostics.detailed() else []:
         line(f"  Бюджет {safe_display(account['category'])}/{safe_display(account['actor'])}: "
              f"{account['used']}/{account['limit']} · осталось {account['remaining']} · продлено +{account['granted']}"+
              (' · прежняя статистика неполна' if not account['history_known'] else ''))
@@ -1444,17 +1455,14 @@ def render_coordinator_result(result, args):
     if result['succeeded']:
         line(f"  Выбранные советы/материалы можно сохранить явно: methods save {result['task_id']} / methods retain {result['task_id']} --file JSON. История автоматически не удаляется.")
     for question in result.get('operator_questions',[]):
-        line(f"  Вопрос #{question['id']} [{question['status']}] · {safe_display(question['kind'])} · ветка {safe_display(question['branch_id'])}")
-        line('    '+safe_display(question['question']))
-        if question.get('resource'):line('    Ресурс: '+diagnostics.clean(question['resource']['value'],limit=None)+' · контекст '+safe_display(question['resource']['context']))
-        render_flag_candidate(question)
+        for text in question_lines(question):line('  '+text)
         render_tool_request(question)
         render_pivot_request(question)
-        line('    Причина: '+safe_display(question['reason']))
-        line('    Границы: '+safe_display(json.dumps(question['boundaries'],ensure_ascii=False)))
         line('    Ссылки: '+', '.join(safe_display(ref) for ref in question['references']))
         if question.get('answer'):line('    Ответ сохранён: '+safe_display(question['answer']['decision']))
-    for step in result['steps']:
+    steps=result['steps'] if diagnostics.detailed() else result['steps'][-6:]
+    if len(steps)<len(result['steps']):line(f"  Ранних шагов в истории: {len(result['steps'])-len(steps)}; подробности — specialists --json / --diagnostic.")
+    for step in steps:
         decision=step['decision']
         report_label={'reserved':'зарезервирован номер отчёта','saved':'сохранён отчёт',
                       'missing':'файл отчёта отсутствует','none':'без отчёта'}.get(step.get('report_state'),'номер отчёта')
@@ -1511,17 +1519,35 @@ def run_task_coordinator(db, task_id, args):
         return default if value is None else value
     if not getattr(args,'json',False):
         heading(f'Координатор — задача #{task_id}')
-        line(f'  Одновременно специалистов: до {args.max_specialists}; отдельный Harness runtime на направление.')
-        line(f"  Срез до {option('coordinator_steps',15)} решений, исправлений ответа до {option('decision_retries',1)}; "
-             f"начальный бюджет специалиста: {option('step_limit',25)} инструментов, {option('poc_budget',15)} PoC, "
-             f"{option('max_tokens',24000)} токенов вывода.")
-        line('  Сохранённый расход не обнуляется. Дополнительные 5 решений/основных шагов — через вопрос оператору.')
-    result=coordinated_attack.run(task_id,roles=tuple(r.strip().lower() for r in option('roles','recon,vuln,access,verify').split(',')),
-        max_steps=option('coordinator_steps',15),decision_retries=option('decision_retries',1),max_specialists=option('max_specialists',2),
-        poc_budget=option('poc_budget',15),step_limit=option('step_limit',25),max_tokens=option('max_tokens',24000),
-        expect_flags=expect,key_provider=lambda:session_api_key(args,required=True),
-        continue_run=getattr(args,'continue_coordinated',False),
-        abandon_running_step=getattr(args,'abandon_running_step',None))
+        intent=db.execute('SELECT intent FROM pm_task_intents WHERE task_id=?',(task_id,)).fetchone()
+        line('  Цель: '+safe_display(intent[0] if intent else state.get('primary') or 'Сохранённое задание'))
+        line(f'  Направление: по состоянию задачи; одновременно до {args.max_specialists} специалистов.')
+        line('  Вопросы относятся к выбранному ID. Сохранённые ограничения и бюджеты действуют.')
+    from orchestrator import model_adapter,operator_console,operator_questions
+    def questions():
+        with closing(sqlite3.connect(DB.resolve().as_uri()+'?mode=ro',uri=True)) as local:
+            return operator_questions.listing(local,task_id,pending=True)
+    def answer(qid,decision):
+        from orchestrator import agent_actions
+        with closing(sqlite3.connect(DB.resolve().as_uri()+'?mode=rw',uri=True,timeout=10)) as local:
+            operator_questions.answer(local,task_id,qid,decision,
+                'Operator answered in the console after platform verification' if decision=='approve' and
+                any(q['id']==qid and q['kind']=='flag_confirmation' for q in questions()) else 'Explicit console answer',
+                capability_log=agent_actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
+    with model_adapter.execution_control() as control:
+        live=operator_console.LiveSession(control,questions,answer,enabled=not getattr(args,'json',False))
+        def key():
+            value=session_api_key(args,required=True);diagnostics.register_secret(value);live.start();return value
+        try:
+            from contextlib import redirect_stdout
+            progress=nullcontext() if not getattr(args,'json',False) else redirect_stdout(sys.stderr)
+            with progress:
+                result=coordinated_attack.run(task_id,roles=tuple(r.strip().lower() for r in option('roles','recon,vuln,access,verify').split(',')),
+                    max_steps=option('coordinator_steps',15),decision_retries=option('decision_retries',1),max_specialists=option('max_specialists',2),
+                    poc_budget=option('poc_budget',15),step_limit=option('step_limit',25),max_tokens=option('max_tokens',24000),
+                    expect_flags=expect,key_provider=key,continue_run=getattr(args,'continue_coordinated',False),
+                    abandon_running_step=getattr(args,'abandon_running_step',None))
+        finally:live.close()
     return render_coordinator_result(result,args)
 
 
@@ -2830,7 +2856,13 @@ def op_specialists(args):
         if getattr(args,'cancel',None) is not None:specialist_workflow.request_cancel(db,args.task_id,args.cancel)
         rows=coordinated_attack.steps(db,args.task_id) if task_memory.exists(db,'pm_coordinator_steps') else []
         result={'task_id':args.task_id,'steps':[coordinated_attack.step_view(row) for row in rows]}
-    line(json.dumps(result,ensure_ascii=False,indent=2));return result
+    if getattr(args,'json',False) or diagnostics.detailed():line(json.dumps(result,ensure_ascii=False,indent=2))
+    else:
+        for step in result['steps']:
+            line(f"  Шаг #{step['id']}: {safe_display(step['status'])} · {safe_display(step['decision'].get('question',''))}")
+            if step.get('report_path'):line('    Отчёт: '+safe_display(step['report_path']))
+        line('  Сохранённая сессия не доказывает живость; running после прерывания автоматически не повторяется.')
+    return result
 
 
 def op_questions(args):
@@ -2867,14 +2899,11 @@ def op_questions(args):
         rows=operator_questions.listing(db,args.task_id)
         if getattr(args,'json',False):line(json.dumps(rows,ensure_ascii=False,indent=2))
         else:
+            from orchestrator.operator_console import question_lines
             for item in rows:
-                line(f"  Вопрос #{item['id']} [{item['status']}] {safe_display(item['kind'])} · {safe_display(item['branch_id'])}")
-                line('    '+safe_display(item['question'])+' · '+safe_display(item['reason']))
-                if item.get('resource'):line('    Ресурс: '+diagnostics.clean(item['resource']['value'],limit=None))
-                render_flag_candidate(item)
+                for text in question_lines(item):line('  '+text)
                 render_tool_request(item)
                 render_pivot_request(item)
-                line('    Границы: '+safe_display(json.dumps(item['boundaries'],ensure_ascii=False)))
                 line('    Ссылки: '+', '.join(safe_display(ref) for ref in item['references']))
             if not rows:line('  Ожидающих или сохранённых вопросов нет.')
             line('  Scope и бюджеты прежние. Одобрение tool разрешает только показанную установку. Продолжение — resume.')
@@ -3019,7 +3048,7 @@ def attack_task(args):
         line('')
         line('  ' + tint('[СТОП]', 'danger') +
              ' Цикл прерван оператором; завершённые этапы остались в storage.')
-        return
+        raise
     line('')
     heading('Итог цикла')
     line('  ' + tint('Остановка:', 'muted') + ' ' + safe_display(result['stop_reason']))
@@ -3494,6 +3523,9 @@ def parser_main():
         cmd.add_argument('--verbose', action='store_true', help='Полные отчёты агентов')
     status.add_argument('--json', action='store_true')
     status.add_argument('--verbose', action='store_true')
+    parser.add_argument('--diagnostic',action='store_true',help='Подробные EVENT/идентификаторы; доказательства сохраняются в обоих режимах')
+    for command in sub.choices.values():
+        command.add_argument('--diagnostic',action='store_true',default=argparse.SUPPRESS,help='Подробный диагностический вывод')
     args=parser.parse_args()
     args._explicit_flags={token.split('=',1)[0] for token in sys.argv[1:] if token.startswith('--')}
     return parser,args
@@ -3566,7 +3598,7 @@ def interactive():
         line('')
         choice = input(tint('  pm', 'brand') + tint(' > ', 'bright')).strip()
         if choice == '0':
-            line('Завершено. Никаких фоновых задач не запущено.')
+            line('Выход. Модельные запуски остановлены; история и сетевые правила сохранены.')
             return
         if choice not in ('1', '2', '3', '4', '5', '6', '7', '8', '9'):
             line('  Выбери 0–9.')
@@ -3758,7 +3790,7 @@ def main():
         line('\n' + tint('[ОШИБКА]', 'danger', stream=sys.stderr) + ' ' + safe_display(exc), stream=sys.stderr)
         raise SystemExit(1)
     except KeyboardInterrupt:
-        line('\nОстановлено оператором. Завершённые результаты сохранены.', stream=sys.stderr)
+        line('\nОстановлено оператором. Результаты и неизвестные исходы сохранены; сетевые правила удаляются отдельно.', stream=sys.stderr)
         raise SystemExit(130)
 
 

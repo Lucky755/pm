@@ -4,7 +4,7 @@ Only metadata is recorded. Append locking works across SDK/MCP processes; a
 start without an end is intentionally recognizable after SIGKILL or power loss.
 """
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar,copy_context
 from functools import wraps
 from pathlib import Path
 import fcntl
@@ -25,8 +25,20 @@ _action = ContextVar('pm_diagnostic_action', default=None)
 _secrets = set()
 _relay_runs = {}
 _relay_lock = threading.Lock()
+_presentation=ContextVar('pm_console_presentation',default=None)
+
+
+def detailed():return _presentation.get()=='debug' or _presentation.get() is None and os.environ.get('PM_DIAGNOSTIC')=='1'
+
+
+@contextmanager
+def presentation(mode):
+    if mode not in ('human','debug'):raise ValueError('Unknown console presentation')
+    token=_presentation.set(mode)
+    try:yield
+    finally:_presentation.reset(token)
 ENV_KEYS = ('PM_RUN_ID', 'PM_EVENT_DIR', 'PM_ACTION_ID', 'PM_TASK_ID',
-            'PM_ROLE', 'PM_ITERATION', 'PM_EVENT_CONTEXT_FILE')
+            'PM_ROLE', 'PM_ITERATION', 'PM_EVENT_CONTEXT_FILE','PM_DIAGNOSTIC')
 
 
 def register_secret(value):
@@ -108,6 +120,7 @@ def child_env():
     if not ctx.get('run_id'):
         return {}
     result = {'PM_RUN_ID': ctx['run_id'], 'PM_EVENT_DIR': str(ctx['directory'])}
+    result['PM_DIAGNOSTIC']='1' if detailed() else '0'
     for key, field in (('PM_ACTION_ID', 'action_id'), ('PM_TASK_ID', 'task_id'),
                        ('PM_ROLE', 'role'), ('PM_ITERATION', 'iteration')):
         if ctx.get(field) is not None:
@@ -122,9 +135,15 @@ def journal(ctx=None):
 
 
 def display(event, stream=None):
+    if not detailed():
+        from orchestrator.operator_console import event_lines
+        try:
+            for text in event_lines(event):print('[PM] '+text,file=stream or sys.stderr,flush=True)
+        except (OSError,ValueError):pass
+        return
     fields = ' '.join(f'{key}={clean(event[key])}' for key in
                       ('run_id', 'task_id', 'role', 'iteration', 'status', 'duration_seconds',
-                       'exit_code', 'executor_exit_code', 'result_id', 'reason', 'reason_category', 'reason_summary', 'error_type', 'parameters', 'table', 'identifiers',
+                       'exit_code', 'executor_exit_code', 'result_id', 'status_code','server_outcome','evidence_path','audit_path','report_path','quality','incomplete','reason', 'reason_category', 'reason_summary', 'error_type', 'parameters', 'table', 'identifiers',
                        'previous_state', 'current_state', 'input_tokens', 'cache_read_tokens',
                        'output_tokens', 'coordinator_run_id', 'step_id', 'question', 'expected_result',
                        'known_ports','checked_ports','unchecked_ports','reachable_ports',
@@ -162,7 +181,7 @@ def emit(kind, *, console=True, **fields):
             return [scrub(v) for v in value]
         return clean(value) if isinstance(value, str) else value
     event = scrub(event)
-    event['visible'] = console or (event.get('source') == 'mcp' and kind in ('tool.start', 'tool.end'))
+    event['visible'] = console or (event.get('source') == 'mcp' and kind in ('tool.start', 'tool.end')) or kind in ('check.start','check.end','poc.checks')
     written = False
     try:
         path = journal(ctx)
@@ -396,7 +415,7 @@ def entrypoint(function):
                 task_id = int(argv[index])
         elif len(argv) > 1 and argv[0] in ('resume', 'attack', 'status', 'change-ip') and argv[1].isdigit():
             task_id = int(argv[1])
-        with run(name, task_id) as action:
+        with presentation('debug' if '--diagnostic' in argv or os.environ.get('PM_DIAGNOSTIC')=='1' else 'human'),run(name, task_id) as action:
             # Propagate to ordinary subprocesses, including the planner PTY.
             with process_environment():
                 result = function(*args, **kwargs)
@@ -483,13 +502,17 @@ def outcome(payload):
     return status
 
 
-def capability_result(record_id, payload, exit_code=None):
+def capability_result(record_id, payload, exit_code=None, evidence_path=None):
     """Attach the evidence reference to the enclosing MCP tool, never its output."""
     action = _action.get()
     if action and action.kind == 'tool':
         action.fields['result_id'] = record_id
+        if evidence_path:action.fields['evidence_path']=str(evidence_path)
         if payload.get('exit_code', exit_code) is not None:
             action.fields['exit_code'] = payload.get('exit_code', exit_code)
+    checks=payload.get('internal_checks') or {}
+    if checks.get('source')=='poc_self_report':
+        emit('poc.checks',console=False,started=checks['started'],finished=checks['finished'],result_id=record_id,source='mcp')
     emit('capability.result', console=False, result_id=record_id,
          status=outcome(payload), exit_code=payload.get('exit_code', exit_code), source='mcp')
 
@@ -580,7 +603,7 @@ def relay():
                 while True:
                     drain()
                     if state['stop'].wait(.1):break
-            state.update(drain=drain,thread=threading.Thread(target=poll,daemon=True))
+            state.update(drain=drain,thread=threading.Thread(target=copy_context().run,args=(poll,),daemon=True))
             try:state['thread'].start()
             except RuntimeError as exc:warning(exc);state=None
             if state:_relay_runs[run_id]=state
@@ -715,7 +738,7 @@ def record_result(payload, returncode=None):
     action = _action.get()
     if not action or not isinstance(payload, dict):
         return
-    for key in ('exit_code', 'result_id'):
+    for key in ('exit_code', 'result_id','status_code','server_outcome'):
         if key in payload:
             action.fields[key] = payload[key]
     if returncode is not None:

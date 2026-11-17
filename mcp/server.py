@@ -860,7 +860,7 @@ def log_capability(tool, task_id, payload, elapsed, command=()):
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
-        diagnostics.capability_result(record["id"], payload)
+        diagnostics.capability_result(record["id"], payload,evidence_path=path)
         return record["id"]
 
     except OSError:

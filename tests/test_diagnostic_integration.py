@@ -33,6 +33,7 @@ class IntegrationTests(unittest.TestCase):
         self.console = io.StringIO()
         for patcher in (patch.object(d, 'EVENT_DIR', self.root / 'events'),
                         patch.dict(os.environ, {key: '' for key in d.ENV_KEYS}),
+                        d.presentation('debug'),patch.dict(os.environ,{'PM_DIAGNOSTIC':'1'}),
                         redirect_stderr(self.console), redirect_stdout(self.console)):
             patcher.__enter__()
             self.addCleanup(patcher.__exit__, None, None, None)

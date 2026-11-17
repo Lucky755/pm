@@ -132,7 +132,7 @@ def direct_http(db,task_id,request,session_id,request_limit=6):
         db.execute("INSERT OR IGNORE INTO pm_check_directions VALUES(?,?,'authentication',?,'active',0,?)",(direction,task_id,resource,int(os.environ.get('PM_COORDINATOR_STEP_ID') or 0)))
         db.execute("INSERT INTO pm_check_series(id,task_id,direction_id,plan_json,phase) VALUES(?,?,?,?,'running')",(series,task_id,direction,task_memory.encoded({'kind':'one_explicit_pair'})))
         db.execute("INSERT INTO pm_internal_checks VALUES(?,?,?,?,?,'started',NULL,NULL)",(ident,task_id,direction,series,identity))
-    diagnostics.emit('check.start',task_id=task_id,identifiers={'check_id':ident,'series_id':series},parameters={'kind':'authentication'})
+    diagnostics.emit('check.start',task_id=task_id,action_id='check:'+ident,parent_action_id=diagnostics.context().get('action_id'),identifiers={'check_id':ident,'series_id':series},parameters={'kind':'authentication'})
     def finish(value):
         with db:
             db.execute('UPDATE pm_internal_checks SET phase=?,outcome=?,result_json=? WHERE id=?',(value['phase'],value['outcome'],task_memory.encoded(value),ident))
@@ -141,7 +141,7 @@ def direct_http(db,task_id,request,session_id,request_limit=6):
             if value['outcome']=='server_refusal':
                 db.execute('UPDATE pm_check_directions SET failures=failures+1 WHERE id=?',(direction,))
                 db.execute("UPDATE pm_check_directions SET state='exhausted' WHERE id=? AND failures>=5",(direction,))
-        diagnostics.emit('check.end',task_id=task_id,identifiers={'check_id':ident,'series_id':series},status=value['outcome'])
+        diagnostics.emit('check.end',task_id=task_id,action_id='check:'+ident,parent_action_id=diagnostics.context().get('action_id'),identifiers={'check_id':ident,'series_id':series},status=value['outcome'])
     try:reply=http_client.execute(db,task_id,request,session_id,request_limit=request_limit)
     except BaseException:
         finish({'phase':'unknown','outcome':'unknown'});raise
@@ -213,7 +213,7 @@ def run(db,task_id,plan,capability_log,request=None):
             continue
         ident=uuid.uuid4().hex
         with db:db.execute("INSERT INTO pm_internal_checks VALUES(?,?,?,?,?,'started',NULL,NULL)",(ident,task_id,direction,series,identity))
-        diagnostics.emit('check.start',task_id=task_id,identifiers={'check_id':ident,'series_id':series},parameters={'kind':plan['kind'],'index':index+1})
+        diagnostics.emit('check.start',task_id=task_id,action_id='check:'+ident,parent_action_id=diagnostics.context().get('action_id'),identifiers={'check_id':ident,'series_id':series},parameters={'kind':plan['kind'],'index':index+1})
         try:
             remaining=max(1,int(plan['seconds']-(time.monotonic()-start)))
             session='checks-'+identity[:32] if plan['kind']=='authentication' else plan.get('session_id','default')
@@ -241,7 +241,7 @@ def run(db,task_id,plan,capability_log,request=None):
         with db:
             db.execute('UPDATE pm_internal_checks SET phase=?,outcome=?,result_json=? WHERE id=?',(value['phase'],value['outcome'],task_memory.encoded(value),ident))
             if plan['kind']=='authentication' and value['outcome']=='negative':db.execute('UPDATE pm_check_directions SET failures=failures+1 WHERE id=?',(direction,))
-        diagnostics.emit('check.end',task_id=task_id,identifiers={'check_id':ident,'series_id':series},status=value['outcome'])
+        diagnostics.emit('check.end',task_id=task_id,action_id='check:'+ident,parent_action_id=diagnostics.context().get('action_id'),identifiers={'check_id':ident,'series_id':series},status=value['outcome'])
         if value['phase']=='unknown':unknown=True;break
         if value.get('execution_started') is False:break
         if value['criterion_matched'] and plan['criterion']['kind']!='inventory':matched=True;break

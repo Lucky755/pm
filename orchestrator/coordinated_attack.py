@@ -761,6 +761,8 @@ def run(task_id, *, roles=actions.ROLES, max_steps=15, decision_retries=1,
                 return result_view(db,run_id,task_id,{**state,'specialist_limit':max_specialists or 1},expect_flags,reason,status)
             if state['success_verified']:
                 return finish(state['verified_stop_reason'])
+            if run_status=='waiting_operator' and old_reason=='interrupted' and not continue_run and abandon_running_step is None:
+                return finish('interrupted','waiting_operator')
             if target != state['task']['target']:
                 return finish('task_target_changed','waiting_operator')
             damaged=report_integrity.unresolved(steps(db,task_id))

@@ -27,6 +27,7 @@ spec.loader.exec_module(server)
 
 class DiagnosticTests(unittest.TestCase):
     def setUp(self):
+        mode=d.presentation('debug');mode.__enter__();self.addCleanup(mode.__exit__,None,None,None)
         self.tmp = tempfile.TemporaryDirectory(prefix='pm-diag-test-')
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)

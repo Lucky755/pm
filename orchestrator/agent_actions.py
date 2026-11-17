@@ -1998,6 +1998,9 @@ def save_report(db, context, role, iteration, report, steps_used, raw_response=N
         diagnostics.state_diff(before, diagnostics.state_snapshot(db, context['task_id']), context['task_id'])
         diagnostics.emit('state.change', table='pm_agent_action_reports', identifiers={
             'task_id': context['task_id'], 'role': role, 'iteration': iteration})
+        diagnostics.emit('report.saved',task_id=context['task_id'],role=role,report_path=str(path),
+            quality=report['report_quality']['status'],incomplete=bool(report.get('report_incomplete')),
+            facts=f"Наблюдений со ссылками: {sum(bool(f.get('quote') and f.get('result_id')) for f in report.get('findings',[]))}; кандидатов флагов: {len(report.get('flags',[]))}")
     return str(path)
 
 
@@ -2480,7 +2483,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
                 report[metric] = usage[metric]
             path = save_report(db, context, role, iteration, report, steps_used,
                                raw_response=raw_response,format_response=format_response)
-        except (RuntimeError, ValueError, OSError) as exc:
+        except (RuntimeError, ValueError, OSError, KeyboardInterrupt) as exc:
             # Any stage termination (exhausted step budget, output limit,
             # provider error) still records an intermediate report first:
             # losing the work a stage already did is not acceptable.
