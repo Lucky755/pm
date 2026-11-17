@@ -54,12 +54,12 @@ EXEC_ARGS_MAX = 64
 EXEC_ARG_LEN_MAX = 4096
 EXEC_TOTAL_MAX = 16384
 EXEC_TIMEOUT = 60
-EXEC_TIMEOUT_MAX = 300
-EXEC_PROFILE_TIMEOUT_MAX = 180
-POC_TIMEOUT_MAX = 300
+EXEC_TIMEOUT_MAX = 600
+EXEC_PROFILE_TIMEOUT_MAX = 600
+POC_TIMEOUT_MAX = 600
 
 # Generated PoC scripts live only under the task's own artifact directory.
-POC_MAX_BYTES = 256 * 1024
+POC_MAX_BYTES = 64 * 1024 * 1024
 POC_DEFAULT_TIMEOUT = 60
 POC_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
 POC_SUFFIXES = ('.sh', '.py', '.pl', '.rb', '.txt')
@@ -1712,9 +1712,52 @@ def ensure_research_egress(v, ip, config=None):
     return added
 
 
+def poc_stdin(stdin_file,poc_file,uid,gid,workdir):
+    if Path(stdin_file).parent.resolve()!=Path(poc_file).parent.resolve():raise ValueError('stdin must belong to the same task source directory')
+    source=safe_payload_path(stdin_file,uid);directory=workdir/'poc'
+    try:directory.mkdir(mode=0o700);os.chown(directory,uid,gid)
+    except FileExistsError:pass
+    directory_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    temporary='.stdin-'+os.urandom(12).hex();total=0;digest=hashlib.sha256()
+    try:
+        info=os.fstat(directory_fd)
+        if info.st_uid!=uid or info.st_mode&0o077:raise ValueError('Unsafe stdin directory')
+        source_fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW)
+        try:
+            info=os.fstat(source_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=uid or info.st_nlink!=1 or info.st_mode&0o022:raise ValueError('Unsafe stdin file')
+            target_fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory_fd)
+            try:
+                os.fchown(target_fd,uid,gid)
+                while block:=os.read(source_fd,65536):
+                    total+=len(block)
+                    if total>POC_MAX_BYTES:raise ValueError('stdin exceeds explicit file bound')
+                    digest.update(block)
+                    while block:block=block[os.write(target_fd,block):]
+                os.fsync(target_fd)
+            finally:os.close(target_fd)
+        finally:os.close(source_fd)
+        name='stdin-'+digest.hexdigest()[:32]+'.txt'
+        os.replace(temporary,name,src_dir_fd=directory_fd,dst_dir_fd=directory_fd)
+        return {'local':directory/name,'poc_sha256':digest.hexdigest(),'poc_bytes':total}
+    finally:
+        try:os.unlink(temporary,dir_fd=directory_fd)
+        except FileNotFoundError:pass
+        os.close(directory_fd)
+
+
+def operation_timeout(profile,timeout,reason=''):
+    value=EXEC_TIMEOUT if timeout is None else int(timeout)
+    if not 5<=value<=600:raise ValueError('Operation timeout must be 5..600 seconds')
+    baseline=180 if profile=='exec' else 300
+    if value>baseline and (not isinstance(reason,str) or not reason.strip() or len(reason)>1000):
+        raise ValueError('A long operation needs a concrete bounded purpose (operation_reason)')
+    return value
+
+
 def run(task, profile, target, port, ports, scheme, path="/", hostname="",
         capture_limit=HTTP_CAPTURE_BODY_LIMIT, argv=None, poc_file=None,
-        poc_interp='bash', research_host='', timeout=None,ssrf_destination='',ssrf_context='',ssrf_parameter='url'):
+        poc_interp='bash', research_host='', timeout=None,ssrf_destination='',ssrf_context='',ssrf_parameter='url',operation_reason='',stdin_file=''):
     ensure_root()
     v, config = owned_config(task)
     sudo_uid = os.environ.get('SUDO_UID')
@@ -1737,6 +1780,7 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
     extra = ()
     workdir = None
     poc_details = None
+    stdin_details=None
     check_egress = True
     if profile == 'research':
         # Fixed allowlist only. The resolved address is pinned in the nft set
@@ -1772,8 +1816,8 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
             built = poc_argv(poc_file, poc_interp, config['uid'], config['gid'], workdir)
             args = built['argv']
             poc_details = built
-        profile_limit = EXEC_PROFILE_TIMEOUT_MAX if profile == 'exec' else POC_TIMEOUT_MAX
-        run_timeout = EXEC_TIMEOUT if timeout is None else max(5, min(int(timeout), profile_limit, EXEC_TIMEOUT_MAX))
+            if stdin_file:stdin_details=poc_stdin(stdin_file,poc_file,config['uid'],config['gid'],workdir)
+        run_timeout = operation_timeout(profile,timeout,operation_reason)
         stdout_limit = 120000
     else:
         target = check_target(target, config['allowed'])
@@ -1826,13 +1870,16 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
     # Strictly bounded runtime and output (including potentially malicious service strings).
     started = time.monotonic()
     timed_out = False
+    input_handle=None
     try:
+        if stdin_details:input_handle=os.fdopen(os.open(stdin_details['local'],os.O_RDONLY|os.O_NOFOLLOW),'rb')
         process = subprocess.Popen(
             privileged_scan_command(v['name'], args, workdir) if profile in RAW_SCAN_PROFILES else
             isolated_command(v['name'], config['owner'], config['uid'], config['gid'], args, extra, workdir=workdir),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=input_handle or subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, errors='replace', start_new_session=True)
     except OSError as exc:
+        if input_handle:input_handle.close()
         output({'operation': 'network_probe_isolated', 'task_id': task,
                 'profile': profile, 'target': target, 'status': 'error',
                 'kind': 'permission_denied' if isinstance(exc, PermissionError) else 'executor_unavailable',
@@ -1850,12 +1897,15 @@ def run(task, profile, target, port, ports, scheme, path="/", hostname="",
             pass
         stdout, stderr = process.communicate()
         code = 124
+    finally:
+        if input_handle:input_handle.close()
     poc_result = {}
     if poc_details is not None:
         poc_result['network_isolated'] = True
         poc_result = {key: poc_details[key] for key in
                       ('poc_sha256', 'poc_bytes', 'poc_source_flag_literals')}
         poc_result['poc_path'] = args[1]
+        if stdin_details:poc_result['stdin_file']={k:stdin_details[k] for k in ('poc_sha256','poc_bytes')}
         try:
             after = poc_file_metadata(poc_details['local'], config['uid'])
             poc_result['poc_changed_during_run'] = (
@@ -3733,9 +3783,11 @@ def main():
     r.add_argument('--capture-limit',type=int,choices=HTTP_CAPTURE_LIMITS,default=HTTP_CAPTURE_BODY_LIMIT)
     r.add_argument('--argv', action='append', default=None)
     r.add_argument('--poc-file', default='')
+    r.add_argument('--stdin-file',default='')
     r.add_argument('--poc-interp', default='bash', choices=POC_INTERPRETERS)
     r.add_argument('--research-host', default='')
     r.add_argument('--timeout', default='')
+    r.add_argument('--operation-reason',default='')
     hs = sub.add_parser('hosts')
     hs.add_argument('--task-id', type=int, required=True)
     hs.add_argument('--hostname', action='append', required=True)
@@ -3837,8 +3889,8 @@ def main():
                    else tool_action(args.task_id, args.action, args.request_id))
         elif args.command == 'run': run(args.task_id, args.profile, args.target,
                                         args.port, args.ports, args.scheme, args.path, args.hostname,args.capture_limit,
-                                        argv=args.argv, poc_file=args.poc_file, poc_interp=args.poc_interp,
-                                        research_host=args.research_host, timeout=args.timeout or None,
+                                        argv=args.argv, poc_file=args.poc_file, poc_interp=args.poc_interp,stdin_file=args.stdin_file,
+                                        research_host=args.research_host, timeout=args.timeout or None,operation_reason=args.operation_reason,
                                         ssrf_destination=args.ssrf_destination,ssrf_context=args.ssrf_context,ssrf_parameter=args.ssrf_parameter)
         elif args.command == 'sync-forward': sync_forward(args.task_id)
         elif args.command=='pivot':

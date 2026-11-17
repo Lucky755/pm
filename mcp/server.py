@@ -46,6 +46,8 @@ mcp = FastMCP("pentest-master")
 ASSET_DB = ROOT / 'storage/tasks.db'
 from orchestrator import target_availability
 network_guard=target_availability.guard(lambda:ASSET_DB)
+from orchestrator import research_budgets
+budget_guard=research_budgets.tool_guard(lambda:ASSET_DB)
 
 
 _memory_operation_id=ContextVar('pm_memory_operation_id',default=None)
@@ -533,6 +535,7 @@ def list_network_profiles() -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def run_network_probe(
     task_id: int,
@@ -702,7 +705,7 @@ ISOLATED_EXECUTOR = ROOT / "executor/network_executor_isolated.py"
 NETWORK_JOBS = ROOT / "orchestrator/network_jobs.py"
 POC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 POC_SUFFIXES = (".sh", ".py", ".pl", ".rb", ".txt")
-POC_MAX_BYTES = 256 * 1024
+POC_MAX_BYTES = 64 * 1024 * 1024
 RESEARCH_HOSTS = (
     "nvd.nist.gov",
     "services.nvd.nist.gov",
@@ -731,6 +734,7 @@ def valid_ipv4(text):
 def capability_provenance(tool, payload, command):
     """Classify the source when writing the record, before argv is truncated."""
     if payload.get('cached') is True:return 'local'
+    if tool=='check_series':return 'network' if payload.get('checks_started',0) else 'local'
     if tool == 'poc_run':
         if payload.get('network_isolated') is True:
             if payload.get('network_contact') is True:return 'network'
@@ -781,6 +785,9 @@ def log_capability(tool, task_id, payload, elapsed, command=()):
     The orchestrator reads this log as evidence, so nothing an agent did inside
     the namespace is lost when its step budget runs out.
     """
+    if tool=='poc_run':
+        from orchestrator.check_series import poc_events
+        payload.setdefault('internal_checks',poc_events(payload))
     if not isinstance(task_id, int) or not 1 <= task_id <= 200:
         return None
 
@@ -806,6 +813,7 @@ def log_capability(tool, task_id, payload, elapsed, command=()):
             "provenance": capability_provenance(tool, payload, full_argv),
         }
         if _memory_operation_id.get():record['memory_operation_id']=_memory_operation_id.get()
+        if os.environ.get('PM_BUDGET_ROLE'):record['actor_role']=os.environ['PM_BUDGET_ROLE']
         record["input_flag_literals"] = sorted(set(re.findall(
             r"\b[A-Z][A-Z0-9_]{1,19}\{[A-Za-z0-9_!@#$%^&*+.:-]{3,120}\}",
             " ".join(full_argv)
@@ -1008,6 +1016,13 @@ def track_memory_operation(function):
                 if (poc.resolve().is_relative_to(allowed) and poc.is_file() and not poc.is_symlink()
                         and poc.stat().st_size<=POC_MAX_BYTES):
                     conditions['poc_source_sha256']=hashlib.sha256(poc.read_bytes()).hexdigest()
+                if '--stdin-file' in command:
+                    data=Path(command[list(command).index('--stdin-file')+1])
+                    if data.resolve().is_relative_to(allowed) and data.is_file() and not data.is_symlink() and data.stat().st_size<=POC_MAX_BYTES:
+                        digest=hashlib.sha256()
+                        with data.open('rb') as stream:
+                            for block in iter(lambda:stream.read(65536),b''):digest.update(block)
+                        conditions['stdin_sha256']=digest.hexdigest()
             fresh=False
             if task_memory.exists(db,'pm_memory_operations'):
                 previous=db.execute('SELECT created_at FROM pm_memory_operations WHERE task_id=? AND signature=? '
@@ -1076,6 +1091,16 @@ def track_memory_operation(function):
 def run_capability(command, timeout, tool="capability", task_id=None):
     """Run a capability helper and return its own JSON payload verbatim."""
     started = time.monotonic()
+    if tool=='poc_run' and ASSET_DB.is_file() and CAPABILITY_LOG.parent==ASSET_DB.parent:
+        with sqlite3.connect(ASSET_DB,timeout=10) as db:
+            try:
+                research_budgets.ensure(db,task_id,'poc',os.environ.get('PM_BUDGET_ROLE','manual'),capability_log=CAPABILITY_LOG/f'task_{task_id}.jsonl')
+                research_budgets.consume(db,task_id,'poc',os.environ.get('PM_BUDGET_ROLE','manual'),unit='poc_executor_dispatch')
+                db.commit()
+            except research_budgets.Exhausted:
+                payload={'status':'blocked','execution_started':False,'reason_category':'poc_budget_exhausted','reason':'15 PoC dispatches reached; return results to coordinator'}
+                rid=log_capability(tool,task_id,payload,0,command)
+                return tool_response({**payload,'result_id':rid})
     try:
         result = subprocess.run(
             command,
@@ -1154,6 +1179,9 @@ def run_capability(command, timeout, tool="capability", task_id=None):
             "payload": payload,
         }
 
+    if tool=='poc_run':
+        from orchestrator.check_series import poc_events
+        payload['internal_checks']=poc_events(payload)
     record_id = log_capability(tool, task_id, payload, time.monotonic() - started, command)
     visible = dict(payload)
     visible.pop("poc_source_flag_literals", None)
@@ -1162,6 +1190,50 @@ def run_capability(command, timeout, tool="capability", task_id=None):
 
 @mcp.tool()
 @diagnostics.tool
+def pm_budget_status(task_id:int)->str:
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked'})
+    with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True)) as db:
+        return tool_response({'status':'completed','accounts':research_budgets.listing(db,task_id),'provenance':'local'})
+
+
+@mcp.tool()
+@diagnostics.tool
+@budget_guard
+@network_guard
+def pm_check_series(task_id:int,plan_json:str)->str:
+    """Bounded HTTP Basic pairs or paths/traversal, each check saved separately.
+
+    Plan kind,url,hypothesis,max_requests(<=50),seconds(<=600),criterion and
+    either <=5 pairs [{username,password,source_ref}] or explicit paths.
+    Criterion: kind=authenticated|find_file|inventory, status list and exact
+    body_contains/sha256 for authentication/file. First 200 is insufficient.
+    Existing scope/HTTP/storage/repeat budgets apply to every inner request.
+    replan=true needs a different running saved coordinator step and new checks.
+    """
+    from orchestrator import check_series
+    try:
+        if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):raise ValueError('Wrong task')
+        with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
+            payload=check_series.run(db,task_id,json.loads(plan_json),CAPABILITY_LOG/f'task_{task_id}.jsonl',
+                request=lambda value,name,bound:json.loads(pm_http_request(task_id,json.dumps(value),name,request_limit=bound)))
+            task_memory.sync(db,task_id,CAPABILITY_LOG/f'task_{task_id}.jsonl',reason='internal_check_series');db.commit()
+    except (ValueError,OSError,sqlite3.Error) as exc:payload={'status':'blocked','execution_started':False,'reason':str(exc)[:240]}
+    rid=log_capability('check_series',task_id,payload,0)
+    return tool_response({**payload,'result_id':rid})
+
+
+@mcp.tool()
+@diagnostics.tool
+def pm_checks_status(task_id:int)->str:
+    from orchestrator import check_series
+    if not valid_task(task_id) or (os.environ.get('PM_TASK_ID') or str(task_id))!=str(task_id):return tool_response({'status':'blocked'})
+    with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True)) as db:
+        return tool_response({'status':'completed','directions':check_series.state(db,task_id),'provenance':'local'})
+
+
+@mcp.tool()
+@diagnostics.tool
+@budget_guard
 def pm_evidence_index(task_id: int, offset: int = -1, limit: int = 40) -> str:
     """List saved result IDs; offset=-1 selects the latest page without a charged step."""
     if not valid_task(task_id) or type(offset) is not int or offset < -1 or type(limit) is not int:
@@ -1174,6 +1246,7 @@ def pm_evidence_index(task_id: int, offset: int = -1, limit: int = 40) -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_task_memory(task_id:int,section:str='resources',offset:int=0,limit:int=20,version:int=-1)->str:
     """Page complete task state/history; a local read creates no network observation."""
     expected=os.environ.get('PM_TASK_ID','')
@@ -1206,6 +1279,7 @@ def pm_task_memory(task_id:int,section:str='resources',offset:int=0,limit:int=20
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_material_read(task_id:int,reference:str,offset:int=0,limit:int=4096,sha256:str='')->str:
     """Read one verified original byte range with coverage metadata; never a GET."""
     expected=os.environ.get('PM_TASK_ID','')
@@ -1226,6 +1300,7 @@ def pm_material_read(task_id:int,reference:str,offset:int=0,limit:int=4096,sha25
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_material_import(task_id:int,path:str)->str:
     """Snapshot one regular task-workspace file (<=64 MiB), never a host path.
 
@@ -1259,6 +1334,7 @@ def pm_material_import(task_id:int,path:str)->str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_material_process(task_id:int,reference:str,operation:str='auto',options_json:str='{}')->str:
     """Actual-type local text/archive/PDF/OCR/static-binary/Git processing.
 
@@ -1285,6 +1361,7 @@ def pm_material_process(task_id:int,reference:str,operation:str='auto',options_j
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_capability_read(task_id: int, result_id: str, offset: int = 0) -> str:
     """Read up to 12 KiB of a saved capability result by ID, with byte offset."""
     if not valid_task(task_id) or not re.fullmatch(r"[a-f0-9]{24}", str(result_id)):
@@ -1321,11 +1398,12 @@ def pm_capability_read(task_id: int, result_id: str, offset: int = 0) -> str:
 
 @mcp.tool()
 @diagnostics.tool
-def pm_write_poc(task_id: int, filename: str, content: str) -> str:
+@budget_guard
+def pm_write_poc(task_id: int, filename: str, content: str='', material_ref: str='',instrument_checks:bool=False) -> str:
     """Save a PoC or helper script for this task, then run it with pm_poc_run.
 
     filename: letters, digits, dot, underscore, hyphen, up to 64 chars, with
-    suffix .sh, .py, .pl, .rb or .txt. content: at most 256 KiB of text.
+    suffix .sh, .py, .pl, .rb or .txt. content or material_ref: <=64 MiB explicit file resource bound.
     The host original is stored under storage/pocs. The first pm_poc_run copies
     it to writable /work/poc/<filename> inside the sandbox.
     """
@@ -1344,17 +1422,31 @@ def pm_write_poc(task_id: int, filename: str, content: str) -> str:
             stderr="Invalid filename (allowed suffixes: .sh .py .pl .rb .txt)",
         )
 
-    if not isinstance(content, str) or not content.strip():
+    source_bytes=None
+    if material_ref:
+        if content:return response('write_poc','blocked',1,stderr='Choose content or material_ref')
+        try:
+            with closing(sqlite3.connect(f'file:{ASSET_DB}?mode=ro',uri=True)) as db:
+                source_bytes=task_memory.material(db,task_id,material_ref,CAPABILITY_LOG/f'task_{task_id}.jsonl')
+        except (ValueError,OSError,UnicodeError,sqlite3.Error) as exc:return response('write_poc','blocked',1,stderr=type(exc).__name__)
+    if source_bytes is None and (not isinstance(content, str) or not content.strip()):
         return response("write_poc", "blocked", 1, stderr="Empty content")
 
-    encoded = content.encode("utf-8")
+    encoded = source_bytes if source_bytes is not None else content.encode("utf-8")
+    original=encoded
+    if instrument_checks:
+        try:
+            if not filename.endswith('.py'):raise ValueError('Automatic instrumentation supports Python; other interpreters must emit PM_CHECK explicitly')
+            from orchestrator.check_series import instrument_python
+            encoded=instrument_python(encoded.decode('utf-8')).encode('utf-8')
+        except (ValueError,SyntaxError,UnicodeError) as exc:return response('write_poc','blocked',1,stderr=str(exc))
 
     if len(encoded) > POC_MAX_BYTES:
         return response(
             "write_poc",
             "blocked",
             1,
-            stderr="Content exceeds 256 KiB",
+            stderr="Content exceeds explicit 64 MiB file resource bound",
         )
 
     directory = POC_ROOT / f"task_{task_id}"
@@ -1369,7 +1461,11 @@ def pm_write_poc(task_id: int, filename: str, content: str) -> str:
             stderr="Refusing to replace a symlink or special file",
         )
 
-    path.write_text(content, encoding="utf-8")
+    if instrument_checks:
+        original_path=directory/(filename+'.source-'+hashlib.sha256(original).hexdigest())
+        if original_path.is_symlink():return response('write_poc','blocked',1,stderr='Unsafe original source path')
+        original_path.write_bytes(original);original_path.chmod(0o600)
+    path.write_bytes(encoded)
     path.chmod(0o600)
 
     sandbox_path = f"/work/poc/{filename}"
@@ -1383,6 +1479,8 @@ def pm_write_poc(task_id: int, filename: str, content: str) -> str:
         "operation": "write_poc",
         "path": sandbox_path,
         "bytes": len(encoded),
+        "internal_check_protocol":"PM_CHECK JSON start/end per check; arbitrary uninstrumented code remains unmeasured",
+        "instrumented":instrument_checks,
         "result_id": record_id,
         "next": f"pm_poc_run(task_id={task_id}, poc_file='{sandbox_path}')",
     })
@@ -1390,6 +1488,7 @@ def pm_write_poc(task_id: int, filename: str, content: str) -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_poc_run(
     task_id: int,
@@ -1397,6 +1496,8 @@ def pm_poc_run(
     poc_file: str,
     interp: str = "bash",
     timeout: int = 60,
+    operation_reason: str = '',
+    stdin_file: str = '',
 ) -> str:
     """Run a PoC written with pm_write_poc inside the task's isolated namespace.
 
@@ -1464,8 +1565,12 @@ def pm_poc_run(
             stderr="PoC must be created with pm_write_poc for this task",
         )
 
-    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 5 <= timeout <= 300:
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 5 <= timeout <= 600:
         return response("poc_run", "blocked", 1, stderr="Invalid timeout")
+    try:
+        from executor.netguard_root import operation_timeout
+        operation_timeout('poc_run',timeout,operation_reason)
+    except ValueError as exc:return response('poc_run','blocked',1,stderr=str(exc))
     try:reject_password_change(text=path.read_text(encoding='utf-8',errors='replace'))
     except ValueError as exc:return response('poc_run','blocked',1,stderr=str(exc))
 
@@ -1488,11 +1593,18 @@ def pm_poc_run(
         "--execute",
     ]
 
+    if operation_reason:command+=['--operation-reason',operation_reason]
+    if stdin_file:
+        name=stdin_file.removeprefix('/work/poc/')
+        data=POC_ROOT/f'task_{task_id}'/name
+        if not POC_NAME.fullmatch(name) or data.is_symlink() or not data.is_file():return response('poc_run','blocked',1,stderr='stdin_file must be a saved task PoC/data basename')
+        command+=['--stdin-file',str(data.resolve())]
     return run_capability(command, timeout + 40, tool="poc_run", task_id=task_id)
 
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_tool_request(task_id: int, spec_json: str, branch_id: str = 'task') -> str:
     """Request one bounded tool/doc/package acquisition; never approve it for the operator.
 
@@ -1532,6 +1644,7 @@ def pm_tool_request(task_id: int, spec_json: str, branch_id: str = 'task') -> st
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_tool_status(task_id: int) -> str:
     """Local saved installation state, source/version/invocation and failures; no network or sudo."""
     from orchestrator import tool_requests
@@ -1544,6 +1657,7 @@ def pm_tool_status(task_id: int) -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_tool_read(task_id: int, request_id: int, offset: int = 0, limit: int = 4096) -> str:
     """Read a bounded, hash-verified saved tool/doc range without network/sudo; not new target evidence."""
     from orchestrator import tool_requests
@@ -1558,6 +1672,7 @@ def pm_tool_read(task_id: int, request_id: int, offset: int = 0, limit: int = 40
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_tool_acquire(task_id: int, request_id: int) -> str:
     """Apply an operator-authorized receipt. Cannot authorize; failed/unknown installs are not replayed."""
     from orchestrator import tool_requests
@@ -1579,6 +1694,7 @@ def pm_tool_acquire(task_id: int, request_id: int) -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_port_status(task_id:int,offset:int=0,limit:int=50)->str:
     """Read aggregated saved discovery states, no target/broker/API requests."""
     from orchestrator import port_research
@@ -1591,6 +1707,7 @@ def pm_port_status(task_id:int,offset:int=0,limit:int=50)->str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_port_survey(task_id:int,protocol:str,ports:str,max_jobs:int=1)->str:
     """Separate explicit TCP/UDP discovery queue (1..50 ports), no service identity.
@@ -1616,6 +1733,7 @@ def pm_port_survey(task_id:int,protocol:str,ports:str,max_jobs:int=1)->str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_privileged_scan(task_id: int, target: str, profile: str, ports: str) -> str:
     """Fixed nmap_syn/nmap_udp/nmap_os through broker; scope/NetGuard/repeat budgets still apply.
@@ -1635,6 +1753,7 @@ def pm_privileged_scan(task_id: int, target: str, profile: str, ports: str) -> s
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_net_exec(
     task_id: int,
@@ -1643,6 +1762,7 @@ def pm_net_exec(
     timeout: int = 60,
     hypothesis_key: str = "",
     new_evidence_id: str = "",
+    operation_reason: str = '',
 ) -> str:
     """Run any installed Kali tool inside the task's isolated namespace.
 
@@ -1684,8 +1804,12 @@ def pm_net_exec(
             stderr="Invalid argv (absolute argv[0], up to 64 tokens)",
         )
 
-    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 5 <= timeout <= 180:
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 5 <= timeout <= 600:
         return response("net_exec", "blocked", 1, stderr="Invalid timeout")
+    try:
+        from executor.netguard_root import operation_timeout
+        operation_timeout('exec',timeout,operation_reason)
+    except ValueError as exc:return response('net_exec','blocked',1,stderr=str(exc))
     try:reject_password_change(argv)
     except ValueError as exc:return response('net_exec','blocked',1,stderr=str(exc))
 
@@ -1715,11 +1839,13 @@ def pm_net_exec(
         "--execute",
     ]
 
+    if operation_reason:command+=['--operation-reason',operation_reason]
     return run_capability(command, timeout + 40, tool="net_exec", task_id=task_id)
 
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_browser(task_id:int,action:str,session_id:str='',action_json:str='{}',url:str='',username:str='',purpose:str='',proxy:str='')->str:
     """Managed JavaScript browser, with scoped PM HTTP as its only network path.
@@ -1778,6 +1904,7 @@ def pm_browser(task_id:int,action:str,session_id:str='',action_json:str='{}',url
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_browser_read(task_id:int,session_id:str,offset:int=0,limit:int=10,action_id:int=0)->str:
     """Read saved browser observations only. No live DOM/JS, target, browser or Burp calls."""
     from orchestrator import browser
@@ -1799,6 +1926,7 @@ def pm_browser_read(task_id:int,session_id:str,offset:int=0,limit:int=10,action_
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_burp(task_id:int,action:str='status',url:str='',after:int=0,limit:int=1)->str:
     """Burp Professional capability and passive history import/read.
 
@@ -1822,8 +1950,9 @@ def pm_burp(task_id:int,action:str='status',url:str='',after:int=0,limit:int=1)-
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
-def pm_http_request(task_id:int,request_json:str,session_id:str='default')->str:
+def pm_http_request(task_id:int,request_json:str,session_id:str='default',request_limit:int=6)->str:
     """Fresh task-scoped HTTP exchange with methods, bodies, cookies and uploads.
 
     JSON fields: url,method,headers,query,cookies,auth,body/body_b64/json/form/files,
@@ -1841,7 +1970,8 @@ def pm_http_request(task_id:int,request_json:str,session_id:str='default')->str:
             from orchestrator import burp_adapter
             if burp_adapter.status(task_id)['status']!='available':raise ValueError('burp_unavailable: dedicated Burp Professional bridge v3 is required')
         with closing(sqlite3.connect(ASSET_DB,timeout=10)) as db:
-            payload=http_client.execute(db,task_id,request,session_id)
+            from orchestrator import check_series
+            payload=check_series.direct_http(db,task_id,request,session_id,request_limit)
     except http_client.HTTPExecutionError as exc:
         payload={'status':'unknown','reason_category':'outcome_unknown','reason':str(exc),'task_id':task_id}
     except (ValueError,TypeError,KeyError) as exc:
@@ -1855,6 +1985,7 @@ def pm_http_request(task_id:int,request_json:str,session_id:str='default')->str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_http_read(task_id:int,exchange_id:int,part:str='body',offset:int=0,limit:int=4096)->str:
     """Read a saved HTTP request/response/body range. No network or new evidence."""
     from orchestrator import http_client
@@ -1867,6 +1998,7 @@ def pm_http_read(task_id:int,exchange_id:int,part:str='body',offset:int=0,limit:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_http_capture(
     task_id: int,
@@ -1918,6 +2050,7 @@ def pm_http_capture(
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_http_ssrf(task_id:int,application:str,destination:str,parameter:str='url',context:str='') -> str:
     """Legacy cached SSRF GET. Use pm_http_request.ssrf for fresh query/form/JSON checks.
@@ -1951,6 +2084,7 @@ def pm_http_ssrf(task_id:int,application:str,destination:str,parameter:str='url'
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_research(task_id: int, target: str, host: str, path: str = "/") -> str:
     """Fetch CVE and exploit data from the fixed research allowlist.
 
@@ -2005,6 +2139,7 @@ def pm_research(task_id: int, target: str, host: str, path: str = "/") -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_callback(
     task_id: int,
@@ -2115,6 +2250,7 @@ def pm_callback(
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_transfer(task_id:int,action:str,port:int=4445,expected_bytes:int=-1,sha256:str='',
                 max_bytes:int=536870912,timeout:int=300)->str:
@@ -2138,6 +2274,7 @@ def pm_transfer(task_id:int,action:str,port:int=4445,expected_bytes:int=-1,sha25
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_pivot_request(task_id:int,spec_json:str)->str:
     """Request one scoped SSH forward through an existing managed SSH session.
@@ -2165,6 +2302,7 @@ def pm_pivot_request(task_id:int,spec_json:str)->str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_pivot(task_id:int,route_id:int,action:str='status')->str:
     """Status/apply an operator-authorized SSH forward; cannot authorize or recreate broken/unknown forwards.
@@ -2198,6 +2336,7 @@ def pm_pivot(task_id:int,route_id:int,action:str='status')->str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 @network_guard
 def pm_session(
     task_id: int,
@@ -2333,6 +2472,7 @@ def pm_session(
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_worknote(task_id: int, append: str = "") -> str:
     """Read or append 0-7 evidence-backed facts in this task's /work/NOTES.md.
 
@@ -2386,6 +2526,7 @@ def pm_worknote(task_id: int, append: str = "") -> str:
 
 @mcp.tool()
 @diagnostics.tool
+@budget_guard
 def pm_observations(task_id: int) -> str:
     """Return saved network observations and capability outputs for a task."""
     if not valid_task(task_id):

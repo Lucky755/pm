@@ -37,6 +37,8 @@ def reconnaissance(db, task_id, status, reason=''):
 def pause(db, task_id):
     """Read only: do not refresh evidence, instantiate SDKs or change checkpoints."""
     from orchestrator import coordinated_attack as coordinator, operator_questions, target_availability
+    from orchestrator import research_budgets,check_series
+    work={"research_budgets":research_budgets.listing(db,task_id),"directions":check_series.state(db,task_id)}
     availability=target_availability.saved(db,task_id)
     exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_coordinator_runs'").fetchone()
     if exists:
@@ -56,7 +58,7 @@ def pause(db, task_id):
             saved_pause=(row[1]=='waiting_operator' and row[2] not in operator_questions.RETIRED_PAUSES
                          and not (row[2]=='operator_questions_pending' and not pending))
             if running or waiting or damaged or pending or saved_pause:
-                return {'target_availability':availability,'task_id':task_id,'coordinator_run_id':row[0],'status':'waiting_operator','succeeded':False,
+                return {**work,'target_availability':availability,'task_id':task_id,'coordinator_run_id':row[0],'status':'waiting_operator','succeeded':False,
                         'stop_reason':('interrupted_running_step' if running else
                                        'role_report_damaged_requires_review' if damaged else row[2]),
                         'checkpoints':[], 'checkpoint_classifier_blocking':False,
@@ -64,16 +66,16 @@ def pause(db, task_id):
                         'steps':[coordinator.step_view(r) for r in rows]}
     queued=operator_questions.listing(db,task_id,pending=True)
     if queued:
-        return {'target_availability':availability,'task_id':task_id,'coordinator_run_id':None,'status':'waiting_operator','succeeded':False,
+        return {**work,'target_availability':availability,'task_id':task_id,'coordinator_run_id':None,'status':'waiting_operator','succeeded':False,
                 'stop_reason':'operator_questions_pending','steps':[],
                 'operator_questions':operator_questions.listing(db,task_id),'checkpoints':[]}
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_tcp_full_scans'").fetchone():
         if db.execute("SELECT 1 FROM pm_tcp_full_scans WHERE task_id=? AND status='running' "
                       'AND target=(SELECT target FROM tasks WHERE id=?)',(task_id,task_id)).fetchone():
-            return {'target_availability':availability,'task_id':task_id,'coordinator_run_id':None,'status':'waiting_operator','succeeded':False,'steps':[],
+            return {**work,'target_availability':availability,'task_id':task_id,'coordinator_run_id':None,'status':'waiting_operator','succeeded':False,'steps':[],
                     'stop_reason':'interrupted_full_tcp_scan'}
     meta=saved(db,task_id)
     if meta and meta['recon_status'] in ('running','waiting_operator') and meta['pause_reason'] not in operator_questions.RETIRED_PAUSES:
-        return {'target_availability':availability,'task_id':task_id,'coordinator_run_id':None,'status':'waiting_operator','succeeded':False,'steps':[],
+        return {**work,'target_availability':availability,'task_id':task_id,'coordinator_run_id':None,'status':'waiting_operator','succeeded':False,'steps':[],
                 'stop_reason':meta['pause_reason'] or 'reconnaissance_interrupted_requires_review'}
     return None

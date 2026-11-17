@@ -378,10 +378,15 @@ def save_plan(target, description, plan):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True)
-    parser.add_argument("--task", required=True)
+    task_input=parser.add_mutually_exclusive_group(required=True)
+    task_input.add_argument("--task")
+    task_input.add_argument("--task-file")
     parser.add_argument("--context-file")
     args = parser.parse_args()
 
+    if args.task_file:
+        from intent_limits import read_utf8_file
+        args.task=read_utf8_file(args.task_file)
     target = str(ipaddress.ip_address(args.target))
 
     api_key = getpass.getpass("Experiential API key: ").strip()

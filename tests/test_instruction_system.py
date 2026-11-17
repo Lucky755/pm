@@ -141,7 +141,7 @@ class SpecialistExecutionTests(unittest.TestCase):
         self.assertEqual(limits,[8192]);self.assertNotIn('pm_net_exec',allowed[0])
         with self.case.connect() as db:
             assignment=json.loads(c.steps(db,11)[0]['assignment_json'])
-        self.assertEqual(assignment['inherited_limits'],{'step_limit':6,'poc_budget':1,'max_tokens':8192})
+        self.assertEqual(assignment['inherited_limits'],{'step_limit':15,'poc_budget':7,'max_tokens':8192})
         self.assertEqual(result['steps'][0]['status'],'completed');self.assertFalse(result['succeeded'])
 
     def test_specialization_keeps_triage_without_access_approval(self):

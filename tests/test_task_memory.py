@@ -236,7 +236,7 @@ class TaskMemoryTests(unittest.TestCase):
                 hashlib.sha256(memory.material(db,11,ref,self.log)).hexdigest())))
             context=a.task_context(db,11);context['specialist_assignment']=assignment
             full=a.build_prompt(db,context,'vuln',assignment['question'],2,7)
-            compact=a.compact_prompt(db,context,'vuln',assignment['question'],2,7,15,'different reason')
+            compact=a.compact_prompt(db,context,'vuln',assignment['question'],2,7,25,'different reason')
         self.assertEqual(full.split('<pm_dynamic_context>')[0],compact.split('<pm_dynamic_context>')[0])
 
     def test_unknown_token_metrics_and_observed_cache_are_not_assumed(self):

@@ -336,7 +336,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIn('без брутфорса',self.prompts[0]['task']['intent'])
         self.assertIn('  /status',self.prompts[0]['task']['intent'])
         self.assertEqual(self.prompts[1]['recent_results'][0]['result_id'],'0'*23+'1')
-        self.assertTrue(all(call[3:5]==(7,15) for call in self.calls))
+        self.assertTrue(all(call[3:5]==(15,25) for call in self.calls))
         self.assertTrue(all(call[5]['max_tokens']==24000 for call in self.calls))
 
     def test_false_role_goal_claim_cannot_complete_primary_goal(self):

@@ -635,6 +635,8 @@ def execute_job(db, plan_id):
         )
 
     command.append("--execute")
+    from orchestrator import research_budgets
+    research_budgets.reconnaissance(db,plan['task_id'])
 
     try:
         db.execute("BEGIN IMMEDIATE")

@@ -62,7 +62,7 @@ class AgentPromptContextTests(unittest.TestCase):
                                       prompt.lower())
 
     def test_intent_near_limit_is_not_clipped_again(self):
-        for size in (INTENT_MAX - 1, INTENT_MAX, INTENT_MAX + 1):
+        for size in (5999, 6000, 12001):
             for filler in ('я', 'x'):
                 with self.subTest(size=size, filler=filler):
                     head = 'Goal: verify flags / найти флаги.\nHints:\n  first\n\n  second\n'

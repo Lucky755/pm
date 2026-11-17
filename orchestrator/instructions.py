@@ -61,7 +61,9 @@ def available(roles):
 
 
 def limits(spec,budgets):
-    return {key:min(value,spec['budget'].get(key,value)) for key,value in budgets.items()}
+    # Counts come from the durable account, including operator grants. A static
+    # profile can narrow tools/output tokens, never erase an approved +5.
+    return {key:value if key in ('step_limit','poc_budget') else min(value,spec['budget'].get(key,value)) for key,value in budgets.items()}
 
 
 def selected(context,role):

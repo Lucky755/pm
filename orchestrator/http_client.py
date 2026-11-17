@@ -198,7 +198,8 @@ def transport(task_id,spec):
     return payload
 
 
-def execute(db,task_id,request,session_id='default'):
+def execute(db,task_id,request,session_id='default',*,request_limit=6,deadline=None):
+    if type(request_limit) is not int or not 1<=request_limit<=6:raise ValueError('HTTP redirect request bound must be 1..6')
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',session_id):raise ValueError('Invalid web session name')
     initialize(db);db.commit();root_id=None;chain=[]
     support=subprocess.run([web.BROKER,'capabilities'],capture_output=True,text=True,timeout=5)
@@ -207,7 +208,13 @@ def execute(db,task_id,request,session_id='default'):
     if support.returncode or not isinstance(capabilities,dict) or capabilities.get('http_protocol')!=1 or capabilities.get('http_header_limit',0)<artifacts.MAX_HEADERS:
         raise ValueError('NetGuard needs http_protocol=1 with 1 MiB headers; update the root-owned broker before HTTP execution')
     # Redirect budget is part of the existing total HTTP request budget.
-    for hop in range(6):
+    for hop in range(request_limit):
+        if deadline is not None:
+            remaining=int(deadline-time.monotonic())
+            if remaining<1:
+                return {**(reply if chain else {'execution_started':False,'chain':[]}),
+                    'status':'partial' if chain else 'blocked','stop_reason':'series_time_limit'}
+            request={**request,'timeout':min(request.get('timeout',25),remaining)}
         with task_memory.atomic(db):
             version,state,busy=session_state(db,task_id,session_id)
             if busy is not None:raise ValueError('Web session has an unfinished exchange; inspect it before continuing')
@@ -296,7 +303,7 @@ def execute(db,task_id,request,session_id='default'):
         except ValueError:
             return {**reply,'status':'blocked','stop_reason':'redirect_outside_scope','redirect_followed':False,
                     'reason_category':'scope_denied','reason_summary':'Redirect is outside saved task boundaries; destination was not contacted.'}
-        if hop==5:return {**reply,'status':'incomplete','stop_reason':'redirect_limit'}
+        if hop==request_limit-1:return {**reply,'status':'incomplete','stop_reason':'redirect_limit'}
         same_origin=next_url['origin']==url['origin']
         headers=[p for p in spec['headers'] if p[0].lower() not in ('cookie','content-type') and
             (same_origin or p[0].lower() in ('accept','accept-language','user-agent','cache-control'))]

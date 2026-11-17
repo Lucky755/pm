@@ -6,15 +6,15 @@
  * turn is bounded: after STEP_LIMIT executed tool calls the gate denies every
  * further call, so the agent must stop acting and return its JSON report.
  *
- * The budget belongs to one agent instance (one Harness session = one stage),
- * so the orchestrator resets it by starting a new session for the next stage.
+ * Python seeds counters from the durable task/role ledger. New sessions and
+ * formatting/context recovery do not replenish the primary/PoC budgets.
  */
 export const name = 'pm-agent-actions';
 export const inject = ['tools'];
 import { readFileSync, writeFileSync } from 'node:fs';
 
-const STEP_LIMIT = Number(process.env.PM_AGENT_STEP_LIMIT || 15);
-const POC_BUDGET = Number(process.env.PM_AGENT_POC_BUDGET || 7);
+const STEP_LIMIT = Number(process.env.PM_AGENT_STEP_LIMIT || 25);
+const POC_BUDGET = Number(process.env.PM_AGENT_POC_BUDGET || 15);
 const PROFILE_TOOLS = process.env.PM_AGENT_ALLOWED_TOOLS
   ? new Set(JSON.parse(process.env.PM_AGENT_ALLOWED_TOOLS)) : null;
 const toolKey = (name) => String(name).replace(/^mcp__pentest_master__/, '');
@@ -57,7 +57,7 @@ export function apply(ctx) {
         events.set(agent, Number(prior.tool_events) || 0);
         recentTools.set(agent, Array.isArray(prior.recent_tools) ?
           prior.recent_tools.slice(-10).map(String) : []);
-      } catch { /* A new stage starts with empty counters. */ }
+      } catch { /* MCP also enforces the durable task ledger. */ }
     }
     events.set(agent, (events.get(agent) || 0) + 1);
     const writeStats = () => {
@@ -84,7 +84,8 @@ export function apply(ctx) {
     if (PROFILE_TOOLS && !PROFILE_TOOLS.has(toolKey(tool))) {
       return reject('PM_PROFILE_TOOL_DENIED: this specialization does not allow that tool.');
     }
-    if (tool.endsWith('pm_browser_read', 'pm_port_status') || tool.endsWith('pm_http_read') || tool.endsWith('pm_capability_read') || tool.endsWith('pm_evidence_index') ||
+    if (tool.endsWith('pm_budget_status') || tool.endsWith('pm_checks_status') || tool.endsWith('pm_observations') ||
+        tool.endsWith('pm_browser_read') || tool.endsWith('pm_port_status') || tool.endsWith('pm_http_read') || tool.endsWith('pm_capability_read') || tool.endsWith('pm_evidence_index') ||
         tool.endsWith('pm_task_memory') || tool.endsWith('pm_material_read') || tool.endsWith('pm_tool_status') || tool.endsWith('pm_tool_read')) {
       const usedReads = reads.get(agent) || 0;
       if (usedReads >= READ_LIMIT) {
@@ -107,18 +108,9 @@ export function apply(ctx) {
     if (used >= STEP_LIMIT) {
       return reject(
           `PM_STEP_LIMIT: this stage already used its ${STEP_LIMIT} tool steps ` +
-          '(the next stage gets a fresh budget). Do not call any more tools. ' +
+          '(saved history remains charged across stages). Do not call any more tools. ' +
           'Return the final JSON report now with what you did, what you ' +
           'observed and what remains unverified.');
-    }
-
-    // Reserve the final charged step for saving notes/files before the report.
-    // Behavioral instructions live under instructions/; this gate is technical.
-    if (used >= STEP_LIMIT - 1 &&
-        !tool.endsWith('pm_write_poc') && !tool.endsWith('pm_worknote')) {
-      return reject(
-        'PM_FINAL_STEP: Остался один шаг. Разрешены только pm_worknote и ' +
-        'pm_write_poc; завершите стадию итоговым JSON-отчётом.');
     }
 
     // Counting here means a call that later fails or is cancelled still costs

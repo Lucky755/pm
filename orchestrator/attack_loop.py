@@ -54,7 +54,7 @@ MAX_ITERATIONS = 7
 # iteration brings no new capture and no new claim.
 DEFAULT_EXPECTED_FLAGS = 2
 MAX_EXPECTED_FLAGS = 30
-MAX_POC_BUDGET = 7
+MAX_POC_BUDGET = 15
 # A run has exactly one of these endings, and only the first three mean the
 # work itself finished. Anything else is recorded as incomplete.
 NORMAL_STOP_REASONS = frozenset({'iterations_done', 'flag_confirmed', 'no_progress',
@@ -466,7 +466,7 @@ def network_unreachable_since(task_id, start):
 
 
 @diagnostics.stage
-def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
+def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=15, step_limit=25,
         api_key=None, max_tokens=None, expect_flags=None):
     iterations = int(iterations)
     if not 1 <= iterations <= MAX_ITERATIONS:
@@ -594,6 +594,8 @@ def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
                                 'flags': [], 'proposed_actions': []}
                 continue
 
+            if outcome.get('status')=='waiting_operator':
+                return finish(task_id,stages,'operator_questions_pending',previous,expect)
             report = outcome['report']
             previous = {'role': role, **report}
             if report_integrity.quality(report)['status']=='damaged':
@@ -729,6 +731,7 @@ def run(task_id, iterations=1, roles=ROLE_ORDER, poc_budget=7, step_limit=15,
                             iteration, poc_budget, step_limit,
                             api_key=api_key, max_tokens=limit,
                         )
+                        if verify.get('status')=='waiting_operator':return finish(task_id,stages,'operator_questions_pending',previous,expect)
                         verified = flag_verify.scan(task_id, patterns=patterns)
                         objective_db = agent_actions.connect()
                         try:
@@ -988,8 +991,8 @@ def main(argv=None):
     run_parser.add_argument('--task-id', type=int, required=True)
     run_parser.add_argument('--iterations', type=int, default=1)
     run_parser.add_argument('--roles', default=','.join(ROLE_ORDER))
-    run_parser.add_argument('--poc-budget', type=int, default=7)
-    run_parser.add_argument('--step-limit', type=int, default=15)
+    run_parser.add_argument('--poc-budget', type=int, default=15)
+    run_parser.add_argument('--step-limit', type=int, default=25)
     run_parser.add_argument('--max-tokens', type=int, default=None)
     run_parser.add_argument('--expect-flags', type=int, default=None)
 

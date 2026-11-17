@@ -500,33 +500,18 @@ def read_planner_stream(process, api_key=None):
 
 
 def run_planner_with_validation_retry(target, task_text, key, context=None):
-    command = [str(PYTHON), str(ROOT / 'orchestrator/planner.py'),
-               '--target', target, '--task', task_text]
-    context_path = None
-    if context:
-        descriptor, context_path = tempfile.mkstemp(prefix='.planner-context-',
-                                                  suffix='.json', dir=ROOT / 'storage')
-        try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-                json.dump(context, handle, ensure_ascii=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            command += ['--context-file', context_path]
-        except BaseException:
-            Path(context_path).unlink(missing_ok=True)
-            raise
-    try:
+    validate_intent(task_text)
+    with tempfile.TemporaryDirectory(prefix='pm-planner-input-') as directory:
+        source=Path(directory)/'task.txt';source.write_text(task_text,encoding='utf-8');source.chmod(0o600)
+        command=[str(PYTHON),str(ROOT/'orchestrator/planner.py'),'--target',target,'--task-file',str(source)]
+        if context:
+            extra=Path(directory)/'context.json';extra.write_text(json.dumps(context,ensure_ascii=False));extra.chmod(0o600)
+            command+=['--context-file',str(extra)]
         for attempt in range(2):
-            try:
-                return read_planner_stream(command, api_key=key)
+            try:return read_planner_stream(command,api_key=key)
             except PlannerValidationError as exc:
-                if attempt:
-                    raise OperatorError(str(exc)) from exc
+                if attempt:raise OperatorError(str(exc)) from exc
                 line('  [!] План не прошёл проверку; повторяю запрос планировщику один раз.')
-    finally:
-        if context_path:
-            Path(context_path).unlink(missing_ok=True)
 
 
 def planner_context_from_task(db, task_id):
@@ -806,6 +791,11 @@ def call_scheduler(db, task_id, target, args, *, prior_jobs=0):
     from orchestrator import decision_agent as decision
     from orchestrator import network_jobs as jobs
     coordinated = bool(getattr(args,'coordinated',False))
+    from orchestrator import research_budgets
+    research_budgets.ensure(db,task_id,'recon')
+    rounds=research_budgets.ensure(db,task_id,'recon','rounds')
+    run_rounds=max(args.max_rounds,min(8,rounds['remaining'])) if rounds['granted'] else args.max_rounds
+    db.commit()
     # Suppress JSON-only end-of-run dumps while retaining verbose English progress.
     original = scheduler.emit, evidence.render, decision.emit
     scheduler.emit = lambda obj: None
@@ -821,7 +811,7 @@ def call_scheduler(db, task_id, target, args, *, prior_jobs=0):
         with scheduler.exclusive_run_lock(), keys, redirect_stdout(progress):
             result = scheduler.auto(db, task_id, True, args.sync_burp,
                                     True if coordinated else args.no_agents, args.max_jobs,
-                                    False if coordinated else not args.no_decide, args.max_rounds, True,
+                                    False if coordinated else not args.no_decide, run_rounds, True,
                                     web_enabled=True)
         progress.flush()
     finally:
@@ -904,6 +894,7 @@ def restore_task_intent(db, task_id, text, source):
 
 
 def op_intent(args):
+    args.task=read_operator_task(args)
     text = compose_task_description(args.task, '', read_hints(args))
     objective_specs(args)
     objective_mode(args)
@@ -924,12 +915,24 @@ def previous_task_intent(db, task_id):
     return None
 
 
+def read_operator_task(args):
+    source=getattr(args,'task_file',None)
+    if not source:return getattr(args,'task','')
+    try:
+        if source=='-':data=sys.stdin.read(INTENT_MAX+1)
+        else:
+            from intent_limits import read_utf8_file
+            data=read_utf8_file(source)
+    except (OSError,ValueError) as exc:raise OperatorError(str(exc)) from exc
+    validate_intent(data)
+    return data
+
+
 def validate_intent(text):
     if not text:
         raise OperatorError('Нужно непустое описание задачи')
-    if len(text) > INTENT_MAX:
-        raise OperatorError(f'Описание с подсказками {len(text)} символов, лимит {INTENT_MAX}; '
-                            f'сократите на {len(text) - INTENT_MAX}; UTF-8: {len(text.encode("utf-8"))} байт')
+    if len(text.encode('utf-8')) > INTENT_MAX:
+        raise OperatorError(f'Описание превышает явный предел хранения {INTENT_MAX} байт; большие материалы передайте отдельными файлами')
 
 
 def read_hints(args):
@@ -937,11 +940,12 @@ def read_hints(args):
     path = getattr(args, 'hints_file', None)
     if path:
         try:
-            hints = Path(path).read_text(encoding='utf-8')
-        except (OSError, UnicodeError) as exc:
+            from intent_limits import read_utf8_file
+            hints=read_utf8_file(path)
+        except (OSError, ValueError) as exc:
             raise OperatorError('Не удалось прочитать файл подсказок UTF-8: ' + str(exc)) from exc
-    if len(hints) > HINTS_MAX:
-        raise OperatorError(f'Подсказки {len(hints)} символов, лимит {HINTS_MAX}; '
+    if len(hints.encode('utf-8')) > HINTS_MAX:
+        raise OperatorError(f'Подсказки превышают предел хранения {HINTS_MAX} байт; '
                             f'UTF-8: {len(hints.encode("utf-8"))} байт')
     return hints
 
@@ -1145,6 +1149,8 @@ def run_full_tcp_scan(db, task_id, target):
                             'Сначала убедись, что процесс Nmap уже остановлен.')
     from orchestrator.target_availability import require_network
     require_network(db,task_id)
+    from orchestrator import research_budgets
+    research_budgets.reconnaissance(db,task_id,unit='tcp_full_execution')
     with db:
         if entry:
             db.execute("UPDATE pm_tcp_full_scans SET status='running',error=NULL,followup_status=NULL,"
@@ -1337,8 +1343,8 @@ def validate_launch_options(args, mode, *, new=False):
         return
     if getattr(args,'no_agents',False) or getattr(args,'no_decide',False) or getattr(args,'verbose',False):
         raise OperatorError('--no-agents, --no-decide и --verbose относятся к прежнему режиму')
-    for name,default,lower,upper in (('coordinator_steps',8,1,32),('decision_retries',1,0,2),
-                                     ('poc_budget',7,1,7),('step_limit',15,1,99),('max_tokens',24000,1,64000)):
+    for name,default,lower,upper in (('coordinator_steps',15,1,32),('decision_retries',1,0,2),
+                                     ('poc_budget',15,1,15),('step_limit',25,1,25),('max_tokens',24000,1,64000)):
         value=getattr(args,name,None)
         if value is not None and not lower <= value <= upper:
             raise OperatorError(f'{name}: {lower}..{upper}')
@@ -1369,6 +1375,9 @@ def render_flag_candidate(question):
 
 
 def render_tool_request(question):
+    grant=question.get('budget_request')
+    if grant:
+        line(f"    Продление: {grant['category']}/{grant['actor']} · ровно +{grant['amount']} к лимиту {grant['previous_limit']}; scope не расширяется.")
     tool=question.get('tool_request')
     if not tool:return
     manifest=tool['manifest'];spec=tool['spec']
@@ -1408,6 +1417,17 @@ def render_coordinator_result(result, args):
         line(json.dumps(result,ensure_ascii=False,indent=2))
         return result
     line('  Остановка: ' + safe_display(result['stop_reason']))
+    for account in result.get('research_budgets',[]):
+        line(f"  Бюджет {safe_display(account['category'])}/{safe_display(account['actor'])}: "
+             f"{account['used']}/{account['limit']} · осталось {account['remaining']} · продлено +{account['granted']}"+
+             (' · прежняя статистика неполна' if not account['history_known'] else ''))
+    for direction in result.get('directions',[]):
+        line(f"  Направление {safe_display(direction['kind'])} {safe_display(direction['resource'])}: "
+             f"{safe_display(direction['state'])} · безрезультатных единиц {direction['failures']}/5")
+    if result['stop_reason']=='internal_check_outcome_unknown':
+        line('  Исход внутренней проверки неизвестен. Проверьте сохранённые материалы; автоматического повторения не будет.')
+    if result['stop_reason']=='all_directions_exhausted':
+        line('  Все рассмотренные направления исчерпаны. Сохранённые результаты доступны; выполнением цели это не является. Нужны новые основания/ответ по бюджету.')
     availability=result.get('target_availability',{})
     if availability.get('network_allowed') is False:
         line('  Цель: '+safe_display(availability['state'])+' · '+safe_display(availability['reason']))
@@ -1486,12 +1506,13 @@ def run_task_coordinator(db, task_id, args):
         return default if value is None else value
     if not getattr(args,'json',False):
         heading(f'Координатор — задача #{task_id}')
-        line(f"  Решений до {option('coordinator_steps',8)}, исправлений ответа до {option('decision_retries',1)}; "
-             f"на специалиста: {option('step_limit',15)} инструментов, {option('poc_budget',7)} PoC, "
+        line(f"  Срез до {option('coordinator_steps',15)} решений, исправлений ответа до {option('decision_retries',1)}; "
+             f"начальный бюджет специалиста: {option('step_limit',25)} инструментов, {option('poc_budget',15)} PoC, "
              f"{option('max_tokens',24000)} токенов вывода.")
+        line('  Сохранённый расход не обнуляется. Дополнительные 5 решений/основных шагов — через вопрос оператору.')
     result=coordinated_attack.run(task_id,roles=tuple(r.strip().lower() for r in option('roles','recon,vuln,access,verify').split(',')),
-        max_steps=option('coordinator_steps',8),decision_retries=option('decision_retries',1),
-        poc_budget=option('poc_budget',7),step_limit=option('step_limit',15),max_tokens=option('max_tokens',24000),
+        max_steps=option('coordinator_steps',15),decision_retries=option('decision_retries',1),
+        poc_budget=option('poc_budget',15),step_limit=option('step_limit',25),max_tokens=option('max_tokens',24000),
         expect_flags=expect,key_provider=lambda:session_api_key(args,required=True),
         continue_run=getattr(args,'continue_coordinated',False),
         abandon_running_step=getattr(args,'abandon_running_step',None))
@@ -1610,10 +1631,16 @@ def launch_coordinated_task(db, task_id, target, args):
         return run_task_coordinator(db,task_id,args)
     cached=bool(ports and meta['recon_status'] in ('pending','completed'))
     def pause(reason):
+        from orchestrator import research_budgets
+        for actor in ('task','rounds'):
+            account=research_budgets.get(db,task_id,'recon',actor)
+            if account and not account['remaining']:research_budgets.request(db,task_id,'recon',actor)
+        db.commit()
         task_runtime.reconnaissance(db,task_id,'waiting_operator',reason)
         diagnostics.stop(reason,task_id=task_id)
         return render_coordinator_result({'task_id':task_id,'status':'waiting_operator','succeeded':False,
-                                          'stop_reason':reason,'steps':[],'coordinator_run_id':None},args)
+                                          'stop_reason':reason,'steps':[],'coordinator_run_id':None,
+                                          'operator_questions':__import__('orchestrator.operator_questions',fromlist=['listing']).listing(db,task_id)},args)
     if not getattr(args,'json',False):
         heading('Начальная разведка → общая карта')
         line(f'  Бюджет разведки: {args.max_jobs} сетевых операций, до {args.max_rounds} раундов.')
@@ -1643,6 +1670,8 @@ def launch_coordinated_task(db, task_id, target, args):
             if scout['stop_reason'] not in ('queue_empty','no_progress','no_new_evidence'):
                 return pause('reconnaissance_'+scout['stop_reason'])
         task_runtime.reconnaissance(db,task_id,'completed')
+    except __import__('orchestrator.research_budgets',fromlist=['Exhausted']).Exhausted:
+        return pause('reconnaissance_budget_exhausted')
     except BaseException as exc:
         columns={row[1] for row in db.execute('PRAGMA table_info(pm_tcp_full_scans)')}
         queue_failed=('followup_status' in columns and db.execute(
@@ -1688,6 +1717,7 @@ def launch_legacy_task(db, task_id, target, args):
 
 @diagnostics.stage
 def op_new(args, *, defer_execution=False):
+    args.task=read_operator_task(args)
     from orchestrator import resources
     raw=validate_target(args.target)
     entry=resources.parse(raw)
@@ -1766,6 +1796,8 @@ def op_resume(args):
             return render_coordinator_result(paused,args)
         if args.coordinated:
             if paused:
+                if any(q['status']=='pending' and q.get('budget_request',{}).get('category') in ('coordinator','recon') for q in paused.get('operator_questions',[])):
+                    return render_coordinator_result(paused,args)
                 running=next((s for s in paused['steps'] if s['status']=='running'),None)
                 waiting=next((s for s in paused['steps'] if s['status']=='waiting_operator'),None)
                 if getattr(args,'abandon_running_step',None) is not None and (
@@ -2882,7 +2914,7 @@ def attack_task(args):
     if not getattr(args,'coordinated',False) and (
             getattr(args,'continue_coordinated',False) or getattr(args,'approve_step',None) is not None
             or getattr(args,'abandon_running_step',None) is not None
-            or getattr(args,'coordinator_steps',None) not in (None,8) or getattr(args,'decision_retries',None) not in (None,1)
+            or getattr(args,'coordinator_steps',None) not in (None,15) or getattr(args,'decision_retries',None) not in (None,1)
             or explicit & {'--coordinator-steps','--decision-retries'}):
         raise OperatorError('Параметры координатора требуют --coordinated')
     with connect() as db:
@@ -3274,12 +3306,16 @@ def parser_main():
     new.add_argument('--deny-resource',action='append',help='Явное исключение комнаты: домен, URL-путь или IP/сеть')
     new.add_argument('--ssrf-destination',action='append',help='Точный URL назначения SSRF через исходное приложение, включая target loopback')
     new.add_argument('--path-prefix',help='Явная граница HTTP-путей комнаты, например /app/; query остаётся данными')
-    new.add_argument('--task', required=True)
+    new_task=new.add_mutually_exclusive_group(required=True)
+    new_task.add_argument('--task')
+    new_task.add_argument('--task-file',help='UTF-8 file, or - for stdin; original retained without 6000-character clipping')
     new.add_argument('--hints', help='Зацепки оператора для агентов (проверяются инструментами)')
     new.add_argument('--hints-file', help='Файл подсказок UTF-8 с переносами строк')
     intent = sub.add_parser('intent', help='Восстановить описание и ограничения с историей')
     intent.add_argument('task_id', type=int)
-    intent.add_argument('--task', required=True)
+    intent_task=intent.add_mutually_exclusive_group(required=True)
+    intent_task.add_argument('--task')
+    intent_task.add_argument('--task-file',help='UTF-8 file or - for stdin')
     intent.add_argument('--source', required=True)
     intent.add_argument('--hints', help='Зацепки оператора для агентов (проверяются инструментами)')
     intent.add_argument('--hints-file', help='Файл подсказок UTF-8 с переносами строк')
@@ -3334,14 +3370,14 @@ def parser_main():
     attack = sub.add_parser('attack', help='Запустить ролевой цикл атаки (recon/vuln/access/verify)')
     attack.add_argument('task_id', type=int)
     attack.add_argument('--coordinated', action='store_true', help='Выбирать одну роль по сохранённому состоянию задачи')
-    attack.add_argument('--coordinator-steps', type=int, default=8, help='Решений/шагов на ручной запуск (1..32)')
+    attack.add_argument('--coordinator-steps', type=int, default=15, help='Решений/шагов на ручной запуск (1..32)')
     attack.add_argument('--decision-retries', type=int, default=1, help='Исправлений ответа координатора (0..2)')
     attack.add_argument('--continue-coordinated', action='store_true', help='Продолжить после сохранённой паузы оператора')
     attack.add_argument('--abandon-running-step', type=int, help='После проверки отметить running-шаг как имеющий неизвестный исход')
     attack.add_argument('--iterations', type=int, default=7)
     attack.add_argument('--roles', default='recon,vuln,access,verify')
-    attack.add_argument('--poc-budget', type=int, default=7)
-    attack.add_argument('--step-limit', type=int, default=15)
+    attack.add_argument('--poc-budget', type=int, default=15)
+    attack.add_argument('--step-limit', type=int, default=25)
     attack.add_argument('--max-tokens', type=int, default=None,
                         help='Предел вывода на один ход роли (по умолчанию 24000)')
     attack.add_argument('--expect-flags', type=int, default=None,
@@ -3381,11 +3417,11 @@ def parser_main():
         modes.add_argument('--coordinated',dest='coordinated',action='store_true',help='Разведка → координатор → одна выбранная роль')
         modes.add_argument('--legacy',dest='coordinated',action='store_false',help='Явно выбрать прежний Evidence Hub / DECIDE')
         cmd.set_defaults(coordinated=None)
-        cmd.add_argument('--coordinator-steps',type=int,default=None,help='Шагов координатора на запуск: 1..32, по умолчанию 8')
+        cmd.add_argument('--coordinator-steps',type=int,default=None,help='Шагов на вход: 1..32; общий бюджет 15, продление +5 через очередь')
         cmd.add_argument('--decision-retries',type=int,default=None,help='Исправлений решения: 0..2, по умолчанию 1')
         cmd.add_argument('--roles',default=None,help='Разрешённые роли координатора через запятую')
-        cmd.add_argument('--poc-budget',type=int,default=None,help='PoC-бюджет специалиста: 1..7, по умолчанию 7')
-        cmd.add_argument('--step-limit',type=int,default=None,help='Инструментов на специалиста: 1..99, по умолчанию 15')
+        cmd.add_argument('--poc-budget',type=int,default=None,help='PoC-бюджет специалиста: 1..15, по умолчанию 15')
+        cmd.add_argument('--step-limit',type=int,default=None,help='Инструментов на специалиста: 1..25, по умолчанию 25')
         cmd.add_argument('--max-tokens',type=int,default=None,help='Вывод специалиста: 1..64000, по умолчанию 24000')
         cmd.add_argument('--continue-coordinated',action='store_true',help='Явно продолжить сохранённую паузу')
         cmd.add_argument('--abandon-running-step',type=int,help='После ручной проверки оставить исход running-шага неизвестным')
@@ -3592,8 +3628,8 @@ def interactive():
                     raise OperatorError('Выбери режим 1 или 2')
                 args.coordinated = mode == '1'
                 if args.coordinated:
-                    raw = input('Шагов координатора (Enter — 8): ').strip()
-                    args.coordinator_steps = int(raw) if raw else 8
+                    raw = input('Шагов координатора (Enter — 15): ').strip()
+                    args.coordinator_steps = int(raw) if raw else 15
                     interactive_continuation(args)
                 if not args.coordinated:
                     raw = input('Итераций (Enter — 7): ').strip()
@@ -3601,10 +3637,10 @@ def interactive():
                 args.roles = (input('Роли через запятую '
                                     '(Enter — recon,vuln,access,verify): ').strip()
                               or 'recon,vuln,access,verify')
-                raw = input('Шагов на роль (Enter — 15): ').strip()
-                args.step_limit = int(raw) if raw else 15
-                raw = input('PoC-бюджет на роль (Enter — 7): ').strip()
-                args.poc_budget = int(raw) if raw else 7
+                raw = input('Основных шагов специалиста (Enter — 25, затем вопрос +5): ').strip()
+                args.step_limit = int(raw) if raw else 25
+                raw = input('PoC-бюджет на роль (Enter — 15): ').strip()
+                args.poc_budget = int(raw) if raw else 15
                 raw = input('Сколько флагов ожидать (Enter — из целей задачи, иначе 2): ').strip()
                 args.expect_flags = int(raw) if raw else None
                 interactive_operation(op_attack,args)

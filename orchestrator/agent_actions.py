@@ -229,7 +229,7 @@ def task_context(db, task_id):
 
 
 @contextmanager
-def action_policy_patch(step_limit=None, poc_budget=7, *, allowed_tools=None):
+def action_policy_patch(step_limit=None, poc_budget=15, *, allowed_tools=None):
     """Runtime budgets and an optional intersection of tool permissions."""
     if not POLICY_PLUGIN.is_file():
         raise ValueError(f'Action policy missing: {POLICY_PLUGIN}')
@@ -1147,7 +1147,7 @@ def progress_watcher(role, step_limit, stream=None, stats_path=None):
     sizes are shown: payloads stay in the capability log as evidence.
     """
     stream = stream or sys.stderr
-    total = min(int(step_limit), 99)
+    total = max(1,int(step_limit))
     calls = []
     reads = []
     metrics = {'thinking_chars': 0, 'tokens_used': 0, 'assistant_messages': 0,
@@ -1335,7 +1335,7 @@ def memory_block(db,context,objective):
     return '<target_availability>\n'+json.dumps(saved(db,context['task_id']),ensure_ascii=False)+'\n</target_availability>\n'+ '<task_memory>\n'+json.dumps(memory,ensure_ascii=False)+'\n</task_memory>'
 
 
-def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit=15):
+def build_prompt(db, context, role, objective, iteration, poc_budget, step_limit=25):
     logs = capability_tail(context['task_id'])
     state = essential_state(db, context['task_id'])
     if isinstance(db, sqlite3.Connection):
@@ -2046,6 +2046,14 @@ def temporary_stage_stats():
         path.unlink(missing_ok=True)
 
 
+@contextmanager
+def persistent_stage_stats(used,pocs):
+    with temporary_stage_stats() as path:
+        if used or pocs:
+            Path(path).write_text(json.dumps({'calls':used,'pocs':pocs,'tool_events':0,'reads':0,'denied':0,'sessions':0}))
+        yield path
+
+
 def validate_triage_objective(state, objective):
     if state.get('pending') and ('ТРИАЖ:' not in objective or re.search(
             r'\b(?:escalate|escalation|повысить|повышай|эскалац\w*)\b',
@@ -2132,12 +2140,12 @@ def reformat_saved_report(db, context, role, iteration, key, max_tokens, prior_i
 
 @diagnostics.stage
 @exclusive_report_slot
-def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
-             step_limit=15, api_key=None, max_tokens=DEFAULT_MAX_TOKENS, *, assignment=None):
+def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
+             step_limit=25, api_key=None, max_tokens=DEFAULT_MAX_TOKENS, *, assignment=None):
     if role not in ROLES:
         raise ValueError(f'Unknown role: {role}')
-    if not 1 <= int(poc_budget) <= 7:
-        raise ValueError('PoC budget must be 1..7')
+    if not 1 <= int(poc_budget) <= 15:
+        raise ValueError('PoC budget must be 1..15')
     if assignment is not None and not isinstance(assignment,dict):
         raise ValueError('Specialist assignment must be an object')
     spec=instructions.profile(role,(assignment or {}).get('profile'))
@@ -2147,6 +2155,15 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
     db = connect()
     try:
         context = task_context(db, task_id)
+        from orchestrator import research_budgets
+        account=research_budgets.ensure(db,task_id,'specialist',role,base=min(int(step_limit),25))
+        poc_account=research_budgets.ensure(db,task_id,'poc',role,capability_log=CAPABILITY_LOG/f'task_{task_id}.jsonl')
+        prior_budget_used=account['used'];prior_poc_used=poc_account['used']
+        step_limit=account['limit'];poc_budget=min(int(poc_budget),poc_account['limit'])
+        if not account['remaining']:
+            question=research_budgets.request(db,task_id,'specialist',role);db.commit()
+            return {'status':'waiting_operator','task_id':task_id,'execution_started':False,'question_id':question['id'],
+                    'stop_reason':'specialist_budget_exhausted','report':None}
         availability=target_availability.saved(db,task_id)
         context['target_availability']=availability
         if not availability['network_allowed']:
@@ -2220,7 +2237,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
 
         def attempt(tokens, first_prompt):
             """One harness session: the first turn, then bounded recoveries."""
-            with temporary_stage_stats() as stats_path, action_policy_patch(step_limit, poc_budget, allowed_tools=spec['tools'] if spec['tools']!='inherit' else None) as policy, HarnessAdapter(mode='execute',
+            with persistent_stage_stats(prior_budget_used,prior_poc_used) as stats_path, action_policy_patch(step_limit, poc_budget, allowed_tools=spec['tools'] if spec['tools']!='inherit' else None) as policy, HarnessAdapter(mode='execute',
                 profile='sdk-minimal',
                 patches=(policy,),
                 dsh_home=str(DSH_HOME),
@@ -2234,6 +2251,9 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
                 env=harness_env({'EXPERIENTIAL_API_KEY': key,
                                  'PM_SESSION_OWNER':task_sessions.owner(),
                                  'PM_SESSION_PURPOSE':objective[:1000],
+                                 'PM_BUDGET_ROLE':role,
+                                 'PM_TASK_ID':str(task_id),
+                                 'PM_COORDINATOR_STEP_ID':str((assignment or {}).get('coordinator_step_id') or ''),
                                  'PM_AGENT_STATS_FILE': str(stats_path),
                                  'PM_AGENT_STEP_LIMIT': str(step_limit),
                                  'PM_AGENT_POC_BUDGET': str(poc_budget)}),
@@ -2378,6 +2398,15 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
             # The model cannot manufacture this field to bypass VERIFY validation.
             report.pop('operator_dependencies',None)
             probe_records=report_probe_records(task_id)
+            # Settle a verified SDK dispatch count before testing completion of
+            # an interim budget-limited report. This never repeats an operation.
+            observed=research_budgets.get(db,task_id,'specialist',role)
+            for _ in range(max(0,(tool_calls.get('calls') or 0)-observed['used'])):
+                try:research_budgets.consume(db,task_id,'specialist',role,unit='sdk_dispatch_without_mcp_receipt')
+                except research_budgets.Exhausted:break
+            if not research_budgets.get(db,task_id,'specialist',role)['remaining']:
+                research_budgets.request(db,task_id,'specialist',role)
+            db.commit()
             requested={r['capture_record']['result'].get('question_id') for rid,r in probe_records.items()
                        if rid not in prior_probe_ids and r['tool'] in ('tool_request','pivot_request') and r['status']=='waiting_operator'}
             dependencies=[q['id'] for q in operator_questions.listing(db,task_id)
@@ -2385,6 +2414,10 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
             if dependencies and not (report.get('findings') or report.get('hypotheses')) and execution['status']=='not_started':
                 report['operator_dependencies']=dependencies
             else:dependencies=[]
+            if not (report.get('findings') or report.get('hypotheses')) and execution['status']!='unknown':
+                dependencies.extend(q['id'] for q in operator_questions.listing(db,task_id,pending=True)
+                    if q.get('budget_request',{}).get('category')=='specialist' and q['budget_request']['actor']==role)
+                if dependencies:report['operator_dependencies']=dependencies
             report = validate_report_probes(report, task_id, role, records=probe_records,
                                              prior_ids=prior_probe_ids, db=db,dependency_ids=dependencies)
             # A fresh readback wrapper is not a new probe either. Keep the
@@ -2399,7 +2432,20 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=7,
             if (report.get('report_consistency') or {}).get('blocking') and raw_response is None:
                 raw_response=str(getattr(result,'final_response','') or '').replace(key,'[СКРЫТО]')
             stats_unknown = tool_calls['calls'] is None
+            if tool_calls['calls'] is not None:tool_calls['calls']=max(0,tool_calls['calls']-prior_budget_used)
             steps_used = tool_calls['calls'] or 0
+            observed=research_budgets.get(db,task_id,'specialist',role)
+            steps_used=max(steps_used,observed['used']-prior_budget_used)
+            if tool_calls['calls'] is not None:tool_calls['calls']=steps_used
+            for _ in range(max(0,prior_budget_used+steps_used-observed['used'])):
+                try:research_budgets.consume(db,task_id,'specialist',role,unit='sdk_dispatch_without_mcp_receipt')
+                except research_budgets.Exhausted:break
+            account=research_budgets.get(db,task_id,'specialist',role)
+            report['budget_state']=account
+            report['poc_runs']=research_budgets.get(db,task_id,'poc',role)['used']-prior_poc_used
+            if not account['remaining']:
+                report['budget_question_id']=research_budgets.request(db,task_id,'specialist',role)['id']
+            db.commit()
             session_share = round(tool_calls['sessions'] / steps_used, 3) if steps_used else 0.0
             report['session_share'] = session_share
             report['stats_unknown'] = stats_unknown
@@ -2679,8 +2725,8 @@ def main(argv=None):
     run.add_argument('--role', required=True, choices=ROLES)
     run.add_argument('--objective', default='')
     run.add_argument('--iteration', type=int, default=1)
-    run.add_argument('--poc-budget', type=int, default=7)
-    run.add_argument('--step-limit', type=int, default=15)
+    run.add_argument('--poc-budget', type=int, default=15)
+    run.add_argument('--step-limit', type=int, default=25)
     run.add_argument('--max-tokens', type=int, default=DEFAULT_MAX_TOKENS)
 
     ls = sub.add_parser('list', help='list stored action reports')

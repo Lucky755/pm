@@ -14,7 +14,7 @@ import re
 import sqlite3
 import uuid
 
-from orchestrator import model_adapter, instructions, task_memory
+from orchestrator import model_adapter, instructions, task_memory, research_budgets
 from orchestrator import agent_actions as actions, attack_loop, diagnostics, flag_verify, objectives
 from orchestrator import evidence_pipeline as evidence
 from orchestrator import coordinator_checkpoints as checkpoints
@@ -275,7 +275,12 @@ def snapshot(db, task_id, expect):
     knowledge = knowledge_state(db,task_id,context,mapped,essential,goals,results,confirmed)
     memory=task_memory.context(db,task_id,actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
     for ref,value in memory['material_index'].items():refs.setdefault(ref,value)
+    budget_state=research_budgets.listing(db,task_id)
+    from orchestrator import check_series
+    directions=check_series.state(db,task_id)
+    for account in budget_state:refs['budget:'+account['category']+':'+account['actor']]=account
     return {'task': context, 'resource_graph':resource_graph,'objectives': goals, 'service_map': mapped, 'essential_state': essential,'task_memory':memory,
+            'research_budgets':budget_state,'directions':directions,
             'open_hypotheses': [f for f in facts if f['status']=='untested'],
             'refutations': [f for f in facts if f['status']=='refuted' and f['probe_result_id'] and f['quote']],
             'recent_results': [{**{k:r[k] for k in ('result_id','tool','status')},
@@ -428,7 +433,7 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             "Operator questions are only pivoting, tool installation/acquisition or documentation, budget, flag_confirmation. "
             "Use branch_id=service reference with boundaries.resource_refs=[branch_id] for a resource branch, or task for a global dependency. "
             "Pending questions block only their branch; continue useful independent service branches within budgets. "
-            "Never evade a blocked branch by using task-wide boundaries. Answers do not grant new scope or increase budgets. "
+            "Never evade a blocked branch by using task-wide boundaries. Only PM-created typed budget receipts add exactly their named +5; arbitrary answer text grants no new scope or budget. "
             "Omit operator_question for run_role and stop; it is required only for wait_operator. "
             "For an actionable tool/docs/package request use operator_question={kind:tool,request:spec}. "
             "spec: kind=user_tool|documentation,name,purpose,version,source (one exact URL),channel=internet|kali_local|local_file,filename,sha256 (empty if unknown),interpreter=direct|python3|bash|perl|ruby (none for documentation). "
@@ -618,6 +623,7 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
             'task_id':task_id,'coordinator_run_id':run_id,'stop_reason':reason,
             'expected_flags':expect,'confirmed_flags':state['confirmed_flags'],
             'target_availability':state['target_availability'],
+            'research_budgets':research_budgets.listing(db,task_id),'directions':state.get('directions',[]),
             'objectives_matrix':attack_loop.objective_matrix(state['objectives']['objectives']),
             'checkpoints':[], 'checkpoint_classifier_blocking':False,
             'operator_questions':operator_questions.listing(db,task_id),
@@ -626,8 +632,8 @@ def result_view(db, run_id, task_id, state, expect, reason, status):
 
 
 @diagnostics.stage
-def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
-        poc_budget=7, step_limit=15, max_tokens=None, expect_flags=2, api_key=None,
+def run(task_id, *, roles=actions.ROLES, max_steps=15, decision_retries=1,
+        poc_budget=15, step_limit=25, max_tokens=None, expect_flags=2, api_key=None,
         key_provider=None, continue_run=False, approve_step=None, abandon_running_step=None,
         model=None, role_runner=None):
     if not 1 <= max_steps <= MAX_STEPS or not 0 <= decision_retries <= MAX_RETRIES:
@@ -638,7 +644,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
         raise ValueError('Select only one operator continuation action')
     if not roles or any(r not in actions.ROLES for r in roles):
         raise ValueError('Invalid allowed roles')
-    if not 1 <= poc_budget <= 7 or not 1 <= step_limit <= 99 or not 1 <= expect_flags <= attack_loop.MAX_EXPECTED_FLAGS:
+    if not 1 <= poc_budget <= 15 or not 1 <= step_limit <= 25 or not 1 <= expect_flags <= attack_loop.MAX_EXPECTED_FLAGS:
         raise ValueError('Invalid role budget or flag threshold')
     max_tokens = max_tokens or actions.DEFAULT_MAX_TOKENS
     if not 1 <= max_tokens <= actions.MAX_TOKENS_CEILING:
@@ -657,6 +663,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
         db = actions.connect()
         try:
             ensure_schema(db)
+            research_budgets.ensure(db,task_id,'coordinator');db.commit()
             operator_questions.retire_legacy(db,task_id,steps(db,task_id))
             flag_review.activate(db,task_id,expect_flags)
             expect_flags=max(expect_flags,flag_review.policy(db,task_id)['expected_flags'] or 0)
@@ -707,7 +714,7 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
             questions=operator_questions.listing(db,task_id)
             for waiting in [r for r in steps(db,task_id) if r['status']=='waiting_operator']:
                 dependencies=[]
-                if waiting['error']=='tool_dependency_pending':
+                if waiting['error'] in ('tool_dependency_pending','budget_dependency_pending'):
                     saved=db.execute('SELECT report_json FROM pm_agent_action_reports WHERE task_id=? AND role=? AND iteration=?',
                         (task_id,json.loads(waiting['decision_json'])['role'],waiting['report_iteration'])).fetchone()
                     if saved:dependencies=json.loads(saved[0]).get('operator_dependencies',[])
@@ -733,6 +740,12 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 db.execute("UPDATE pm_coordinator_runs SET status='running',pause_step_id=NULL WHERE id=?",(run_id,))
             for _ in range(max_steps):
                 state = snapshot(db,task_id,expect_flags)
+                if state['success_verified']:return finish(state['verified_stop_reason'])
+                if all((research_budgets.get(db,task_id,'specialist',r) or {'remaining':1})['remaining']==0 for r in roles):
+                    return finish('all_directions_exhausted','waiting_operator' if any(q['status']=='pending' for q in state['operator_questions']) else 'completed')
+                if state['directions'] and all(d['state']=='exhausted' for d in state['directions']):
+                    latest=max((r['id'] for r in steps(db,task_id) if r['status']=='completed'),default=0)
+                    if latest>max(d['plan_step'] or 0 for d in state['directions']):return finish('all_directions_exhausted')
                 if any(q['status']=='pending' and q['kind']=='flag_confirmation' for q in state['operator_questions']) and not flag_review.useful_work(db,task_id,expect_flags):
                     return finish('operator_questions_pending','waiting_operator')
                 if any(q['status']=='pending' for q in state['operator_questions']) and not operator_questions.available(state):
@@ -757,6 +770,15 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                         update_step(db,step_id,'failed',error='planned_transition_no_longer_allowed')
                         return finish('invalid_saved_transition','failed')
                 else:
+                    allowed_roles=tuple(r for r in roles if (research_budgets.get(db,task_id,'specialist',r) or {'remaining':1})['remaining'])
+                    if state['essential_state']['access_state'].get('pending') and 'access' not in allowed_roles:
+                        return finish('operator_questions_pending','waiting_operator')
+                    if not research_budgets.get(db,task_id,'coordinator')['remaining']:
+                        research_budgets.request(db,task_id,'coordinator');db.commit()
+                        state=snapshot(db,task_id,expect_flags)
+                        return finish('coordinator_budget_exhausted','waiting_operator')
+                    research_budgets.consume(db,task_id,'coordinator',unit='coordinator_decision');db.commit()
+                    state=snapshot(db,task_id,expect_flags)
                     previous = [step_view(r) for r in steps(db,task_id)]
                     error = None
                     response=None
@@ -765,10 +787,10 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                             if attempt:
                                 diagnostics.emit('model.retry',reason='coordinator_decision_repair')
                             with diagnostics.scope(role='coordinator'):
-                                prompt=decision_prompt(state,roles,previous,error,response,attempt)
+                                prompt=decision_prompt(state,allowed_roles,previous,error,response,attempt)
                                 response=None
                                 response=model(prompt,key())
-                                decision = parse_decision(response,state,roles)
+                                decision = parse_decision(response,state,allowed_roles)
                             if repeated(db,task_id,decision,state):
                                 raise ValueError('repeated_question_without_new_evidence')
                             break
@@ -819,7 +841,20 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 saved_budget=json.loads(pending['budgets_json'])
                 effective={k:min(saved_budget[k],budgets[k]) for k in budgets}
                 effective=instructions.limits(instructions.profile(decision['role'],decision['profile']),effective)
+                actor=decision['role']
+                account=research_budgets.ensure(db,task_id,'specialist',actor,base=min(step_limit,25))
+                if not account['remaining']:
+                    research_budgets.request(db,task_id,'specialist',actor,step_id=step_id);db.commit()
+                    update_step(db,step_id,'failed',error='specialist_budget_not_started',outcome_uncertain=0)
+                    state=snapshot(db,task_id,expect_flags)
+                    if all((research_budgets.get(db,task_id,'specialist',r) or {'remaining':1})['remaining']==0 for r in roles):
+                        return finish('all_directions_exhausted','waiting_operator')
+                    continue
+                effective['step_limit']=account['limit']
+                saved_poc=research_budgets.ensure(db,task_id,'poc',actor,capability_log=actions.CAPABILITY_LOG/f'task_{task_id}.jsonl')
+                effective['poc_budget']=min(poc_budget,saved_poc['limit']);db.commit()
                 assignment['inherited_limits']=effective
+                assignment['coordinator_step_id']=step_id
                 iteration=pending['report_iteration']
                 # A legacy invocation may have consumed a number while this step was planned.
                 if db.execute('SELECT 1 FROM pm_agent_action_reports WHERE task_id=? AND iteration=?',(task_id,iteration)).fetchone():
@@ -864,15 +899,25 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                                          reason='report_incomplete',report_path=report.get('report_path'),outcome_uncertain=unknown,
                                          reason_summary='Отчёт неполон или противоречив; требуется проверка оператором. Исход исполнения сохранён отдельно.')
                         return finish('role_report_incomplete_requires_review','waiting_operator')
+                    from orchestrator import check_series
+                    unknown_checks=[d for d in check_series.state(db,task_id) if d['state']=='unknown']
+                    if unknown_checks:
+                        state=snapshot(db,task_id,expect_flags)
+                        update_step(db,step_id,'failed',report_path=report.get('report_path'),
+                            error='internal_check_outcome_unknown',outcome_uncertain=1,knowledge_after_sha256=state['knowledge_sha256'])
+                        with db:db.execute('UPDATE pm_coordinator_runs SET pause_step_id=? WHERE id=?',(step_id,run_id))
+                        diagnostics.emit('coordinator.pause',task_id=task_id,step_id=step_id,
+                            reason='internal_check_outcome_unknown',identifiers={'direction_ids':[d['id'] for d in unknown_checks]})
+                        return finish('internal_check_outcome_unknown','waiting_operator')
                     dependencies=[q for q in operator_questions.listing(db,task_id,pending=True)
-                        if q['id'] in report.get('operator_dependencies',[]) and (q.get('tool_request') or q.get('pivot_request'))]
+                        if q['id'] in report.get('operator_dependencies',[]) and (q.get('tool_request') or q.get('pivot_request') or q.get('budget_request'))]
                     if dependencies:
                         with db:
                             for question in dependencies:
                                 db.execute('UPDATE pm_operator_questions SET step_id=? WHERE id=? AND step_id IS NULL',(step_id,question['id']))
                         state=snapshot(db,task_id,expect_flags)
                         update_step(db,step_id,'waiting_operator',report_path=report.get('report_path'),
-                            error='tool_dependency_pending',outcome_uncertain=0,knowledge_after_sha256=state['knowledge_sha256'])
+                            error='budget_dependency_pending' if any(q.get('budget_request') for q in dependencies) else 'tool_dependency_pending',outcome_uncertain=0,knowledge_after_sha256=state['knowledge_sha256'])
                         if not operator_questions.available(state):return finish('operator_questions_pending','waiting_operator')
                         continue
                     registry=flag_verify.scan(task_id,db=db)
@@ -910,6 +955,9 @@ def run(task_id, *, roles=actions.ROLES, max_steps=8, decision_retries=1,
                 # call is allowed to gate execution here, including on resume.
             if any(q['status']=='pending' for q in state['operator_questions']):
                 return finish('operator_questions_pending','waiting_operator')
+            if not research_budgets.get(db,task_id,'coordinator')['remaining']:
+                research_budgets.request(db,task_id,'coordinator');db.commit();state=snapshot(db,task_id,expect_flags)
+                return finish('coordinator_budget_exhausted','waiting_operator')
             return finish('coordinator_step_limit')
         finally:
             db.close()

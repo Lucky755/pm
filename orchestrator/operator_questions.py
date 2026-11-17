@@ -49,6 +49,10 @@ def listing(db,task_id,*,pending=False):
             from orchestrator import tool_requests
             tool=tool_requests.for_question(db,task_id,item['id'])
             if tool:item['tool_request']=tool_requests.describe(tool)
+        if item['kind']=='budget':
+            from orchestrator import research_budgets
+            grant=research_budgets.for_question(db,task_id,item['id'])
+            if grant:item['budget_request']=grant
         if item['kind']=='pivoting':
             from orchestrator import pivoting
             route=pivoting.for_question(db,task_id,item['id'])
@@ -68,7 +72,8 @@ def dependent_branches(question):
 
 
 def available(state):
-    pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending' and q['kind']!='flag_confirmation']
+    pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending' and q['kind']!='flag_confirmation'
+             and not q.get('budget_request')]
     if not pending:return state['known_resources']
     blocked={b for q in pending for b in dependent_branches(q)}
     if 'task' in blocked:return []
@@ -76,7 +81,8 @@ def available(state):
 
 
 def blocked(decision,state):
-    pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending' and q['kind']!='flag_confirmation']
+    pending=[q for q in state.get('operator_questions',[]) if q['status']=='pending' and q['kind']!='flag_confirmation'
+             and not q.get('budget_request')]
     return bool(pending and (branch(decision)=='task' or any(
         'task' in dependent_branches(q) or branch(decision) in dependent_branches(q) for q in pending)))
 
@@ -143,6 +149,11 @@ def answer(db,task_id,question_id,decision,text='',*,capability_log=None):
         item=next((q for q in listing(db,task_id) if q['id']==question_id),None)
         if not item or item['status']!='pending':raise ValueError('No matching pending question')
         payload={'decision':decision,'text':text,'permission_effect':'none; saved scope and budgets remain authoritative'}
+        if item['kind']=='budget':
+            from orchestrator import research_budgets
+            if research_budgets.answered(db,item,decision):
+                payload['permission_effect']=('exactly five units in the named saved account; no scope change' if decision=='approve'
+                    else 'no budget increase; operator declined the named extension')
         if item['kind']=='tool':
             from orchestrator import tool_requests
             if tool_requests.answered(db,item,decision):

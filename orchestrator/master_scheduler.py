@@ -275,6 +275,10 @@ def auto(db, task_id, execute, sync_burp, skip_agents, max_jobs,
             emit({'burp_sync': evidence.load_burp().import_history(task_id, limit=50)})
 
         for number in range(1, max_rounds + 1):
+            if execute:
+                from orchestrator import research_budgets
+                research_budgets.ensure(db,task_id,'recon','rounds')
+                research_budgets.reconnaissance(db,task_id,'rounds',unit='reconnaissance_round')
             digest_before, bundle_before = evidence.make_snapshot(db, task_id)
             agent_work_before = _agent_work(task_id)
             with db:

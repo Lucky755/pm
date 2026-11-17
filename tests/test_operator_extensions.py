@@ -17,10 +17,10 @@ from orchestrator import agent_actions
 
 class OperatorExtensionsTests(unittest.TestCase):
     def test_oversized_intent_stops_before_planner(self):
-        args = argparse.Namespace(target='10.10.10.10', task='x' * 7000, hints=None)
+        args = argparse.Namespace(target='10.10.10.10', task='x' * (pm.INTENT_MAX+1), hints=None)
         with patch.object(pm, 'session_api_key', return_value='key'), patch.object(
                 pm, 'run_planner_with_validation_retry') as planner:
-            with self.assertRaisesRegex(pm.OperatorError, 'сократите на 1000'):
+            with self.assertRaisesRegex(pm.OperatorError, 'предел хранения'):
                 pm.op_new(args)
             planner.assert_not_called()
 

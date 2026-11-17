@@ -131,6 +131,8 @@ with patch.object(sys, 'argv', ['planner', '--target', '10.0.0.1', '--task', 'In
 
     def db(self):
         db = sqlite3.connect(':memory:')
+        db.execute('CREATE TABLE tasks(id INTEGER PRIMARY KEY,target TEXT)')
+        db.execute('INSERT INTO tasks VALUES(11,?)',(TARGET,));db.commit()
         self.addCleanup(db.close)
         pm.initialize_tcp_scans(db)
         return db

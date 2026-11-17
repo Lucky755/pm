@@ -34,3 +34,10 @@ Do not interpret remote 127.0.0.1/::1 as Kali or treat an application capture as
 proof of the inner destination's behavior. Other SSRF transports require a
 separate supported procedure and permissions. GET is not a universal guarantee
 that a server has no side effects; room conditions remain authoritative.
+
+For Basic credential trials and path/traversal enumeration use pm_check_series:
+predeclare max_requests (redirects count), seconds, and a criterion (authenticated,
+find_file with content marker/hash, or inventory). Five negative pairs/series
+return to the coordinator; changed wording is not a new check. Reuse saved
+web sessions and locally re-evaluate prior captures rather than repeating GETs.
+See tests/test_work_series_runtime.py for actual loopback transport coverage.

@@ -173,6 +173,13 @@ def source_state(db,task_id,capability_log):
     for item in rows(db,'pm_port_preflight',task_id,target=target):
         put('checks','port_availability:'+str(item['port']),{'port':item['port'],'state':item['state'],
             'observed_at':item['checked_at'],'purpose':'availability','product_identified':False})
+    from orchestrator import research_budgets,check_series
+    for account in research_budgets.listing(db,task_id):
+        put('plan','budget:'+account['category']+':'+account['actor'],account)
+    for direction in check_series.state(db,task_id):put('plan','direction:'+direction['id'],direction)
+    for check in rows(db,'pm_internal_checks',task_id):
+        put('checks','internal_check:'+check['id'],{**{k:check[k] for k in ('series_id','direction_id','phase','outcome')},
+            'result':json.loads(check['result_json']) if check['result_json'] else None,'unit':'internal_check'})
     for intent in rows(db,'pm_task_intents',task_id):put('constraints','intent',{'text':intent['intent'],'target':target})
     for settings in rows(db,'task_scope_settings',task_id):put('constraints','scope',settings)
     for network in rows(db,'task_scope_networks',task_id):
@@ -401,6 +408,9 @@ def material(db,task_id,reference,capability_log):
     found=db.execute('SELECT target FROM tasks WHERE id=?',(task_id,)).fetchone()
     if not found:raise ValueError('Unknown task')
     target=found[0]
+    if reference=='intent':
+        row=db.execute('SELECT intent FROM pm_task_intents WHERE task_id=?',(task_id,)).fetchone()
+        if row:return row[0].encode('utf-8')
     if re.fullmatch(r'file_material:\d+',reference):
         from orchestrator import material_processing
         return material_processing.load(db,task_id,reference)
@@ -578,7 +588,7 @@ def analysis_context(db,task_id):
 def canonical_operation(tool,command,target,provenance='network'):
     """Canonical executable input, never the model's wording/result ID/time."""
     argv=list(map(str,command));params={};inner=None
-    transient={'--task-id','--timeout','--wait','--idle','--new-evidence-id','--hypothesis-key',
+    transient={'--task-id','--timeout','--wait','--idle','--new-evidence-id','--hypothesis-key','--operation-reason',
                '--owner','--owner-pid','--purpose','--username','--resource'}
     i=0
     while i<len(argv):

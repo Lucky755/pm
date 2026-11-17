@@ -63,6 +63,11 @@ def parse_argv(raw):
 def broker_command(args, target):
     command = ['sudo', '-n', BROKER, 'run', '--task-id', str(args.task_id),
                '--profile', args.profile, '--target', target]
+    reason=getattr(args,'operation_reason','')
+    if args.profile in ('exec','poc_run'):
+        from executor.netguard_root import operation_timeout
+        operation_timeout(args.profile,args.timeout or None,reason)
+        if reason:command+=['--operation-reason',reason]
     planned = [args.profile]
     if args.profile == 'exec':
         argv = parse_argv(args.argv_json or '[]')
@@ -87,6 +92,10 @@ def broker_command(args, target):
         if not poc.is_file():
             raise ValueError('PoC file does not exist')
         command += ['--poc-file', str(poc), '--poc-interp', args.poc_interp]
+        if getattr(args,'stdin_file',''):
+            input_path=Path(args.stdin_file)
+            if input_path.is_symlink() or not input_path.resolve().is_relative_to(allowed):raise ValueError('stdin must belong to task PoC storage')
+            command+=['--stdin-file',str(input_path.resolve())]
         planned = [args.poc_interp, str(poc)]
         if args.timeout:
             command += ['--timeout', str(args.timeout)]
@@ -158,8 +167,7 @@ def callback_command(args):
 def run_broker(command):
     result = subprocess.run(command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
                             capture_output=True, text=True, errors='replace',
-                            timeout=360 if '--profile' in command and
-                            command[command.index('--profile') + 1] == 'poc_run' else 260,
+                            timeout=(int(command[command.index('--timeout')+1])+40) if '--timeout' in command else 260,
                             check=False)
     try:
         payload = json.loads(result.stdout)
@@ -186,8 +194,10 @@ def main():
     run.add_argument('--argv-json', default='')
     run.add_argument('--poc-file', default='')
     run.add_argument('--poc-interp', default='bash')
+    run.add_argument('--stdin-file',default='')
     run.add_argument('--research-host', default='')
     run.add_argument('--timeout', type=int, default=0)
+    run.add_argument('--operation-reason',default='')
     run.add_argument('--execute', action='store_true')
     cb = sub.add_parser('callback')
     cb.add_argument('--task-id', type=int, required=True)

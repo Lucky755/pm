@@ -29,6 +29,8 @@ spec.loader.exec_module(s)
 class AutoTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(':memory:')
+        self.db.execute('CREATE TABLE tasks(id INTEGER PRIMARY KEY,target TEXT)')
+        self.db.execute("INSERT INTO tasks VALUES(9,'127.0.0.1')");self.db.commit()
         self.state = {'observations': 1, 'queue': [], 'agent_calls': [],
                       'decisions': 0, 'results_change': True}
         self.patches = []
