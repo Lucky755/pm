@@ -18,6 +18,7 @@ OFFLINE = OFFLINE | {'test_specialist_workflow'}
 OFFLINE = OFFLINE | {'test_method_library'}
 OFFLINE = OFFLINE | {'test_operator_console'}
 OFFLINE = OFFLINE | {'test_final_audit'}
+OFFLINE = OFFLINE | {'test_result_ownership'}
 SCRIPTS = frozenset(('test_burp_import', 'test_decision_agent', 'test_evidence_pipeline', 'test_evidence_recovery', 'test_master_scheduler', 'test_policy'))
 RUNTIME = frozenset(('test_model_adapter_runtime', 'test_coordinated_runtime', 'test_evidence_readonly_runtime', 'test_tool_download_runtime', 'test_task_sessions', 'test_session_runtime', 'test_http_client_runtime','test_browser_runtime'))
 RUNTIME = RUNTIME | {'test_burp_proxy_runtime'}

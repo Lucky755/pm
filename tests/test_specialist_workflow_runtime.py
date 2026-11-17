@@ -77,6 +77,15 @@ class SpecialistRuntimeTests(unittest.TestCase):
                     marker=owner.root/('goal-cancel-recorded' if getattr(owner,'mode','')=='goal' else 'ssh-completed')
                     deadline=time.monotonic()+12
                     while not marker.exists() and not owner.release.is_set() and time.monotonic()<deadline:time.sleep(.02)
+                    # Guarantee cross-over: the SSH result must be committed
+                    # before the web tool returns, not just the executor exited.
+                    if getattr(owner,'mode','') in ('normal','same-role'):
+                        while time.monotonic()<deadline:
+                            log=a.CAPABILITY_LOG/'task_11.jsonl'
+                            rows=list(task_memory.capability_records(11,log,'10.0.0.1'))
+                            if any(r.get('tool')=='net_exec' and r.get('coordinator_step_id') for r in rows):break
+                            time.sleep(.02)
+                        else:raise AssertionError('SSH receipt was not committed during WEB work')
                     body=b'Independent web investigation continued while SSH was checked.'
                 self.send_response(200);self.send_header('Content-Type','text/plain');self.send_header('Content-Length',str(len(body)));self.end_headers()
                 try:self.wfile.write(body)
@@ -193,6 +202,14 @@ print(json.dumps({'status':'completed','task_id':11,'target':'10.0.0.1','exit_co
                 source=tool_payload(body)
                 self.assertIn('exit_code',source,{k:source.get(k) for k in ('status','reason','reason_category','error_type','stderr')})
                 self.assertEqual(source['exit_code'],0,source);self.assertIn('uid='+str(os.getuid()),source['stdout'])
+                if mode in ('normal','same-role'):
+                    deadline=time.monotonic()+10
+                    while time.monotonic()<deadline:
+                        records=list(task_memory.capability_records(11,a.CAPABILITY_LOG/'task_11.jsonl','10.0.0.1'))
+                        if len([r for r in records if r.get('tool')=='http_capture' and r.get('coordinator_step_id')
+                                and r['coordinator_step_id']!=assignment['coordinator_step_id']])==2:break
+                        time.sleep(.02)
+                    else:raise AssertionError('WEB receipt was not committed during SSH work')
                 report={'summary':'SSH execution returned the exact identity below.','findings':[],'flags':[],
                     'access_level':'root' if os.getuid()==0 else 'user','access_signal':'execution','access_probe_result_id':source['result_id'],
                     'access_quote':source['stdout'].strip(),'verified':[],'uncertainties':[],'proposed_actions':[]}
@@ -233,7 +250,7 @@ print(json.dumps({'status':'completed','task_id':11,'target':'10.0.0.1','exit_co
                     time.sleep(.03)
                 raise AssertionError('Operator observer timeout')
             except Exception as exc:self.observer_errors.append(exc)
-        observer=threading.Thread(target=observe,daemon=True) if mode!='normal' else None
+        observer=threading.Thread(target=observe,daemon=True) if mode in ('cancel','goal') else None
         if observer:observer.start()
         with d.run('concurrent SDK/MCP '+mode,11),d.process_environment():
             result=c.run(11,api_key='local-test-only',max_specialists=2,max_steps=10,max_tokens=1000,expect_flags=1 if mode=='goal' else 2)
@@ -271,6 +288,28 @@ print(json.dumps({'status':'completed','task_id':11,'target':'10.0.0.1','exit_co
         result,_=self.run_chain()
         self.assertFalse(result['succeeded'])
         self.assertEqual(len([s for s in result['steps'] if s['decision'].get('action')=='run_role' and s['status']=='completed']),2)
+        self.assert_execution_owners(result)
+
+    def assert_execution_owners(self,result):
+        from orchestrator import research_budgets
+        records={r['id']:r for r in (json.loads(line) for line in (a.CAPABILITY_LOG/'task_11.jsonl').read_text().splitlines())}
+        with self.case.connect() as db:
+            for step in result['steps']:
+                if step['decision']['action']!='run_role':continue
+                raw=db.execute('SELECT report_json FROM pm_agent_action_reports WHERE task_id=11 AND role=? AND iteration=?',
+                    (step['decision']['role'],step['report_iteration'])).fetchone()[0]
+                report=json.loads(raw)
+                actual={r['result_id'] for r in report['execution_outcome']['results']}
+                expected={rid for rid,r in records.items() if r.get('coordinator_step_id')==step['id'] and r['tool'] in ('http_capture','net_exec')}
+                self.assertTrue(expected)
+                self.assertEqual(actual,expected,(step['id'],actual,expected))
+                self.assertEqual(report['tool_calls'],3 if step['decision']['question'].startswith('WEB_PIPELINE') else 2)
+                self.assertEqual(report['tool_calls'],research_budgets.step_usage(db,11,'specialist',step['decision']['role'],step['id']))
+                for entry in report['execution_outcome']['results']:
+                    self.assertEqual(records[entry['result_id']]['coordinator_step_id'],step['id'])
+                    self.assertEqual(entry['coordinator_step_id'],step['id'])
+                    self.assertEqual(entry['actor_role'],step['decision']['role'])
+                self.assertEqual(report['execution_outcome']['status'],'executed')
 
     def test_cancel_web_runtime_does_not_interrupt_ssh_specialist(self):
         result,_=self.run_chain('cancel')
@@ -287,6 +326,7 @@ print(json.dumps({'status':'completed','task_id':11,'target':'10.0.0.1','exit_co
             self.assertEqual(sorted(r['tool_calls'] for r in reports),[2,3])
             self.assertEqual(research_budgets.get(db,11,'specialist','vuln')['used'],5)
         self.assertEqual(len(reports),2);self.assertFalse(result['succeeded'])
+        self.assert_execution_owners(result)
 
     def test_explicit_goal_completion_cancels_unneeded_runtime(self):
         result,api=self.run_chain('goal')

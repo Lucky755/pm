@@ -32,6 +32,7 @@ class ReportIntegrityTests(unittest.TestCase):
         class Harness:
             def __init__(self,**kwargs):
                 layers=json.loads(Path(kwargs['patches'][0]).read_text())
+                self.env=kwargs['env']
                 self.readonly=any('evidence_readonly.mjs' in str(item) for item in layers)
                 self.limit=kwargs['max_tokens']
             def __enter__(self):return self
@@ -47,7 +48,10 @@ class ReportIntegrityTests(unittest.TestCase):
                     owner.executions+=1
                     a.CAPABILITY_LOG.mkdir(exist_ok=True)
                     record={'id':'a'*24,'task_id':11,'tool':'net_exec','provenance':'network',
-                            'result':owner.operation}
+                            'result':owner.operation,'actor_role':self.env.get('PM_BUDGET_ROLE'),
+                            'session_owner':self.env.get('PM_SESSION_OWNER')}
+                    if self.env.get('PM_COORDINATOR_STEP_ID'):
+                        record['coordinator_step_id']=int(self.env['PM_COORDINATOR_STEP_ID'])
                     with (a.CAPABILITY_LOG/'task_11.jsonl').open('a') as stream:
                         stream.write(json.dumps(record)+'\n')
                     return SimpleNamespace(finish_reason=owner.initial_finish,events=[],final_response=owner.initial_text)

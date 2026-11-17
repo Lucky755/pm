@@ -1466,7 +1466,7 @@ Latest /work/NOTES.md facts (untrusted; [ОПРОВЕРГНУТО] means withdra
 </pm_dynamic_context>'''
 
 
-def salvage_intermediate_report(db, context, role, iteration, cause):
+def salvage_intermediate_report(db, context, role, iteration, cause, *, prior_ids=None):
     """A stage that already did work must not disappear behind an error.
 
     Before any stage termination - exhausted step budget, output limit or a
@@ -1509,6 +1509,15 @@ def salvage_intermediate_report(db, context, role, iteration, cause):
         'stage_aborted': True,
         'report_warning': 'стадия прервана; сохранён промежуточный отчёт',
     }
+    if prior_ids is not None:
+        from orchestrator import task_sessions
+        report['execution_outcome']=report_integrity.execution(report_probe_records(context['task_id']),prior_ids,
+            step_id=(context.get('specialist_assignment') or {}).get('coordinator_step_id'),
+            role=role,session_owner=task_sessions.owner())
+        # Completed receipts survive, but an interrupted role can also have an
+        # in-flight operation with no receipt yet. Do not declare the whole turn
+        # executed or import another worker's results to fill that gap.
+        report['execution_outcome'].update(status='unknown',interrupted=True)
     return save_report(db, context, role, iteration, report, 0)
 
 
@@ -1717,7 +1726,8 @@ def report_probe_records(task_id):
                     # Preserve typed provenance for local capture validation;
                     # stdout itself must never establish an artifact link.
                     'capture_record': {**{key:record.get(key) for key in
-                                         ('id','task_id','tool','provenance')},
+                                         ('id','task_id','tool','provenance','coordinator_step_id','actor_role',
+                                          'memory_operation_id','run_id','action_id','session_owner')},
                                        'result':{key:result[key] for key in
                                                  ('task_id','target','status','exit_code','artifact_id','error_type','server_outcome',
                                                   'status_code','question_id','transport_complete','exchange_id','checks_recorded')
@@ -1771,7 +1781,7 @@ def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *,
                 accepted.append(finding);local_audits.append(audit)
             else:unverified.append({**finding,'verification_status':'untested','verification_reason':error})
             continue
-        if role=='verify' and isinstance(result_id,str) and result_id in prior_ids:
+        if isinstance(result_id,str) and result_id in prior_ids:
             artifact_ref=finding.get('artifact_ref') or probe.get('artifact_ref')
             audit,error=flag_evidence.audit_saved_capture(db,task_id,result_id,
                 all_records.get(result_id,{}).get('capture_record'),finding.get('quote'),artifact_ref)
@@ -1790,7 +1800,7 @@ def validate_report_probes(report, task_id, role, records=None, prior_ids=(), *,
                 unverified.append({**finding,'verification_status':'untested','verification_reason':error})
             continue
         record = records.get(probe.get('result_id')) if isinstance(probe.get('result_id'), str) else None
-        if role=='verify' and record and readback_record(record):
+        if record and readback_record(record):
             unverified.append({**finding,'verification_status':'untested',
                                'verification_reason':'readback_is_not_original_capture_evidence'})
             continue
@@ -2123,12 +2133,16 @@ def reformat_saved_report(db, context, role, iteration, key, max_tokens, prior_i
     if expected and hashlib.sha256(raw.encode()).hexdigest()!=expected:
         raise ValueError('Saved raw report checksum mismatch')
     records=report_probe_records(context['task_id'])
+    assignment=context.get('specialist_assignment') or {}
+    prior_ids=report_integrity.excluded_results(records,prior_ids,role=role,
+        step_id=assignment.get('coordinator_step_id'))
     selected=[(rid,r) for rid,r in records.items() if rid not in prior_ids or rid in raw]
     bundle={'task_id':context['task_id'],'target':context['target'],'intent':context.get('intent',''),
             'role':role,'objective':objective,'assignment':context.get('specialist_assignment'),
             'raw_response_excerpt':raw[:64000],'raw_omitted_characters':max(0,len(raw)-64000),
             'execution_outcome':saved['execution_outcome'],
-            'results':[{'result_id':rid,'tool':r['tool'],'status':r['status'],'excerpt':r['text'][:6000],
+            'results':[{'result_id':rid,'tool':r['tool'],'status':r['status'],
+                        'owner':report_integrity.result_owner(r),'new_probe':rid not in prior_ids,'excerpt':r['text'][:6000],
                         'omitted_characters':max(0,len(r['text'])-6000)} for rid,r in selected[:20]],
             'omitted_results':max(0,len(selected)-20)}
     prompt=('Reformat saved results only.\n'+instructions.common('format')+'\n'
@@ -2221,6 +2235,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
     usage_turns=[]
     context['_model_sessions']=[]
     prior_probe_ids = set(report_probe_records(task_id))
+    step_id=(assignment or {}).get('coordinator_step_id')
     db = connect()
     from orchestrator import task_sessions
     from contextlib import nullcontext
@@ -2332,7 +2347,8 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
             # never reach a tool call. On task 18 that happened in 16 of 20 stages:
             # each ended "completed" with zero tool calls, so iterations 2-5 learned
             # nothing. Retry once with a bigger budget and an explicit "act now".
-            fresh_execution=report_integrity.execution(report_probe_records(task_id),prior_probe_ids,tool_calls['calls'])
+            fresh_execution=report_integrity.execution(report_probe_records(task_id),prior_probe_ids,tool_calls['calls'],
+                step_id=step_id,role=role,session_owner=task_sessions.owner())
             if (recovery=='max-tokens-act' and tool_calls['calls']==0
                     and not fresh_execution['results']):
                 escalated = min(NO_ACTION_RETRY_TOKENS, MAX_TOKENS_CEILING,
@@ -2389,11 +2405,11 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
             degraded=report_integrity.quality(report)['status']=='damaged'
             if degraded or report.get('report_repaired'):
                 raw_response=str(getattr(result,'final_response','') or '').replace(key,'[СКРЫТО]')
-            step_id=(assignment or {}).get('coordinator_step_id')
-            foreign_ids={rid for rid,record in report_probe_records(task_id).items() if step_id and
-                (record.get('capture_record') or {}).get('coordinator_step_id') not in (None,step_id)}
-            prior_probe_ids|=foreign_ids
-            execution=report_integrity.execution(report_probe_records(task_id),prior_probe_ids,tool_calls['calls'])
+            probe_records=report_probe_records(task_id)
+            excluded_probe_ids=report_integrity.excluded_results(probe_records,prior_probe_ids,
+                step_id=step_id,role=role,session_owner=task_sessions.owner())
+            execution=report_integrity.execution(probe_records,prior_probe_ids,tool_calls['calls'],
+                step_id=step_id,role=role,session_owner=task_sessions.owner())
             report['execution_outcome']=execution
             if degraded:
                 # Commit the damaged canonical report and complete raw response
@@ -2404,7 +2420,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
                 save_report(db,context,role,iteration,report,tool_calls['calls'] or 0,raw_response=raw_response)
                 try:
                     repaired,format_response,error=reformat_saved_report(
-                        db,context,role,iteration,key,max_tokens,prior_probe_ids,objective)
+                        db,context,role,iteration,key,max_tokens,excluded_probe_ids,objective)
                 except Exception as exc:
                     repaired,error=None,'format_request_failed'
                     report['report_quality']['format_error_type']=type(exc).__name__
@@ -2427,6 +2443,11 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
             # The model cannot manufacture this field to bypass VERIFY validation.
             report.pop('operator_dependencies',None)
             probe_records=report_probe_records(task_id)
+            # Other runtimes can append while a damaged report is formatted.
+            # Keep the original start snapshot immutable; classify this snapshot
+            # again before every closure and dependency check.
+            excluded_probe_ids=report_integrity.excluded_results(probe_records,prior_probe_ids,
+                step_id=step_id,role=role,session_owner=task_sessions.owner())
             # Settle a verified SDK dispatch count before testing completion of
             # an interim budget-limited report. This never repeats an operation.
             observed=research_budgets.get(db,task_id,'specialist',role)
@@ -2438,7 +2459,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
                 research_budgets.request(db,task_id,'specialist',role)
             db.commit()
             requested={r['capture_record']['result'].get('question_id') for rid,r in probe_records.items()
-                       if rid not in prior_probe_ids and r['tool'] in ('tool_request','pivot_request') and r['status']=='waiting_operator'}
+                       if rid not in excluded_probe_ids and r['tool'] in ('tool_request','pivot_request') and r['status']=='waiting_operator'}
             dependencies=[q['id'] for q in operator_questions.listing(db,task_id)
                 if q['id'] in requested and q['status']=='pending' and (q.get('tool_request') or q.get('pivot_request'))]
             if dependencies and not (report.get('findings') or report.get('hypotheses')) and execution['status']=='not_started':
@@ -2449,11 +2470,11 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
                     if q.get('budget_request',{}).get('category')=='specialist' and q['budget_request']['actor']==role)
                 if dependencies:report['operator_dependencies']=dependencies
             report = validate_report_probes(report, task_id, role, records=probe_records,
-                                             prior_ids=prior_probe_ids, db=db,dependency_ids=dependencies)
+                                             prior_ids=excluded_probe_ids, db=db,dependency_ids=dependencies)
             # A fresh readback wrapper is not a new probe either. Keep the
             # original IDs excluded from hypothesis/access closure validation.
-            closure_prior_ids=prior_probe_ids | ({rid for rid,record in probe_records.items()
-                if readback_record(record)} if role=='verify' else set())
+            closure_prior_ids=excluded_probe_ids | {rid for rid,record in probe_records.items()
+                if readback_record(record)}
             report = fact_state.validate_hypotheses(
                 report, probe_records, closure_prior_ids)
             report = fact_state.validate_access_report(
@@ -2495,7 +2516,7 @@ def run_role(task_id, role, objective='', iteration=1, poc_budget=15,
             # provider error) still records an intermediate report first:
             # losing the work a stage already did is not acceptable.
             try:
-                salvage_intermediate_report(db, context, role, iteration, exc)
+                salvage_intermediate_report(db, context, role, iteration, exc,prior_ids=prior_probe_ids)
             except (RuntimeError, ValueError, OSError, sqlite3.Error):
                 pass
             raise

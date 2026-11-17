@@ -262,13 +262,15 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_actual_verify_negative_probe_is_not_an_incomplete_report(self):
         class Harness:
-            def __init__(inner,**kwargs):pass
+            def __init__(inner,**kwargs):inner.env=kwargs['env']
             def __enter__(inner):return inner
             def __exit__(inner,*args):return False
             def start_session(inner,name):
                 def run(prompt,**kwargs):
                     a.CAPABILITY_LOG.mkdir(exist_ok=True)
                     record={'id':'e'*24,'task_id':11,'tool':'net_exec','provenance':'network',
+                            'coordinator_step_id':int(inner.env['PM_COORDINATOR_STEP_ID']),
+                            'actor_role':inner.env['PM_BUDGET_ROLE'],'session_owner':inner.env['PM_SESSION_OWNER'],
                             'result':{'status':'completed','exit_code':0,'stdout':'HTTP/1.1 404 Not Found'}}
                     (a.CAPABILITY_LOG/'task_11.jsonl').write_text(json.dumps(record)+'\n')
                     report={'summary':'HTTP check returned 404; no impact demonstrated.',

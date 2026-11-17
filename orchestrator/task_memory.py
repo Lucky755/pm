@@ -314,20 +314,22 @@ def source_state(db,task_id,capability_log):
                 'sha256':hashlib.sha256(raw.encode()).hexdigest(),'bytes':len(raw.encode()),
                 'complete':attempt['status']=='completed','source':{'table':'pm_tcp_full_scan_attempts','id':attempt['id']}})
     for record in capability_records(task_id,capability_log,target):
+        from orchestrator.report_integrity import result_owner
+        owner=result_owner({'capture_record':record})
         result=record['result'];ref='result:'+record['id']
         text=capability_text(record)
         put('materials',ref,{'kind':'capability','tool':record['tool'],'sha256':hashlib.sha256(text.encode()).hexdigest(),
             'bytes':len(text.encode()),'source':{'log':str(capability_log),'result_id':record['id']},
-            'provenance':record.get('provenance','unknown')})
+            'provenance':record.get('provenance','unknown'),'owner':owner})
         original=record['_memory_raw_line'].encode()
         put('materials','execution:'+record['id'],{'kind':'capability_record','tool':record['tool'],
             'sha256':hashlib.sha256(original).hexdigest(),'bytes':len(original),
-            'source':{'log':str(capability_log),'result_id':record['id']}})
+            'source':{'log':str(capability_log),'result_id':record['id']},'owner':owner})
         put('checks',ref,{'operation':record['tool'],'phase':'not_started' if result.get('execution_started') is False else 'unknown' if result.get('status')=='timeout' else 'finished',
             'outcome':result.get('status'),'exit_code':result.get('exit_code'),
             'execution_started':result.get('execution_started'),'error_type':result.get('error_type'),
             'reason_category':result.get('kind'),'server_outcome':result.get('server_outcome','unknown'),
-            'provenance':record.get('provenance','unknown'),'result_id':record['id'],
+            'provenance':record.get('provenance','unknown'),'result_id':record['id'],'owner':owner,
             'execution_ref':'execution:'+record['id'],
             'operation_signature':canonical_operation(record['tool'],record['argv'],target,record.get('provenance'))['signature']
                 if record.get('argv') and not record.get('argv_truncated') else None,
@@ -528,6 +530,7 @@ def context(db,task_id,capability_log,*,references=(),question=''):
         else:shape={k:v for k,v in value.items() if k not in ('source_owned',)}
         group=check_groups.setdefault(digest(shape),{**shape,'references':[]})
         group['references'].append(key)
+        if value.get('owner'):group.setdefault('owners',{})[key]=value['owner']
     source['checks']={'groups':list(check_groups.values()),'total_records':len(source['checks']),
                       'history_table':'pm_memory_operations / capability_log / pm_coordinator_steps'}
     # Aggregate identical scan evidence in code. All port identities and sources
@@ -567,7 +570,7 @@ def context(db,task_id,capability_log,*,references=(),question=''):
     index={}
     for ref,item in materials.items():
         summary=str(item.get('summary',''))
-        index[ref]={**{k:item[k] for k in ('kind','sha256','bytes','tool','quality','path','complete') if k in item},
+        index[ref]={**{k:item[k] for k in ('kind','sha256','bytes','tool','quality','path','complete','owner') if k in item},
                     'summary':summary[:300],'summary_omitted_characters':max(0,len(summary)-300)}
     source['resources']=resources
     return {'version':head['version'],'source_state_sha256':digest([source,groups,index]),'state':source,

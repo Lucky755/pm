@@ -49,7 +49,37 @@ def transport_completed(tool, payload):
     return False
 
 
-def execution(records, prior_ids, calls=None):
+def result_owner(record):
+    source=record.get('capture_record') or {}
+    step=source.get('coordinator_step_id')
+    known=type(step) is int and step>0
+    return {'coordinator_step_id':step,'actor_role':source.get('actor_role'),
+            'ownership_status':'known' if known or source.get('session_owner') else 'unestablished',
+            **{k:source[k] for k in ('memory_operation_id','run_id','action_id','session_owner') if source.get(k)}}
+
+
+def excluded_results(records, prior_ids, *, step_id=None, role=None, session_owner=None):
+    """Shared originals stay readable; only attributable new actions are ours.
+
+    A role is not an owner: two profiles can run as VULN simultaneously. Missing
+    step IDs are never filled with the caller's ID. Standalone legacy calls can
+    still describe fresh records with explicitly unestablished ownership.
+    """
+    excluded=set(prior_ids)
+    for rid,record in records.items():
+        source=record.get('capture_record') or {}
+        step=source.get('coordinator_step_id');actor=source.get('actor_role')
+        if ((step_id is not None and (type(step) is not int or step!=step_id)) or
+                (step_id is None and step is not None) or
+                (role is not None and actor not in (None,'',role)) or
+                (session_owner and source.get('session_owner') not in (None,'',session_owner))):
+            excluded.add(rid)
+    return excluded
+
+
+def execution(records, prior_ids, calls=None, *, step_id=None, role=None, session_owner=None):
+    initial=set(prior_ids)
+    prior_ids=excluded_results(records,initial,step_id=step_id,role=role,session_owner=session_owner)
     rows=[]
     fresh=[record for rid,record in records.items() if rid not in prior_ids]
     dependency_only=bool(fresh and calls==len(fresh) and all(r['tool'] in ('tool_request','pivot_request') for r in fresh))
@@ -83,13 +113,19 @@ def execution(records, prior_ids, calls=None):
         server_states={item['outcome'] for item in responses}
         if server_states:server=next(iter(server_states)) if len(server_states)==1 else 'mixed'
         rows.append({'result_id':rid,'tool':record['tool'],'status':status,'exit_code':code,'outcome':outcome,
+                     **result_owner(record),
                      'provenance':(record.get('capture_record') or {}).get('provenance'),
                      'server_outcome':server,'server_responses':responses[:20],
                      'omitted_server_responses':max(0,len(responses)-20)})
     statuses={r['outcome'] for r in rows}
     status=('unknown' if 'unknown' in statuses else next(iter(statuses)) if len(statuses)==1 else
             'mixed' if rows else 'not_started' if calls==0 or dependency_only else 'unknown')
-    return {'status':status,'results':rows[:30],'omitted':max(0,len(rows)-30)}
+    unowned=[{'result_id':rid,**result_owner(record)} for rid,record in records.items()
+             if step_id is not None and rid not in initial and rid in prior_ids and
+             not (type(result_owner(record)['coordinator_step_id']) is int and
+                  result_owner(record)['coordinator_step_id']>0)]
+    return {'status':status,'results':rows[:30],'omitted':max(0,len(rows)-30),
+            'unattributed_results':unowned[:30],'omitted_unattributed':max(0,len(unowned)-30)}
 
 
 def check_consistency(report, assertions):

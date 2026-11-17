@@ -815,6 +815,9 @@ def log_capability(tool, task_id, payload, elapsed, command=()):
         if _memory_operation_id.get():record['memory_operation_id']=_memory_operation_id.get()
         if os.environ.get('PM_BUDGET_ROLE'):record['actor_role']=os.environ['PM_BUDGET_ROLE']
         if os.environ.get('PM_COORDINATOR_STEP_ID'):record['coordinator_step_id']=int(os.environ['PM_COORDINATOR_STEP_ID'])
+        if os.environ.get('PM_SESSION_OWNER'):record['session_owner']=os.environ['PM_SESSION_OWNER']
+        record.update({key:value for key,value in (diagnostics.context() or {}).items()
+                       if key in ('run_id','action_id') and value})
         record["input_flag_literals"] = sorted(set(re.findall(
             r"\b[A-Z][A-Z0-9_]{1,19}\{[A-Za-z0-9_!@#$%^&*+.:-]{3,120}\}",
             " ".join(full_argv)
@@ -1422,7 +1425,10 @@ def pm_capability_read(task_id: int, result_id: str, offset: int = 0) -> str:
                         end -= 1
                 else:
                     part = ""
+                from orchestrator.report_integrity import result_owner
                 return tool_response({"status": "completed", "result_id": result_id,
+                                      "owner":result_owner({'capture_record':record}),
+                                      "provenance":"local","fresh_observation":False,
                                       "offset": offset, "next_offset": end,
                                       "total_bytes": len(raw), "text": part})
     return tool_response({"status": "blocked", "error": "Result not found"})

@@ -324,7 +324,9 @@ class ToolAcquisitionTests(unittest.TestCase):
             def start_session(self,name):
                 def run(prompt,**kwargs):
                     model_prompts.append(prompt)
-                    reply=owner.request(kind='documentation',filename='guide.txt',interpreter='none')
+                    with patch.dict(os.environ,{key:self.options['env'][key] for key in
+                            ('PM_COORDINATOR_STEP_ID','PM_BUDGET_ROLE','PM_TASK_ID','PM_SESSION_OWNER')}):
+                        reply=owner.request(kind='documentation',filename='guide.txt',interpreter='none')
                     owner.assertEqual(reply['status'],'waiting_operator')
                     Path(self.options['env']['PM_AGENT_STATS_FILE']).write_text(json.dumps(
                         {'calls':1,'tool_events':1,'reads':0,'denied':0,'sessions':0}))

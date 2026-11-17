@@ -49,6 +49,7 @@ class AdapterRuntimeTests(unittest.TestCase):
         self.stack=ExitStack();self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.dict(os.environ,{'PATH':os.environ.get('PATH','/usr/bin:/bin'),
             'LANG':'C.UTF-8','NO_PROXY':'127.0.0.1,localhost',
+            'PYTHONPATH':os.environ.get('PYTHONPATH',''),  # inherit offline storage guard into planner/MCP/worker children
             'PM_MODEL_AUDIT_DIR':str(self.root/'model-audit')},clear=True))
         self.rid='a'*24;self.captured='HTTP/1.1 403 Forbidden; saved response, no goal claim'
         a.CAPABILITY_LOG.mkdir()
