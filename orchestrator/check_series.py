@@ -97,6 +97,17 @@ def matches(criterion,item,body,status,full):
     return bool(met)
 
 
+def reuse(db,task_id,item,value,criterion):
+    try:
+        body,audit=http_client.audit_saved_check(db,task_id,item,value)
+        return {**value,**audit,'criterion_matched':matches(criterion,item,body,audit['status_code'],audit['source_complete']),
+            'reused':True,'requests_sent':0}
+    except (ValueError,OSError,KeyError,TypeError) as exc:
+        reason=str(exc) if str(exc).startswith('saved_http_') else 'saved_http_integrity_failed'
+        return {**value,'criterion_matched':False,'source_complete':False,'reused':True,
+            'requests_sent':0,'execution_started':False,'audit_error':reason}
+
+
 def direct_http(db,task_id,request,session_id,request_limit=6):
     """Explicit Basic trials also obey the five-refusal guard.
 
@@ -138,7 +149,9 @@ def direct_http(db,task_id,request,session_id,request_limit=6):
     refused=reply.get('status_code') in (401,403) and full
     not_started=reply.get('status')=='blocked' and not reply.get('exchange_id')
     value={'phase':'finished' if full or not_started else 'unknown','outcome':'server_refusal' if refused else 'refused_before_execution' if not_started else 'interpretation_required' if full else 'unknown',
-        'exchange_id':reply.get('exchange_id'),'artifact_ref':reply.get('artifact_ref'),'status_code':reply.get('status_code')}
+        'exchange_id':reply.get('exchange_id'),'artifact_ref':reply.get('artifact_ref'),'status_code':reply.get('status_code'),
+        'source_complete':bool(full and not reply.get('body_truncated') and not reply.get('wire_truncated')),
+        'session_id':session_id,'request_url':request['url'],'task_id':task_id,'target':target}
     finish(value)
     return {**reply,'internal_check':{'check_id':ident,'direction_id':direction,**value}}
 
@@ -153,13 +166,22 @@ def run(db,task_id,plan,capability_log,request=None):
     # Neither hypothesis wording, time nor a new ID creates a new check.
     series=task_memory.digest([direction,identities,plan['criterion']])
     row=db.execute('SELECT state,failures,plan_step FROM pm_check_directions WHERE id=?',(direction,)).fetchone()
-    if row and (row[0]=='unknown' or row[0]=='succeeded' and family=='authentication'):
-        return {'status':'completed' if row[0]=='succeeded' else 'outcome_unknown','direction_id':direction,'direction_result':row[0],
+    if row and row[0]=='unknown':
+        return {'status':'outcome_unknown','direction_id':direction,'direction_result':row[0],
                 'cached':True,'execution_started':False,'checks':[]}
     saved=db.execute('SELECT phase,result_json FROM pm_check_series WHERE task_id=? AND id=?',(task_id,series)).fetchone()
     if saved:
-        if saved[0]=='completed':return {**json.loads(saved[1]),'cached':True}
+        if saved[0]=='completed':
+            result=json.loads(saved[1])
+            checks=[reuse(db,task_id,item,value,plan['criterion']) for item,value in zip(items,result['checks'])]
+            invalid=any(c.get('audit_error') for c in checks)
+            return {**result,'checks':checks,'cached':True,'checks_started':0,'requests_sent':0,'execution_started':False,
+                'criterion_matched':not invalid and any(c['criterion_matched'] for c in checks),
+                **({'status':'blocked','direction_result':'saved_evidence_audit_failed'} if invalid else {})}
         return {'status':'outcome_unknown','direction_result':'interrupted_series_no_replay','series_id':series,'execution_started':False}
+    if row and row[0]=='succeeded' and family=='authentication':
+        return {'status':'completed','direction_id':direction,'direction_result':'prior_criterion_satisfied',
+            'criterion_matched':False,'goal_confirmed':False,'cached':True,'execution_started':False,'checks':[]}
     current_step=int(os.environ.get('PM_COORDINATOR_STEP_ID') or 0)
     if row and row[1]>=5:
         decision=None
@@ -182,16 +204,12 @@ def run(db,task_id,plan,capability_log,request=None):
         old=db.execute('SELECT phase,result_json FROM pm_internal_checks WHERE task_id=? AND direction_id=? AND identity=?',(task_id,direction,identity)).fetchone()
         if old:
             if old[0]!='finished':unknown=True;break
-            value=json.loads(old[1]);met=False
+            value=reuse(db,task_id,item,json.loads(old[1]),plan['criterion'])
             # Re-evaluate the current criterion against original saved bytes,
             # never inherit a different series' successful inventory criterion.
-            try:
-                ref=value.get('artifact_ref','')
-                body,_=http_artifacts.load(db,task_id,ref.removeprefix('http_artifact:'))
-                met=matches(plan['criterion'],item,body,value.get('status_code'),value.get('source_complete',False))
-            except (ValueError,OSError):pass
-            results.append({**value,'criterion_matched':met,'reused':True,'requests_sent':0})
-            if met and plan['criterion']['kind']!='inventory':matched=True;break
+            results.append(value)
+            if value.get('audit_error'):break
+            if value['criterion_matched'] and plan['criterion']['kind']!='inventory':matched=True;break
             continue
         ident=uuid.uuid4().hex
         with db:db.execute("INSERT INTO pm_internal_checks VALUES(?,?,?,?,?,'started',NULL,NULL)",(ident,task_id,direction,series,identity))

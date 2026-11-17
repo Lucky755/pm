@@ -5,7 +5,9 @@ automatic replay of unknown operations, inferred authentication or goal success.
 """
 import base64
 import hashlib
+import io
 import json
+from email.parser import BytesParser
 from http.cookies import SimpleCookie
 import re
 import subprocess
@@ -17,6 +19,105 @@ from orchestrator import diagnostics,http_artifacts as artifacts,http_discovery 
 
 
 class HTTPExecutionError(RuntimeError):pass
+
+
+def audit_saved_check(db,task_id,item,receipt):
+    """Read-only audit of saved GET originals, not a new target observation.
+
+    Missing historical receipt fields are derived from the exchange and private
+    originals. Caller booleans/status/quotes never establish completeness.
+    """
+    def require(test,reason):
+        if not test:raise ValueError('saved_http_'+reason)
+    def exchange(identifier):
+        cursor=db.execute('SELECT id,task_id,target,url,method,phase,session_id,parent_id,artifact_id,metadata_json '
+                          'FROM pm_http_exchanges WHERE id=? AND task_id=?',(identifier,task_id))
+        row=cursor.fetchone();require(row is not None,'exchange_unavailable')
+        return dict(zip([c[0] for c in cursor.description],row))
+    eid=receipt.get('exchange_id');require(type(eid) is int,'exchange_required')
+    for key in ('task_id','source_task_id'):
+        if key in receipt:require(receipt[key]==task_id,'receipt_task_mismatch')
+    last=exchange(eid);root=last['parent_id'] or eid
+    chain=[exchange(root)]
+    if root!=eid:
+        chain.extend(exchange(r[0]) for r in db.execute('SELECT id FROM pm_http_exchanges WHERE task_id=? AND parent_id=? AND id<=? ORDER BY id',
+            (task_id,root,eid)).fetchall())
+    require(chain[-1]['id']==eid,'exchange_chain_mismatch')
+    expected,target=endpoint(db,task_id,item['url']);next_url=expected['request_url']
+    for key in ('target','source_target'):
+        if key in receipt:require(receipt[key]==target,'receipt_target_mismatch')
+    require(receipt.get('source_complete') is not False,'receipt_source_incomplete')
+    result={};body=b''
+    for entry in chain:
+        url,pin=endpoint(db,task_id,entry['url'],entry['target'])
+        require(url['request_url']==next_url and url['origin']==expected['origin'] and pin==target,'resource_mismatch')
+        require(entry['phase']=='finished' and entry['method']=='GET' and entry['session_id']==chain[0]['session_id'],'exchange_not_complete_get')
+        if receipt.get('session_id') is not None:require(receipt['session_id']==entry['session_id'],'session_mismatch')
+        cursor=db.execute('SELECT target,scheme,hostname,port,path,status_code,complete,metadata_json FROM pm_http_artifacts '
+            'WHERE id=? AND task_id=?',(entry['artifact_id'],task_id))
+        row=cursor.fetchone();require(row is not None,'artifact_unavailable')
+        artifact=dict(zip([c[0] for c in cursor.description],row))
+        require((artifact['target'],artifact['scheme'],artifact['hostname'],artifact['port'],artifact['path'])==
+            (target,url['scheme'],url['host'],url['port'],url['request_path']),'artifact_resource_mismatch')
+        metadata=json.loads(entry['metadata_json']);stored=json.loads(artifact['metadata_json'])
+        require(isinstance(metadata,dict) and isinstance(stored,dict),'metadata_invalid')
+        require(isinstance(stored.get('request'),dict),'request_metadata_invalid')
+        require(artifact['complete']==1 and all(m.get('transport_complete') is True and
+            m.get('body_truncated') is False and m.get('wire_truncated') is False and
+            m.get('request_write_completed') is True for m in (metadata,stored)),'source_incomplete')
+        require(metadata.get('request_ref')==stored.get('request_ref')==stored.get('request',{}).get('raw_request_ref') and
+            metadata.get('response_ref')==stored.get('response_ref'),'original_reference_mismatch')
+        raw_request=artifacts.load_material(task_id,metadata.get('request_ref'))
+        raw_response=artifacts.load_material(task_id,metadata.get('response_ref'))
+        body,_=artifacts.load(db,task_id,entry['artifact_id'])
+        head,separator,request_body=raw_request.partition(b'\r\n\r\n');require(separator and not request_body,'request_invalid')
+        line,_,fields=head.partition(b'\r\n')
+        require(line==('GET '+url['request_path']+' HTTP/1.1').encode('latin-1'),'request_resource_mismatch')
+        headers=BytesParser().parsebytes(fields+b'\r\n\r\n');require(not headers.defects,'request_headers_invalid')
+        authority=('['+url['host']+']' if ':' in url['host'] else url['host'])+':'+str(url['port'])
+        require(headers.get_all('Host')==[authority],'request_host_mismatch')
+        if item.get('auth'):
+            auth=item['auth'];authorization='Basic '+base64.b64encode((auth['username']+':'+auth['password']).encode()).decode()
+            require(headers.get_all('Authorization')==[authorization],'request_credentials_mismatch')
+        code,_,wire_body=artifacts.split_response(raw_response)
+        require(code==artifact['status_code']==metadata.get('status_code')==stored.get('status_code'),'response_status_mismatch')
+        response_head=raw_response[:len(raw_response)-len(wire_body)]
+        status_lines=list(re.finditer(rb'(?m)^HTTP/\d(?:\.\d)? [0-9]{3}[^\r\n]*\r?\n',response_head))
+        response_headers=BytesParser().parsebytes(response_head[status_lines[-1].end():])
+        require(not response_headers.defects,'response_headers_invalid')
+        transfer=[v.strip().lower() for v in response_headers.get_all('Transfer-Encoding',[])]
+        if transfer:
+            require(transfer==['chunked'],'response_encoding_unsupported')
+            stream=io.BytesIO(wire_body);decoded=bytearray()
+            while True:
+                size_line=stream.readline(8193)
+                size=re.fullmatch(rb'([0-9a-fA-F]+)(?:;[^\r\n]*)?\r\n',size_line)
+                require(size is not None,'chunk_framing_invalid');amount=int(size[1],16)
+                require(len(decoded)+amount<=artifacts.MAX_BODY,'body_limit')
+                if not amount:
+                    while True:
+                        trailer=stream.readline(artifacts.MAX_HEADERS+1)
+                        require(trailer.endswith(b'\r\n'),'chunk_trailer_incomplete')
+                        if trailer==b'\r\n':break
+                    require(not stream.read(1),'response_trailing_data');break
+                block=stream.read(amount);require(len(block)==amount and stream.read(2)==b'\r\n','chunk_incomplete')
+                decoded.extend(block)
+            wire_body=bytes(decoded)
+        else:
+            lengths=response_headers.get_all('Content-Length',[])
+            if lengths:require(len(set(lengths))==1 and lengths[0].isdigit() and int(lengths[0])==len(wire_body),'response_length_mismatch')
+        require(wire_body==body,'response_body_mismatch')
+        next_url=resources.parse(urljoin(url['request_url'],response_headers.get('Location','')))['request_url']
+        if entry['id']!=eid:require(code in (301,302,303,307,308) and bool(response_headers.get('Location')),'redirect_receipt_invalid')
+        result={'exchange_id':entry['id'],'artifact_ref':'http_artifact:'+str(entry['artifact_id']),
+            'status_code':code,'source_complete':True,'session_id':entry['session_id'],'session_version':metadata.get('session_version'),
+            'body_sha256':hashlib.sha256(body).hexdigest(),'request_ref':metadata['request_ref'],'response_ref':metadata['response_ref'],
+            'source_task_id':task_id,'source_target':target,'request_url':url['request_url']}
+    require(receipt.get('artifact_ref')==result['artifact_ref'],'exchange_artifact_mismatch')
+    if receipt.get('status_code') is not None:require(receipt['status_code']==result['status_code'],'receipt_status_mismatch')
+    for key in ('request_ref','response_ref','body_sha256'):
+        if key in receipt:require(receipt[key]==result[key],'receipt_'+key+'_mismatch')
+    return body,result
 
 
 def initialize(db):

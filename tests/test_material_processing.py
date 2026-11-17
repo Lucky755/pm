@@ -41,6 +41,22 @@ class MaterialTests(unittest.TestCase):
     def save(self,data,name='source',source='operator:offline'):
         return files.save(self.db,11,data,name=name,source_ref=source)
 
+    def assert_ocr_text(self,result):
+        outputs=[entry for entry in result['outputs'] if entry.get('metadata',{}).get('kind')=='ocr']
+        self.assertEqual(len(outputs),1)
+        self.assertIn('OCR transcription',outputs[0]['metadata']['interpretation'])
+        self.assertTrue(outputs[0]['complete'])
+        self.assertIn(b'LOCAL OCR MATERIAL',files.load(self.db,11,outputs[0]['reference']))
+
+    def test_ocr_result_selection_keeps_diagnostics_separate(self):
+        # Receipt-order regression only; this fixture is not OCR recognition.
+        diagnostic=files.save(self.db,11,b'Estimating resolution as 450\n',name='tesseract.stderr',
+            source_ref='operator:offline',metadata={'kind':'analyzer_stderr'})
+        text=files.save(self.db,11,b'LOCAL OCR MATERIAL\n',name='ocr.txt',source_ref='operator:offline',
+            metadata={'kind':'ocr','interpretation':'OCR transcription, may contain recognition errors; not byte-exact proof'})
+        self.assert_ocr_text({'outputs':[diagnostic,text]})
+        self.assertEqual(files.load(self.db,11,diagnostic['reference']),b'Estimating resolution as 450\n')
+
     def test_actual_bytes_override_misleading_extension_and_preserve_encoding(self):
         original=self.save('Привет: сохранённый материал'.encode('utf-16'),'fake.pdf')
         result=files.process(self.db,11,original['reference'])
@@ -91,7 +107,7 @@ class MaterialTests(unittest.TestCase):
         languages=subprocess.run([binary,'--list-langs'],capture_output=True,text=True,check=True).stdout.splitlines() if binary else []
         if 'eng' in languages:
             self.assertEqual(result['status'],'completed')
-            self.assertIn(b'LOCAL OCR MATERIAL',files.load(self.db,11,result['outputs'][0]['reference']))
+            self.assert_ocr_text(result)
         else:
             self.assertEqual(result['status'],'tool_missing');self.assertFalse(result['complete'])
             self.assertEqual(result['required_tool']['name'],'tesseract-ocr' if binary is None else 'tesseract-ocr-eng')

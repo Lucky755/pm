@@ -24,6 +24,13 @@ class SeriesRuntimeTests(unittest.TestCase):
             elif request.path=='/auth-refused':
                 owner.http.requests.append({'path':request.path})
                 request.respond(401,b'Authentication required')
+            elif request.path=='/auth-copy':
+                owner.http.requests.append({'path':request.path})
+                request.respond(200,b'SERVER AUTHENTICATED')
+            elif request.path=='/auth-incomplete':
+                owner.http.requests.append({'path':request.path})
+                request.send_response(200);request.send_header('Content-Length','1000');request.end_headers()
+                request.wfile.write(b'SERVER AUTHENTICATED');request.wfile.flush();request.close_connection=True
             elif request.path=='/slow-chain':
                 import time
                 owner.http.requests.append({'path':request.path})
@@ -131,6 +138,140 @@ class SeriesRuntimeTests(unittest.TestCase):
         result=self.http.call('/auth-refused',auth={'type':'basic','username':'alice','password':'sixth'})
         self.assertEqual(result['status'],'replan_required');self.assertFalse(result['execution_started'])
         self.assertEqual(len(self.http.requests),5)
+
+    def test_direct_success_is_audited_locally_before_the_next_pair(self):
+        response=self.http.call('/auth-check',session='found-login',auth={'type':'basic','username':'alice','password':'secret3'})
+        self.assertEqual(response['status_code'],200)
+        with self.http.case.connect() as db:
+            original=db.execute('SELECT COUNT(*) FROM pm_internal_checks').fetchone()[0]
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertTrue(result['criterion_matched']);self.assertEqual(len(self.http.requests),1)
+        self.assertEqual(result['checks_started'],0);self.assertEqual(result['requests_sent'],0)
+        self.assertEqual(result['checks'][0]['exchange_id'],response['exchange_id'])
+        self.assertEqual(result['checks'][0]['session_id'],'found-login')
+        self.assertFalse(result['goal_confirmed'])
+        with self.http.case.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_internal_checks').fetchone()[0],original)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_access_state').fetchone()[0],0)
+        again=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertTrue(again['cached']);self.assertTrue(again['criterion_matched'])
+        self.assertEqual(again['checks_started'],0);self.assertEqual(len(self.http.requests),1)
+
+    def test_legacy_direct_success_requires_verified_saved_receipt(self):
+        response=self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'secret3'})
+        # Re-open a real database containing the historical minimal receipt.
+        with self.http.case.connect() as db:
+            value={'phase':'finished','outcome':'interpretation_required','exchange_id':response['exchange_id'],
+                'artifact_ref':response['artifact_ref'],'status_code':response['status_code']}
+            db.execute('UPDATE pm_internal_checks SET result_json=?',(json.dumps(value),))
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertTrue(result['criterion_matched']);self.assertEqual(len(self.http.requests),1)
+        self.assertTrue(result['checks'][0]['source_complete'])
+
+    def test_prior_negative_response_does_not_become_authenticated(self):
+        self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'bad'})
+        result=self.call(self.pairs(['bad']))
+        self.assertFalse(result['criterion_matched']);self.assertEqual(len(self.http.requests),1)
+
+    def test_negative_saved_response_allows_only_the_next_unchecked_pair(self):
+        self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'bad'})
+        result=self.call(self.pairs(['bad','secret3','wrong-next']))
+        self.assertTrue(result['criterion_matched']);self.assertEqual(len(self.http.requests),2)
+        self.assertFalse(result['checks'][0]['criterion_matched']);self.assertTrue(result['checks'][0]['reused'])
+        self.assertEqual(result['checks_started'],1)
+
+    def test_corrupted_prior_artifact_stops_without_falling_through_to_next_pair(self):
+        from orchestrator import http_artifacts
+        response=self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'secret3'})
+        with self.http.case.connect() as db:
+            sha=db.execute('SELECT sha256 FROM pm_http_artifacts WHERE id=?',(response['artifact_id'],)).fetchone()[0]
+        (http_artifacts.ROOT/'task-11'/(sha+'.body')).write_bytes(b'damaged')
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertFalse(result['criterion_matched']);self.assertEqual(len(self.http.requests),1)
+        self.assertEqual(result['status'],'blocked');self.assertIn('audit_error',result['checks'][0])
+
+    def test_foreign_prior_artifact_is_rejected_before_next_pair(self):
+        response=self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'secret3'})
+        with self.http.case.connect() as db:db.execute('UPDATE pm_http_artifacts SET task_id=12 WHERE id=?',(response['artifact_id'],))
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertFalse(result['criterion_matched']);self.assertEqual(len(self.http.requests),1)
+
+    def test_incomplete_prior_artifact_is_not_promoted_by_finished_check_row(self):
+        response=self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'secret3'})
+        with self.http.case.connect() as db:db.execute('UPDATE pm_http_artifacts SET complete=0 WHERE id=?',(response['artifact_id'],))
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertFalse(result['criterion_matched']);self.assertEqual(len(self.http.requests),1)
+
+    def test_unknown_direct_outcome_does_not_replay_on_reopen(self):
+        response=self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'secret3'})
+        with self.http.case.connect() as db:
+            db.execute("UPDATE pm_http_exchanges SET phase='unknown' WHERE id=?",(response['exchange_id'],))
+            db.execute("UPDATE pm_internal_checks SET phase='unknown',outcome='unknown'")
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertEqual(result['status'],'outcome_unknown');self.assertFalse(result['criterion_matched'])
+        self.assertEqual(len(self.http.requests),1)
+
+    def test_lost_request_original_is_not_replaced_with_a_complete_default(self):
+        from orchestrator import http_artifacts
+        response=self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'secret3'})
+        with self.http.case.connect() as db:
+            metadata=json.loads(db.execute('SELECT metadata_json FROM pm_http_exchanges WHERE id=?',(response['exchange_id'],)).fetchone()[0])
+            legacy={'phase':'finished','outcome':'interpretation_required','exchange_id':response['exchange_id'],
+                'artifact_ref':response['artifact_ref'],'status_code':200}
+            db.execute('UPDATE pm_internal_checks SET result_json=?',(json.dumps(legacy),))
+        (http_artifacts.ROOT/'task-11'/(metadata['request_ref']['sha256']+'.http')).unlink()
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertEqual(result['status'],'blocked');self.assertFalse(result['criterion_matched'])
+        self.assertEqual(len(self.http.requests),1)
+
+    def test_receipt_artifact_mismatch_is_rejected_even_for_identical_bodies(self):
+        self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'secret3'})
+        other=self.http.call('/auth-copy')
+        with self.http.case.connect() as db:
+            receipt=json.loads(db.execute('SELECT result_json FROM pm_internal_checks').fetchone()[0])
+            receipt['artifact_ref']=other['artifact_ref']
+            db.execute('UPDATE pm_internal_checks SET result_json=?',(json.dumps(receipt),))
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertEqual(result['status'],'blocked');self.assertFalse(result['criterion_matched'])
+        self.assertEqual(len(self.http.requests),2)
+        self.assertEqual(result['checks'][0]['audit_error'],'saved_http_exchange_artifact_mismatch')
+
+    def test_wrong_request_resource_is_not_reused_for_the_requested_endpoint(self):
+        self.http.call('/auth-check',query={'source':'different'},auth={'type':'basic','username':'alice','password':'secret3'})
+        result=self.call(self.pairs(['secret3','wrong-next']))
+        self.assertEqual(result['status'],'blocked');self.assertEqual(len(self.http.requests),1)
+        self.assertEqual(result['checks'][0]['audit_error'],'saved_http_resource_mismatch')
+
+    def test_chunked_saved_response_is_decoded_locally_without_an_extra_request(self):
+        self.http.call('/chunked',auth={'type':'basic','username':'alice','password':'secret3'})
+        plan=self.pairs(['secret3','wrong-next']);plan['url']=self.http.url+'/chunked';plan['criterion']['body_contains']='abcde'
+        result=self.call(plan)
+        self.assertTrue(result['criterion_matched']);self.assertEqual(len(self.http.requests),1)
+
+    def test_cached_success_reaudits_saved_original_after_reopening(self):
+        from orchestrator import http_artifacts
+        response=self.http.call('/auth-check',auth={'type':'basic','username':'alice','password':'secret3'})
+        plan=self.pairs(['secret3','wrong-next']);self.assertTrue(self.call(plan)['criterion_matched'])
+        with self.http.case.connect() as db:sha=db.execute('SELECT sha256 FROM pm_http_artifacts WHERE id=?',(response['artifact_id'],)).fetchone()[0]
+        (http_artifacts.ROOT/'task-11'/(sha+'.body')).write_bytes(b'damaged after audit')
+        result=self.call(plan)
+        self.assertEqual(result['status'],'blocked');self.assertFalse(result['criterion_matched'])
+        self.assertEqual(len(self.http.requests),1)
+
+    def test_real_incomplete_response_remains_unknown_without_retry(self):
+        response=self.http.call('/auth-incomplete',auth={'type':'basic','username':'alice','password':'secret3'})
+        self.assertFalse(response['transport_complete'])
+        plan=self.pairs(['secret3','wrong-next']);plan['url']=self.http.url+'/auth-incomplete'
+        first=self.call(plan);second=self.call(plan)
+        for result in (first,second):
+            self.assertEqual(result['status'],'outcome_unknown');self.assertFalse(result.get('criterion_matched',False))
+        self.assertEqual(len(self.http.requests),1)
+
+    def test_saved_large_headers_do_not_introduce_a_smaller_audit_limit(self):
+        self.http.call('/large-header',auth={'type':'basic','username':'alice','password':'secret3'})
+        plan=self.pairs(['secret3','wrong-next']);plan['url']=self.http.url+'/large-header';plan['criterion']['body_contains']='header accepted'
+        result=self.call(plan)
+        self.assertTrue(result['criterion_matched']);self.assertEqual(len(self.http.requests),1)
 
     def test_new_saved_coordinator_plan_can_change_checks_but_cannot_replay_old_pairs(self):
         from orchestrator import coordinated_attack as coordinator

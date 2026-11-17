@@ -150,3 +150,53 @@ read-only backup в `/tmp/pm-network-research-db-incident.sqlite3` (0600);
 запрещающий доступ к checkout/storage до SQLite/open. Нарушение делает набор
 неуспешным даже при перехваченном исключении. Тест защиты использует собственный
 временный «рабочий» каталог; проверки не удалялись и не заменялись skip.
+
+
+### Долговременное сохранение инцидента, 17 ноября 2026
+
+При проверке HEAD `40789e63f16787506d01c530a03f83ffa6311b57` сохранены:
+
+- исходный `/tmp/pm-network-research-db-incident.sqlite3` побайтно, без удаления;
+- отдельная согласованная копия текущего `storage/tasks.db` через SQLite backup
+  API, исходное соединение `mode=ro`, `PRAGMA query_only=ON`;
+- семь обнаруженных старых SQLite-источников, также через read-only backup API,
+  и приватные результаты проверки/манифест хэшей.
+
+Каталог вне текущего checkout и Git:
+`/home/lucky/pm-archive-20261103/backups/pm-stage12-incident-20261117T044121Z/`.
+Каталог 0700, файлы 0600. Основные файлы: `stage12-after-incident.sqlite3` и
+`current-readonly-backup.sqlite3`. Их SHA-256 совпадает:
+`1edb79065b018799a1cec803f6f903d512f10e5a04b7c14d4d0ddb20e4bab327`.
+На обеих копиях integrity_check=ok, foreign_key_check пуст. Рабочая БД для
+проверок целостности, миграций или восстановления не открывалась на запись.
+
+Состояние задачи №1 на копии:
+
+- coordinator run #1 — running; сохранённый stop_reason остаётся
+  decision_budget_exhausted:invalid_decision, pause_step_id=NULL;
+- шаги #1–4 completed, #5 failed/invalid_decision, outcome_uncertain=0;
+- flag proposal #1 pending, flag_confirmation question #1 pending, ответа нет;
+- реестр содержит candidate, evidence_count=0, operator_confirmed=0; прежние
+  списки legacy flags/goals в policy пусты. Это не принятый оператором флаг;
+- память: v1/source_sync/coordinator_resume_reconcile от
+  2026-11-16T15:08:28.559907+00:00;
+- policy expected_flags=2; операторская цель goal — open/goal-exclusive,
+  expected_flags=1. Несогласованность сохранена, не исправлена догадкой.
+
+Старые копии найдены в архивных backups и storage/backups. На всех семи
+integrity_check=ok. Шесть содержат прежнюю задачу №1, созданную 31 октября
+для 192.0.2.10, без таблиц координатора и flag policy; седьмая pentest.db не
+содержит задачи №1. Это не достоверный снимок текущей задачи от 5 ноября.
+Поиск по именам проведён в checkout/архиве и доступной части home; одно
+постороннее vskb/ligolo-selfcerts недоступно. Это не полный forensic-поиск диска.
+**Восстановление не выполнено:** достоверного состояния непосредственно перед
+инцидентом не найдено. Нужны отдельный проверяемый baseline и план восстановления;
+running/pending/expected_flags и история не переписаны. SQLite и приватные
+диагностические выгрузки в Git не добавляются.
+
+
+После полного тестирования получена ещё одна read-only backup API-копия
+`after-verification-readonly-backup.sqlite3`: её SHA-256 совпал с обеими основными
+копиями. На ней integrity_check=ok, foreign_key_check пуст. Это подтверждает
+неизменность содержимого рабочей БД за время данного исправления; выводы о
+состоянии **до** первоначального инцидента из этого не следуют.
