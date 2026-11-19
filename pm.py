@@ -2797,30 +2797,51 @@ def offer_archive_restore(archive, new_id):
 
 
 def op_status(args):
-    with connect() as db:
-        from orchestrator import master_scheduler as scheduler
-        from orchestrator import network_jobs as jobs
-        jobs.initialize(db)
-        data = scheduler.compact_status(db, args.task_id)
-        data['stop_reason'] = None
-        render_results(db, data, json_output=args.json, verbose=args.verbose)
-        approval = db.execute('SELECT allowed,egress,closed_at FROM pm_operator_approvals WHERE task_id=?',
-                              (args.task_id,)).fetchone()
-        if approval and not args.json:
-            line(f'  Scope: {approval[0]} через {approval[1]}' +
-                 (' (закрыт)' if approval[2] else ''))
-        linkage = db.execute('''SELECT previous_task_id,previous_target FROM pm_task_lineage
-                                WHERE successor_task_id=?''', (args.task_id,)).fetchone()
-        if linkage and not args.json:
-            line(f'  Предыдущая стадия: задача #{linkage[0]}, IP {linkage[1]} (история сохранена)')
-        next_stage = db.execute('SELECT successor_task_id,successor_target FROM pm_task_lineage WHERE previous_task_id=?',
-                                (args.task_id,)).fetchone()
-        if next_stage and not args.json:
-            line(f'  Продолжение: задача #{next_stage[0]}, IP {next_stage[1]}')
-        aliases = db.execute('SELECT hostnames_json FROM pm_task_hostnames WHERE task_id=?',
-                             (args.task_id,)).fetchone()
-        if aliases and not args.json:
-            line('  Имена хоста: ' + ', '.join(json.loads(aliases[0])))
+    from orchestrator import task_view
+    database = args.storage / 'tasks.db' if getattr(args, 'storage', None) is not None else DB
+    data = task_view.load_task(database, args.task_id, for_cli=True)
+    if data is None:
+        raise OperatorError(f'Задача #{args.task_id} не найдена')
+    if args.json:
+        line(json.dumps({'task_id': args.task_id, **data}, ensure_ascii=False, indent=2))
+        return
+    heading(f'Задача #{args.task_id} · {safe_display(data.get("target", ""))}')
+    outcome = data['outcome']['data']
+    line('  ' + (outcome['label'] if outcome else 'Ошибка чтения итога цели.'))
+    coordinator = data['coordinator']['data'] or {}
+    line('  Статус задачи: ' + safe_display(data.get('status', 'неизвестен')))
+    if coordinator:
+        line('  Координатор: ' + safe_display(coordinator.get('status', 'неизвестно')))
+    closure = {'open': 'не закрыта', 'closed': 'закрыта', 'unknown': 'неизвестно'}
+    line('  Закрытие: ' + closure[data['closure']])
+    run = (data['last_run']['data'] or {}).get('latest')
+    if run:
+        line(f'  Вызов PM: {safe_display(run["status"] or "исход не записан")} · {run["id"]}')
+    snapshot = data['snapshot']['data']
+    if snapshot:
+        line(f'  Сохранённый снимок: находок {snapshot["network_observations"]}, Burp {snapshot["burp_observations"]}')
+    approval = data['approval']['data'] or {}
+    if approval:
+        line(f'  Scope: {safe_display(approval.get("allowed"))} через {safe_display(approval.get("egress"))}')
+    previous, successor = data['previous_task'], data['successor_task']
+    if previous:
+        line(f'  Предыдущая стадия: задача #{previous["previous_task_id"]}, IP {safe_display(previous["previous_target"])}')
+    if successor:
+        line(f'  Продолжение: задача #{successor["successor_task_id"]}, IP {safe_display(successor["successor_target"])}')
+    if data['aliases']:
+        line('  Имена хоста: ' + ', '.join(safe_display(alias) for alias in data['aliases']))
+    for source in data['reports'].values():
+        for report in source['data'] or []:
+            summary = safe_display(report.get('read_error') or report.get('summary') or '')
+            limit = 650 if args.verbose else 200
+            line(f'  {report["reference"]}: {summary[:limit]}' + ('…' if len(summary) > limit else ''))
+
+
+def op_web(args):
+    from orchestrator.operator_web import serve
+    database = args.storage / 'tasks.db' if args.storage is not None else DB
+    library_root = args.storage / 'method_library' if args.storage is not None else None
+    serve(database, port=args.port, library_root=library_root)
 
 
 def op_methods(args):
@@ -3110,30 +3131,17 @@ def attack_task(args):
 
 def flags_confirmed_by_evidence(db, task_id):
     """Two automatically confirmed flag values with captured evidence."""
-    name = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pm_verified_flags'").fetchone()
-    if not name:
-        return False
-    columns = {row[1] for row in db.execute('PRAGMA table_info(pm_verified_flags)')}
-    if not {'value', 'status', 'evidence_count'}.issubset(columns):
-        raise OperatorError('Схема реестра флагов несовместима: нужны value/status/evidence_count')
-    rows = db.execute(
-        "SELECT value, status, evidence_count FROM pm_verified_flags WHERE task_id=?",
-        (task_id,),
-    ).fetchall()
-    return sum(1 for value, status, count in rows
-               if value and status == 'confirmed' and int(count or 0) >= 2) >= 2
+    from orchestrator.task_outcome import legacy_evidence_count
+    return (legacy_evidence_count(db, task_id) or 0) >= 2
 
 
 def offer_cleanup_if_verified(db, task_id, result):
-    from orchestrator import flag_review
-    if flag_review.policy(db,task_id) is not None and flag_review.completion(db,task_id) is None:
-        line('  Подтверждение на CTF-платформе ещё не завершено; изоляция сохранена.')
+    from orchestrator import task_outcome
+    outcome = task_outcome.saved(db, task_id)
+    line('  ' + outcome['label'])
+    if not outcome['reached']:
         return
-    if not flags_confirmed_by_evidence(db, task_id):
-        line('  Статус цели: флаги не подтверждены; изоляция сохранена.')
-        return
-    heading('Цель выполнена — завершение задачи')
-    line('  Оба флага подтверждены записями инструмента в SQLite.')
+    heading('Очистка изолированной среды')
     response = input('Удалить изолированную сеть и правила NetGuard? yes/no: ').strip().lower()
     if response != 'yes':
         line('  Правила сохранены, задачу можно продолжить.')
@@ -3356,6 +3364,9 @@ def op_http_reparse(args):
 def parser_main():
     parser = argparse.ArgumentParser(description='Pentest Master — удобная операторская консоль')
     sub = parser.add_subparsers(dest='command', required=False)
+    web = sub.add_parser('web', help='Открыть локальный просмотр сохранённых задач')
+    web.add_argument('--port', type=int, default=8765, metavar='0..65535')
+    web.add_argument('--storage', type=Path, help='Каталог сохранённых данных или резервной копии')
     policy = sub.add_parser('http-policy',help='Предел HTTP-ответа конкретной задачи')
     policy.add_argument('task_id',type=int)
     policy.add_argument('--response-limit-mib',type=int,choices=(2,8))
@@ -3435,6 +3446,7 @@ def parser_main():
     browser.add_argument('--burp-ca')
     status = sub.add_parser('status', help='Показать краткий отчёт')
     status.add_argument('task_id', type=int)
+    status.add_argument('--storage', type=Path, help='Каталог сохранённых данных или резервной копии')
     close = sub.add_parser('close', help='Удалить NetGuard правила и namespace')
     close.add_argument('task_id', type=int)
     change = sub.add_parser('change-ip', help='Перенести расследование на новый IP с сохранением истории')
@@ -3676,7 +3688,7 @@ def interactive():
                 interactive_operation(op_resume,args)
             elif choice == '3':
                 args.task_id = int(input('Номер задачи: ').strip())
-                interactive_operation(op_status,args)
+                op_status(args)
             elif choice == '4':
                 args.task_id = int(input('Номер задачи: ').strip())
                 interactive_operation(op_close,args)
@@ -3756,6 +3768,8 @@ def main():
         ensure_process_env()
 
     parser, args = parser_main()
+    if args.command == 'web' and not 0 <= args.port <= 65535:
+        parser.error('Укажите --port от 0 до 65535')
     if args.command is None:
         try:
             interactive()
@@ -3770,6 +3784,7 @@ def main():
         elif args.command == 'intent': op_intent(args)
         elif args.command == 'resume': op_resume(args)
         elif args.command == 'status': op_status(args)
+        elif args.command == 'web': op_web(args)
         elif args.command == 'questions': op_questions(args)
         elif args.command == 'specialists': op_specialists(args)
         elif args.command == 'methods': op_methods(args)

@@ -188,8 +188,9 @@ class Library:
     def read(self):
         file=self.root/'catalog.json'
         if self.root.is_symlink() or file.is_symlink():raise ValueError('method_library_unsafe_file')
-        if not file.exists():return {'schema':SCHEMA,'methods':{},'retained':[]}
-        if self.root.is_symlink() or file.is_symlink() or file.stat().st_size>MAX_CATALOG:raise ValueError('method_library_unsafe_or_oversized')
+        try:info=file.stat()
+        except FileNotFoundError:return {'schema':SCHEMA,'methods':{},'retained':[]}
+        if not stat.S_ISREG(info.st_mode) or info.st_size>MAX_CATALOG:raise ValueError('method_library_unsafe_or_oversized')
         data=json.loads(file.read_text())
         if not isinstance(data,dict) or set(data)!={'schema','methods','retained'} or data['schema']!=SCHEMA:
             raise ValueError('method_library_schema')

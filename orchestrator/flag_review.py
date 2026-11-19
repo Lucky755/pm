@@ -323,13 +323,22 @@ def useful_work(db,task_id,expect):
     return state['accepted_count']+len(waiting)<max(expect,state['expected_flags'] or 0)
 
 
-def completion(db,task_id,expect=None):
+def outcome(db,task_id,expect=None):
+    """Read the manual flag policy and the verdict from the same progress."""
     state=progress(db,task_id)
     if state is None:return None
     goals=_goals(db,task_id)
     required=max(expect or 0,state['expected_flags'] or 0,next((g.get('expected_flags') or 0 for g in goals if g['key']=='goal'),0)) or 2
-    if state['accepted_count']<required or any(g['key'] not in state['reviewed_goal_keys'] for g in goals):return None
-    return ('goal_confirmed' if len(goals)==1 and goals[0].get('exclusive') else 'objectives_done') if goals else 'flag_confirmed'
+    remaining=[g['key'] for g in goals if g['key'] not in state['reviewed_goal_keys']]
+    reason=None
+    if state['accepted_count']>=required and not remaining:
+        reason=('goal_confirmed' if len(goals)==1 and goals[0].get('exclusive') else 'objectives_done') if goals else 'flag_confirmed'
+    return {'accepted':state['accepted_count'],'expected':required,'remaining_goals':remaining,'reason':reason}
+
+
+def completion(db,task_id,expect=None):
+    state=outcome(db,task_id,expect)
+    return state['reason'] if state else None
 
 
 def completed_result(db,task_id,expect=None):

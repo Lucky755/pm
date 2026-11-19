@@ -66,8 +66,28 @@ class ConsoleV2Tests(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             pm.offer_cleanup_if_verified(db, 10, {})
-        self.assertIn('не подтверждены', out.getvalue())
+        self.assertIn('Итог цели неизвестен', out.getvalue())
         db.close()
+
+    def test_one_operator_flag_reaches_goal_and_cleanup_stays_optional(self):
+        from orchestrator import flag_review, objectives, operator_questions
+        with sqlite3.connect(':memory:') as db:
+            self.addCleanup(db.close)
+            db.execute('CREATE TABLE tasks (id INTEGER PRIMARY KEY,target TEXT)')
+            db.execute("INSERT INTO tasks VALUES (10,'192.0.2.10')")
+            objectives.save_objectives(db, 10, 'Флаг задания', expected_flags=1)
+            flag_review.activate(db, 10, 1)
+            proposal = flag_review.propose(db, 10, 'test-flag', objective_key='goal')
+            question = flag_review.enqueue(db, proposal['id'])
+            operator_questions.answer(db, 10, question['id'], 'approve')
+            self.assertFalse(pm.flags_confirmed_by_evidence(db, 10))
+            out = io.StringIO()
+            with patch('builtins.input', return_value='no') as ask, patch.object(pm, 'op_close') as close:
+                with redirect_stdout(out):
+                    pm.offer_cleanup_if_verified(db, 10, {})
+                ask.assert_called_once()
+                close.assert_not_called()
+            self.assertIn('Цель достигнута · 1 из 1', out.getvalue())
 
     def test_only_confirmed_user_root_evidence_enables_cleanup(self):
         from orchestrator import flag_verify

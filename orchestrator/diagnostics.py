@@ -406,8 +406,10 @@ def entrypoint(function):
         name = Path(function.__code__.co_filename).stem
         task_id = None
         argv = sys.argv[1:]
-        if name=='pm' and not argv:
-            # The menu owns one run per selected operation, not per open UI.
+        command = next((arg for arg in argv if arg != '--diagnostic'), None)
+        if name == 'pm' and command in (None, 'web', 'status'):
+            # The menu owns one run per selected operation. Saved-data views
+            # must not become the latest execution in the task journal.
             return function(*args,**kwargs)
         if '--task-id' in argv:
             index = argv.index('--task-id') + 1

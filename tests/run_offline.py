@@ -28,6 +28,7 @@ RUNTIME = RUNTIME | {'test_specialist_workflow_runtime'}
 RUNTIME = RUNTIME | {'test_method_library_runtime'}
 RUNTIME = RUNTIME | {'test_operator_console_runtime'}
 RUNTIME = RUNTIME | {'test_final_audit_runtime'}
+RUNTIME = RUNTIME | {'test_operator_web_runtime'}
 MANUAL = frozenset(('test_agent_tool_selection', 'test_agent_v3_selection', 'test_approval_mcp', 'test_harness_mcp', 'test_local_tool_mcp', 'test_mcp_connection', 'test_network_mcp', 'test_pi_provider', 'test_shell_disabled', 'test_tool_v3_mcp'))
 
 
