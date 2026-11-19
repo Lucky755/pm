@@ -2820,6 +2820,21 @@ def op_status(args):
     snapshot = data['snapshot']['data']
     if snapshot:
         line(f'  Сохранённый снимок: находок {snapshot["network_observations"]}, Burp {snapshot["burp_observations"]}')
+    for observation in data['findings']['tcp']:
+        service = observation['service'] or 'сервис не определён'
+        line(f'  {tint("[OPEN]", "success")} TCP/{observation["port"]}: {safe_display(service)}')
+    for observation in data['findings'].get('http_headers', []):
+        status_line = observation.get('status_line') or observation.get('status_code')
+        value = ' · '.join(str(value) for value in (status_line, observation.get('path'), observation.get('title')) if value)
+        line(f'  {tint("[HTTP]", "brand")} {safe_display(value)}')
+    for observation in data['findings'].get('web', []):
+        host = observation.get('hostname') or ''
+        if host and observation.get('port'):
+            host += f':{observation["port"]}'
+        location = host + str(observation.get('path') or '')
+        value = ' · '.join(str(value) for value in (
+            observation.get('status_code'), location, observation.get('title')) if value)
+        line(f'  {tint("[WEB]", "brand")} {safe_display(value)}')
     approval = data['approval']['data'] or {}
     if approval:
         line(f'  Scope: {safe_display(approval.get("allowed"))} через {safe_display(approval.get("egress"))}')
@@ -2886,14 +2901,53 @@ def op_specialists(args):
     return result
 
 
+def question_actions(args):
+    return {name for name in ('answer', 'reconsider', 'apply_tool', 'apply_pivot')
+            if getattr(args, name, None) is not None}
+
+
+def render_questions(rows, args):
+    if getattr(args, 'json', False):
+        line(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    from orchestrator.operator_console import question_lines
+    for item in rows:
+        for text in question_lines(item):
+            line('  ' + text)
+        render_tool_request(item)
+        render_pivot_request(item)
+        line('    Ссылки: ' + ', '.join(safe_display(ref) for ref in item['references']))
+    if not rows:
+        line('  Ожидающих или сохранённых вопросов нет.')
+    line('  Scope и бюджеты прежние. Одобрение tool разрешает только показанную установку. Продолжение — resume.')
+
+
 def op_questions(args):
-    from orchestrator import coordinated_attack, operator_questions, agent_actions, flag_review, tool_requests,pivoting
-    if getattr(args,'answer',None) is not None and getattr(args,'reconsider',None) is not None:
+    from orchestrator import operator_questions
+    actions = question_actions(args)
+    if {'answer', 'reconsider'} <= actions:
         raise OperatorError('Выберите ответ на вопрос либо пересмотр кандидата')
-    if sum(getattr(args,field,None) is not None for field in ('answer','reconsider','apply_tool','apply_pivot'))>1:
+    if len(actions) > 1:
         raise OperatorError('Выберите одно действие: ответ, пересмотр, --apply-tool или --apply-pivot')
-    if getattr(args,'decision',None) and getattr(args,'answer',None) is None:
+    if getattr(args,'decision',None) and 'answer' not in actions:
         raise OperatorError('--decision используется вместе с --answer')
+    if 'answer' in actions and not getattr(args, 'decision', None):
+        raise OperatorError('Для ответа нужен --decision')
+    if not actions:
+        from orchestrator import task_view, task_memory, task_outcome
+        with task_view.read_database(DB) as db:
+            if (not task_memory.exists(db, 'tasks') or
+                    not db.execute('SELECT 1 FROM tasks WHERE id=?', (args.task_id,)).fetchone()):
+                raise OperatorError(f'Задача #{args.task_id} не найдена')
+            rows = operator_questions.listing(db, args.task_id)
+            outcome = (task_view.section(lambda: task_outcome.saved(db, args.task_id))['data']
+                       if not getattr(args, 'json', False) else None)
+        render_questions(rows, args)
+        if outcome and outcome['reached']:
+            line('  ' + outcome['label'])
+        return rows
+
+    from orchestrator import coordinated_attack, agent_actions, flag_review, tool_requests, pivoting
     with connect() as db:
         task_target(db,args.task_id)
         log=flag_review.local_log(db,args.task_id,agent_actions.CAPABILITY_LOG/f'task_{args.task_id}.jsonl')
@@ -2903,7 +2957,6 @@ def op_questions(args):
             if getattr(args,'note_file',None):text=Path(args.note_file).read_text(encoding='utf-8')
             flag_review.reconsider(db,args.task_id,args.reconsider,text)
         if getattr(args,'answer',None) is not None:
-            if not getattr(args,'decision',None):raise OperatorError('Для ответа нужен --decision')
             text=getattr(args,'answer_text','')
             if getattr(args,'note_file',None):text=Path(args.note_file).read_text(encoding='utf-8')
             answered=operator_questions.answer(db,args.task_id,args.answer,args.decision,text,
@@ -2918,16 +2971,7 @@ def op_questions(args):
         if getattr(args,'apply_pivot',None) is not None:
             with coordinated_attack.task_lock(args.task_id):pivoting.apply(db,args.task_id,args.apply_pivot,authorize=True)
         rows=operator_questions.listing(db,args.task_id)
-        if getattr(args,'json',False):line(json.dumps(rows,ensure_ascii=False,indent=2))
-        else:
-            from orchestrator.operator_console import question_lines
-            for item in rows:
-                for text in question_lines(item):line('  '+text)
-                render_tool_request(item)
-                render_pivot_request(item)
-                line('    Ссылки: '+', '.join(safe_display(ref) for ref in item['references']))
-            if not rows:line('  Ожидающих или сохранённых вопросов нет.')
-            line('  Scope и бюджеты прежние. Одобрение tool разрешает только показанную установку. Продолжение — resume.')
+        render_questions(rows, args)
         solved=flag_review.completed_result(db,args.task_id)
         if solved and not getattr(args,'json',False):render_coordinator_result(solved,args)
         return rows
@@ -3707,7 +3751,7 @@ def interactive():
             elif choice == '9':
                 args.task_id=int(input('Номер задачи: ').strip())
                 args.answer=None
-                queued=interactive_operation(op_questions,args)
+                queued=op_questions(args)
                 raw=input('ID вопроса для ответа (Enter — вернуться): ').strip()
                 if raw:
                     args.answer=int(raw)
@@ -3785,7 +3829,13 @@ def main():
         elif args.command == 'resume': op_resume(args)
         elif args.command == 'status': op_status(args)
         elif args.command == 'web': op_web(args)
-        elif args.command == 'questions': op_questions(args)
+        elif args.command == 'questions':
+            if question_actions(args):
+                mode = 'debug' if args.diagnostic or diagnostics.detailed() else 'human'
+                with diagnostics.presentation(mode):
+                    interactive_operation(op_questions, args)
+            else:
+                op_questions(args)
         elif args.command == 'specialists': op_specialists(args)
         elif args.command == 'methods': op_methods(args)
         elif args.command == 'callback-config':op_callback_config(args)

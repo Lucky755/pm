@@ -295,7 +295,7 @@ class ToolAcquisitionTests(unittest.TestCase):
         reply=self.request()
         def args(*argv):
             with patch.object(sys,'argv',['pm',*argv]):return pm.parser_main()[1]
-        with patch.object(pm,'connect',self.case.connect):
+        with patch.object(pm,'connect',self.case.connect), patch.object(pm,'DB',self.case.database):
             pm.op_questions(args('questions','11','--answer',str(reply['question_id']),'--decision','approve'))
             calls=len(self.calls)
             pm.op_questions(args('questions','11'))

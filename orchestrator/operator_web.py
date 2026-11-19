@@ -9,7 +9,7 @@ import sqlite3
 from urllib.parse import unquote, urlsplit
 
 from operator_errors import OperatorError
-from orchestrator import task_view
+from orchestrator import diagnostics, task_view
 from orchestrator.method_library import Library
 
 
@@ -35,7 +35,13 @@ STATE_LABELS = {
 
 
 def text(value):
-    return escape(str(value)) if value is not None and value != '' else 'нет данных'
+    if value is None or value == '':
+        return 'нет данных'
+    return escape(diagnostics.clean(value, limit=None, preserve_lines=True))
+
+
+def multiline(value):
+    return text(value).replace('\n', '<br>')
 
 
 def status(value):
@@ -73,7 +79,7 @@ def details(row, labels):
             value = row[key]
             if isinstance(value, (list, dict)):
                 value = json.dumps(value, ensure_ascii=False)
-            entries.append(f'<dt>{text(label)}</dt><dd>{text(value)}</dd>')
+            entries.append(f'<dt>{text(label)}</dt><dd>{multiline(value)}</dd>')
     return '<dl>' + ''.join(entries) + '</dl>' if entries else '<p>Нет сохранённых сведений.</p>'
 
 
@@ -92,6 +98,7 @@ def run_view(data):
                                      'started_at': 'Время записи', 'reason': 'Причина остановки'}))
     if data['damaged']:
         result += '<p>Некоторые строки журнала не удалось прочитать.</p>'
+        result += list_html(f'Run ID · {text(run_id)}' for run_id in data['damaged_runs'])
     return result
 
 
@@ -146,7 +153,7 @@ def task_page(data):
             value, {'mode': 'Режим', 'recon_status': 'Разведка', 'pause_reason': 'Причина паузы'}))
     body += '<p><a href="#questions">Ожидающие вопросы</a></p>'
     body += '<div id="questions">' + block('Ожидающие вопросы', data['questions'], lambda rows: list_html(
-        f'#{text(q["id"])} · {text(q["kind"])} · {text(q["question"])}'
+        f'#{text(q["id"])} · {text(q["kind"])} · {multiline(q["question"])}'
         + details(q, {'reason': 'Причина', 'branch_id': 'Ветка', 'boundaries': 'Границы'}) for q in rows),
         empty='Ожидающих вопросов нет.') + '</div>'
     body += block('Роли и шаги', data['steps'], lambda rows: list_html(step_view(step) for step in rows))

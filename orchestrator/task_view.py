@@ -148,34 +148,42 @@ def saved_report(db, task_id, reference):
 def last_run(directory, task_id):
     """Use diagnostic run records. A start without an end stays unresolved."""
     latest = None
-    damaged = False
+    damaged_runs = []
     for path in directory.iterdir():
         if path.suffix != '.jsonl' or not re.fullmatch(r'[a-f0-9]{32}', path.stem) or path.is_symlink():
             continue
         linked = False
+        damaged = False
         start = end = summary = None
-        with path.open(encoding='utf-8') as stream:
-            for line in stream:
-                try:
-                    event = json.loads(line)
-                    if not isinstance(event, dict):
-                        raise ValueError('event JSON must be an object')
-                except ValueError:
-                    damaged = True
-                    continue
-                if event.get('run_id') != path.stem:
-                    continue
-                task_ids = event.get('task_ids')
-                linked |= event.get('task_id') == task_id or (
-                    isinstance(task_ids, list) and task_id in task_ids)
-                if event.get('kind') == 'run.start':
-                    start = event
-                elif event.get('kind') == 'run.end':
-                    end = event
-                elif event.get('kind') == 'run.summary':
-                    summary = event
+        try:
+            # Decode one line at a time, so a torn UTF-8 sequence does not
+            # prevent Python from returning earlier intact events.
+            with path.open('rb') as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line.decode('utf-8'))
+                        if not isinstance(event, dict):
+                            raise ValueError('event JSON must be an object')
+                    except ValueError:
+                        damaged = True
+                        continue
+                    if event.get('run_id') != path.stem:
+                        continue
+                    task_ids = event.get('task_ids')
+                    linked |= event.get('task_id') == task_id or (
+                        isinstance(task_ids, list) and task_id in task_ids)
+                    if event.get('kind') == 'run.start':
+                        start = event
+                    elif event.get('kind') == 'run.end':
+                        end = event
+                    elif event.get('kind') == 'run.summary':
+                        summary = event
+        except OSError:
+            damaged = True
         if not linked:
             continue
+        if damaged:
+            damaged_runs.append(path.stem)
         first = start or summary or end or {}
         timestamp = first.get('timestamp')
         if type(timestamp) not in (int, float):
@@ -183,14 +191,45 @@ def last_run(directory, task_id):
         try:
             started_at = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
         except (ValueError, OverflowError, OSError):
-            damaged = True
+            if not damaged:
+                damaged_runs.append(path.stem)
             continue
         final = summary or end or {}
         if latest is None or (timestamp, path.stem) > latest[0]:
             latest = ((timestamp, path.stem), {'id': path.stem, 'name': first.get('name'),
                 'status': final.get('status'), 'reason': final.get('reason'),
                 'started_at': started_at})
-    return {'latest': latest[1] if latest else None, 'damaged': damaged} if latest or damaged else None
+    if latest or damaged_runs:
+        return {'latest': latest[1] if latest else None, 'damaged': bool(damaged_runs),
+                'damaged_runs': sorted(damaged_runs)}
+    return None
+
+
+def valid_port(value):
+    return type(value) is int and 1 <= value <= 65535
+
+
+def snapshot_findings(bundle):
+    tcp = {}
+    http_headers = []
+    for record in bundle.get('network_observations') or []:
+        if not isinstance(record, dict) or not isinstance(record.get('data'), dict):
+            continue
+        item = record['data']
+        port = item.get('port')
+        if record.get('kind') in ('tcp_port_open', 'service_probe') and valid_port(port):
+            service = item.get('service_hint')
+            tcp.setdefault(port, None)
+            if isinstance(service, str) and service:
+                tcp[port] = service
+        elif record.get('kind') in ('http_response', 'http_content'):
+            observation = fields(item, 'status_line', 'status_code', 'path', 'title')
+            if observation:
+                http_headers.append(observation)
+    web = [fields(item, 'hostname', 'port', 'path', 'status_code', 'title')
+           for item in bundle.get('web_observations') or [] if isinstance(item, dict)]
+    return {'tcp': [{'port': port, 'service': service} for port, service in sorted(tcp.items())],
+            'http_headers': http_headers, 'web': [item for item in web if item]}
 
 
 def legacy_snapshot(db, task_id):
@@ -199,8 +238,25 @@ def legacy_snapshot(db, task_id):
     if row is None:
         return None
     data = json.loads(row[1])
-    return {'evidence_sha256': row[0], 'network_observations': len(data.get('network_observations', [])),
-            'burp_observations': len(data.get('burp_http_metadata', []))}
+    return {'evidence_sha256': row[0], 'network_observations': len(data.get('network_observations') or []),
+            'burp_observations': len(data.get('burp_http_metadata') or []),
+            'findings': snapshot_findings(data)}
+
+
+def full_scan_ports(db, task_id, target):
+    if not target:
+        return []
+    ports = set()
+    for row in task_memory.rows(db, 'pm_tcp_full_scans', task_id, target=target):
+        if row.get('target') != target or row.get('status') != 'completed':
+            continue
+        try:
+            saved = json.loads(row['open_ports_json'])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if isinstance(saved, list):
+            ports.update(value for value in saved if valid_port(value))
+    return sorted(ports)
 
 
 def saved_plan(raw):
@@ -254,6 +310,10 @@ def cli_metadata(db, task_id, data):
     from orchestrator import master_scheduler as scheduler
 
     snapshot = data['snapshot']['data'] or {}
+    findings = snapshot.get('findings', {})
+    ports = {row['port']: row for row in findings.get('tcp', [])}
+    for port in full_scan_ports(db, task_id, data.get('target')):
+        ports.setdefault(port, {'port': port, 'service': None})
     digest = snapshot.get('evidence_sha256')
     reports = data['reports']['evidence_agent_reports']
     stages = [name for name in scheduler.evidence.STAGES if any(
@@ -282,6 +342,7 @@ def cli_metadata(db, task_id, data):
         'previous_task': (previous['data'] or [None])[0],
         'successor_task': (successor['data'] or [None])[0],
         'aliases': aliases['data'],
+        'findings': {**findings, 'tcp': [ports[port] for port in sorted(ports)]},
     }
 
 

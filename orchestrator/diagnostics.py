@@ -46,19 +46,39 @@ def register_secret(value):
         _secrets.add(value)
 
 
-def clean(value, limit=500):
+_QUOTED_VALUE = r'"(?:\\.|[^"\\\r\n])*"' r"|'(?:\\.|[^'\\\r\n])*'"
+_SECRET_FIELD = r'api[_-]?key|password|passwd|(?:client[_-]?)?secret|(?:(?:access|refresh|id)[_-]?)?token|session[_-]?id'
+_HEADER_FIELD = r'authorization|set-cookie|cookie'
+
+
+def _sensitive_assignment(keys, unquoted):
+    return re.compile(
+        rf'''(?i)(?<![\w-])(["']?(?:{keys})["']?[ \t]*[:=][ \t]*)'''
+        rf'''(?:{_QUOTED_VALUE}|["'][^\r\n]*|{unquoted})'''
+    )
+
+
+_SENSITIVE_HEADER = _sensitive_assignment(_HEADER_FIELD, r'[^\r\n]+')
+_SENSITIVE_FIELD = _sensitive_assignment(_SECRET_FIELD, r'''[^\s,;&"'<>]+''')
+_SENSITIVE_OPTION = re.compile(
+    rf'(?i)(--(?:{_SECRET_FIELD}|cookie)(?:=|[ \t]+))(?:{_QUOTED_VALUE}|[^\s]+)'
+)
+
+
+def clean(value, limit=500, *, preserve_lines=False):
     text = str(value)
     for secret in sorted(_secrets, key=len, reverse=True):
         text = text.replace(secret, '[REDACTED]')
     text = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', text)
     text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
-    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', text)
-    text = re.sub(r'(?i)(authorization|cookie|set-cookie)\s*[:=].*', r'\1=[REDACTED]', text)
-    text = re.sub(r'(?i)((?:api[_-]?key|password|passwd|secret|token)\s*[=:]\s*)[^\s,;]+',
-                  r'\1[REDACTED]', text)
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]', ' ', text)
+    text = _SENSITIVE_HEADER.sub(r'\1[REDACTED]', text)
+    text = _SENSITIVE_FIELD.sub(r'\1[REDACTED]', text)
     text = re.sub(r'(https?://)[^/@\s]+:[^/@\s]+@', r'\1[REDACTED]@', text)
-    text = re.sub(r'(?i)(--(?:api[-_]?key|password|passwd|secret|token|cookie)(?:=|\s+))[^\s]+',
-                  r'\1[REDACTED]', text)
+    text = _SENSITIVE_OPTION.sub(r'\1[REDACTED]', text)
+    if not preserve_lines:
+        text = text.replace('\n', ' ').replace('\t', ' ')
     return text[:limit] if limit is not None else text
 
 
@@ -407,9 +427,10 @@ def entrypoint(function):
         task_id = None
         argv = sys.argv[1:]
         command = next((arg for arg in argv if arg != '--diagnostic'), None)
-        if name == 'pm' and command in (None, 'web', 'status'):
+        if name == 'pm' and command in (None, 'web', 'status', 'questions'):
             # The menu owns one run per selected operation. Saved-data views
-            # must not become the latest execution in the task journal.
+            # must not become the latest execution. Questions starts a run only
+            # once PM has parsed an explicit mutation.
             return function(*args,**kwargs)
         if '--task-id' in argv:
             index = argv.index('--task-id') + 1

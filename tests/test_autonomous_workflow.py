@@ -220,7 +220,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         with self.case.connect() as db:task_runtime.save_mode(db,11,'coordinated')
         def args(*values):
             with patch.object(sys,'argv',['pm',*values]):return pm.parser_main()[1]
-        with patch.object(pm,'connect',self.case.connect),\
+        with patch.object(pm,'connect',self.case.connect), patch.object(pm,'DB',self.case.database),\
              patch.object(pm,'session_api_key',side_effect=AssertionError('No key')) ,\
              patch.object(pm,'sudo_checked',side_effect=AssertionError('No privileged executor')),\
              patch.object(c,'choose_with_model',side_effect=AssertionError('No model')):

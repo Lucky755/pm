@@ -110,7 +110,7 @@ class PivotCloseTests(unittest.TestCase):
 
     def render_questions(self):
         output=io.StringIO()
-        with patch.object(pm,'connect',self.case.connect),redirect_stdout(output):
+        with patch.object(pm,'DB',self.case.database),redirect_stdout(output):
             pm.op_questions(SimpleNamespace(task_id=11,json=False))
         return output.getvalue()
 

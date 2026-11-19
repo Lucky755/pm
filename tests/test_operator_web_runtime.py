@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import runpy
 import select
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -31,15 +32,30 @@ class WebRuntimeTests(unittest.TestCase):
         guard.mkdir()
         self.env = {**os.environ, 'PYTHONPATH': storage_guard(guard),
                     'PM_METHOD_LIBRARY_DIR': str(self.storage / 'method_library')}
+        # Keep diagnostics from both the CLI and menu in the fixture directory.
+        with (guard / 'sitecustomize.py').open('a') as source:
+            source.write(f'\nfrom orchestrator import diagnostics\ndiagnostics.EVENT_DIR = Path({str(self.storage / "run_events")!r})\n')
         self.addCleanup(lambda: self.assertFalse((guard / 'storage-violation').exists()))
         for key in ('DEEPSEEK_API_KEY', 'EXPERIENTIAL_API_KEY', 'GLM_API_KEY'):
             self.env.pop(key, None)
         # Run the project installer with a disposable user directory. The
         # generated launcher execs the actual pm.py with the project Python.
+        self.launcher = self.install_launcher(ROOT, self.root)
+
+    def install_launcher(self, project, home):
         from contextlib import redirect_stdout
-        with patch.object(Path, 'home', return_value=self.root), redirect_stdout(io.StringIO()):
-            runpy.run_path(str(ROOT / 'install_launcher.py'), run_name='__main__')
-        self.launcher = self.root / '.local/bin/pentest-master'
+        with patch.object(Path, 'home', return_value=home), redirect_stdout(io.StringIO()):
+            runpy.run_path(str(project / 'install_launcher.py'), run_name='__main__')
+        return home / '.local/bin/pentest-master'
+
+    def use_fixture_as_default_storage(self):
+        project = self.root / 'project'
+        project.mkdir()
+        for filename in ('pm.py', 'install_launcher.py'):
+            shutil.copyfile(ROOT / filename, project / filename)
+        (project / '.venv').symlink_to(ROOT / '.venv', target_is_directory=True)
+        (project / 'storage').symlink_to(self.storage, target_is_directory=True)
+        self.launcher = self.install_launcher(project, self.root / 'operator')
 
     def cli(self, *args, **kwargs):
         return subprocess.run([self.launcher, *args], cwd=self.root, env=self.env,
@@ -73,12 +89,12 @@ class WebRuntimeTests(unittest.TestCase):
             response = connection.getresponse()
             return response.status, response.read().decode('utf-8')
 
-    def seed_task(self, task_id=1, *, expected=None, accepted=0):
+    def seed_task(self, task_id=1, *, expected=None, accepted=0, target='192.0.2.10'):
         self.storage.mkdir(exist_ok=True)
         with closing(sqlite3.connect(self.database)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,target TEXT,status TEXT,description TEXT)')
-            db.execute("INSERT INTO tasks VALUES (?,'192.0.2.10','pending_review','Сохранённое описание')",
-                       (task_id,))
+            db.execute("INSERT INTO tasks VALUES (?,?,'pending_review','Сохранённое описание')",
+                       (task_id, target))
             if expected is not None:
                 objectives.save_objectives(db, task_id, 'Найти флаг', expected_flags=expected)
                 flag_review.activate(db, task_id, expected)
@@ -142,6 +158,137 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(cli.returncode, 1)
         self.assertIn('WAL-базы', cli.stderr)
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.storage.iterdir()})
+
+    def test_delete_mode_rereads_committed_data_with_writer_open(self):
+        self.seed_task()
+        self.serve()
+        with closing(sqlite3.connect(self.database)) as writer:
+            self.assertEqual(writer.execute('PRAGMA journal_mode').fetchone()[0], 'delete')
+            writer.execute("UPDATE tasks SET description='Новое описание после commit' WHERE id=1")
+            self.assertIn('Сохранённое описание', self.get('/tasks/1')[1])
+            writer.commit()
+            before = self.snapshot()
+            code, body = self.get('/tasks/1')
+            self.assertEqual(code, 200)
+            self.assertIn('Новое описание после commit', body)
+            self.assertEqual(before, self.snapshot())
+
+    def test_question_views_preserve_unqueued_candidate_and_answer_history(self):
+        self.seed_task(expected=2, accepted=1, target='10.71.0.1')
+        with closing(sqlite3.connect(self.database)) as db, db:
+            flag_review.propose(db, 1, 'not-yet-queued', objective_key='goal')
+        before = self.snapshot()
+        self.use_fixture_as_default_storage()
+        self.serve()
+        self.assertIn('Ожидающих вопросов нет.', self.get('/tasks/1')[1])
+        self.assertEqual(before, self.snapshot())
+        result = self.cli('--diagnostic', 'questions', '1', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual([row['status'] for row in rows], ['answered'])
+        self.assertEqual(rows[0]['answer']['decision'], 'approve')
+        self.assertEqual(before, self.snapshot())
+        menu = self.cli(input='9\n1\n\n0\n')
+        self.assertEqual(menu.returncode, 0, menu.stderr)
+        self.assertNotIn('[ОШИБКА]', menu.stderr)
+        self.assertIn('ID вопроса для ответа', menu.stdout)
+        self.assertEqual(before, self.snapshot())
+
+    def test_explicit_cli_answer_writes_saved_question_and_goal(self):
+        self.seed_task(expected=1, target='10.71.0.1')
+        with closing(sqlite3.connect(self.database)) as db, db:
+            proposal = flag_review.propose(db, 1, 'answer-fixture', objective_key='goal')
+            question = flag_review.enqueue(db, proposal['id'])
+        self.use_fixture_as_default_storage()
+        result = self.cli('questions', '1', '--answer', str(question['id']), '--decision', 'approve', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)[0]['status'], 'answered')
+        with task_view.read_database(self.database) as db:
+            self.assertEqual(flag_review.completion(db, 1), 'objectives_done')
+            self.assertEqual(operator_questions.listing(db, 1)[0]['answer']['decision'], 'approve')
+        self.assertEqual(len(list((self.storage / 'run_events').glob('*.jsonl'))), 1)
+
+    def test_status_and_report_menu_show_saved_findings(self):
+        self.seed_task(expected=1, accepted=1)
+        digest = 'c' * 64
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute('CREATE TABLE pm_tcp_full_scans(task_id INTEGER,target TEXT,status TEXT,open_ports_json TEXT)')
+            db.execute("INSERT INTO pm_tcp_full_scans VALUES(1,'192.0.2.10','completed','[22,8080]')")
+            db.execute("INSERT INTO pm_tcp_full_scans VALUES(1,'192.0.2.99','completed','[9999]')")
+            db.execute('CREATE TABLE evidence_snapshots(task_id INTEGER,evidence_sha256 TEXT,evidence_json TEXT,created_at TEXT)')
+            bundle = {'network_observations': [{'kind': 'tcp_port_open', 'data': {'port': 22, 'service_hint': 'ssh'}}],
+                      'web_observations': [{'path': '/fixture', 'status_code': 200, 'title': 'Страница фикстуры'}]}
+            db.execute("INSERT INTO evidence_snapshots VALUES(1,?,?,'t')", (digest, json.dumps(bundle)))
+        before = self.snapshot()
+        self.use_fixture_as_default_storage()
+        for result in (self.cli('status', '1'), self.cli(input='3\n1\n0\n')):
+            with self.subTest(output=result.stdout):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('[ОШИБКА]', result.stderr)
+                for label in ('TCP/22', 'ssh', 'TCP/8080', '200', '/fixture', 'Страница фикстуры', 'Цель достигнута · 1 из 1'):
+                    self.assertIn(label, result.stdout)
+                self.assertNotIn('TCP/9999', result.stdout)
+        result = self.cli('status', '1', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data['evidence_sha256'], digest)
+        self.assertEqual(data['network_observations'], 1)
+        self.assertEqual(data['burp_observations'], 0)
+        self.assertEqual(data['outcome']['data']['label'], 'Цель достигнута · 1 из 1')
+        self.assertEqual(before, self.snapshot())
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute('DROP TABLE evidence_snapshots')
+        before = self.snapshot()
+        partial = self.cli('status', '1')
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        self.assertIn('TCP/8080', partial.stdout)
+        self.assertEqual(before, self.snapshot())
+
+    def test_journal_damage_and_recovery_are_local_to_each_run(self):
+        self.seed_task(1)
+        self.seed_task(2)
+        self.serve()
+        journals = self.storage / 'run_events'
+        journals.mkdir()
+        # A path that cannot be opened as a log must not hide other runs.
+        (journals / ('f' * 32 + '.jsonl')).mkdir()
+
+        def records(task_id, run_id):
+            start = {'run_id': run_id, 'kind': 'run.start', 'task_id': task_id,
+                     'timestamp': task_id, 'name': 'Локальный отчёт'}
+            end = {**start, 'kind': 'run.summary', 'status': 'completed', 'reason': 'Запись завершена'}
+            return ((json.dumps(record, ensure_ascii=False) + '\n').encode('utf-8') for record in (start, end))
+
+        first_id, second_id = 'a' * 32, 'b' * 32
+        first_path, second_path = (journals / f'{ident}.jsonl' for ident in (first_id, second_id))
+        first = b''.join(records(1, first_id))
+        first_path.write_bytes(first)
+        start, end = records(2, second_id)
+        warning = 'Некоторые строки журнала не удалось прочитать.'
+        utf8_split = end.index('Запись'.encode('utf-8')) + 1
+        for cut in (10, utf8_split):
+            with self.subTest(cut=cut):
+                partial = start + end[:cut]
+                second_path.write_bytes(partial)
+                first_page = self.get('/tasks/1')[1]
+                self.assertIn(first_id, first_page)
+                self.assertIn('Вызов PM · завершён', first_page)
+                self.assertNotIn(warning, first_page)
+                second_page = self.get('/tasks/2')[1]
+                self.assertIn(second_id, second_page)
+                self.assertIn('исход не записан', second_page)
+                self.assertIn(warning, second_page)
+                self.assertEqual(second_path.read_bytes(), partial)
+        with second_path.open('ab') as stream:
+            stream.write(end[utf8_split:])
+        second_page = self.get('/tasks/2')[1]
+        self.assertIn('Вызов PM · завершён', second_page)
+        self.assertIn('Запись завершена', second_page)
+        self.assertNotIn(warning, second_page)
+        self.assertIn(first_id, self.get('/tasks/1')[1])
+        self.assertNotIn(warning, self.get('/tasks/1')[1])
+        self.assertEqual(first_path.read_bytes(), first)
+        self.assertEqual(second_path.read_bytes(), start + end)
 
     def test_cli_and_http_agree_on_manual_flag_outcome(self):
         cases = (
@@ -266,6 +413,58 @@ class WebRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(sqlite3.OperationalError, 'readonly'):
                 db.execute("UPDATE tasks SET status='closed'")
 
+    def test_browser_masks_secrets_before_escaping_and_sending_html(self):
+        from playwright.sync_api import sync_playwright
+
+        self.seed_waiting_task()
+        self.seed_task(2)
+        report = {
+            'summary': 'Обычный текст отчёта <script>\nAuthorization: Bearer REPORT_AUTH_SYNTH\nКонец отчёта',
+            'report_warning': 'Cookie: a=WARNING_COOKIE_SYNTH; b=SECOND_COOKIE_SYNTH\nОбычное предупреждение',
+            'report_quality': {'reason': 'Причина отчёта token="QUALITY TOKEN SYNTH" далее'},
+        }
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute('UPDATE pm_agent_action_reports SET report_json=?', (json.dumps(report),))
+            db.execute("UPDATE pm_task_intents SET intent='Задание\nCookie: sid=INTENT_COOKIE_SYNTH\nОграничение остаётся'")
+            db.execute("UPDATE tasks SET description='Описание password=DESCRIPTION_PASS_SYNTH далее' WHERE id=2")
+            db.execute('UPDATE pm_coordinator_steps SET decision_json=?', (
+                json.dumps({'role': 'verify', 'question': 'Поручение access_token=STEP_TOKEN_SYNTH далее'}),))
+            db.execute('UPDATE pm_operator_questions SET question=?,reason=?', (
+                'Вопрос: /fixture?password=QUESTION_PASS_SYNTH&page=2',
+                'Причина: {"Authorization": "Basic REASON_AUTH_SYNTH", "text": "Пояснение остаётся"}'))
+        before = self.snapshot()
+        self.serve()
+        secrets = ('REPORT_AUTH_SYNTH', 'WARNING_COOKIE_SYNTH', 'SECOND_COOKIE_SYNTH', 'QUALITY TOKEN SYNTH',
+                   'INTENT_COOKIE_SYNTH', 'DESCRIPTION_PASS_SYNTH', 'STEP_TOKEN_SYNTH',
+                   'QUESTION_PASS_SYNTH', 'REASON_AUTH_SYNTH')
+        pages = {
+            '/tasks/1': ('Задание\n', 'Ограничение остаётся', 'Поручение', 'далее', 'page=2', 'Пояснение остаётся'),
+            '/tasks/2': ('Описание', 'далее'),
+            '/tasks/1/reports/verify-1': ('Обычный текст отчёта', 'Конец отчёта', '[REDACTED]\nОбычное предупреждение',
+                                          'Причина отчёта', 'далее'),
+        }
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', headless=True)
+            try:
+                tab = browser.new_page()
+                for path, ordinary in pages.items():
+                    with self.subTest(path=path):
+                        code, raw = self.get(path)
+                        self.assertEqual(code, 200)
+                        self.assertEqual(tab.goto(self.url.rstrip('/') + path).status, 200)
+                        html = tab.content()
+                        visible = tab.locator('main').inner_text()
+                        for secret in secrets:
+                            self.assertNotIn(secret, raw)
+                            self.assertNotIn(secret, html)
+                        for fragment in ordinary:
+                            self.assertIn(fragment, visible)
+                        self.assertIn('[REDACTED]', visible)
+                self.assertIn('&lt;script&gt;', raw)
+                self.assertEqual(tab.locator('script').count(), 0)
+            finally:
+                browser.close()
+        self.assertEqual(before, self.snapshot())
 
 if __name__ == '__main__':
     unittest.main()
