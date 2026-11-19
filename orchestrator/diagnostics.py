@@ -48,7 +48,7 @@ def register_secret(value):
 
 _QUOTED_VALUE = r'"(?:\\.|[^"\\\r\n])*"' r"|'(?:\\.|[^'\\\r\n])*'"
 _SECRET_FIELD = r'api[_-]?key|password|passwd|(?:client[_-]?)?secret|(?:(?:access|refresh|id)[_-]?)?token|session[_-]?id'
-_HEADER_FIELD = r'authorization|set-cookie|cookie'
+_HEADER_FIELD = r'(?:proxy-)?authorization|x-api-key|set-cookie|cookie'
 
 
 def _sensitive_assignment(keys, unquoted):

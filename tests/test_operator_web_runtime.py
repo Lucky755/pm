@@ -21,6 +21,18 @@ from orchestrator import task_memory, task_view
 from tests.run_offline import ROOT, storage_guard
 
 
+REPORT_CREDENTIAL_HEADERS = (
+    'Начало заголовков <script>\n'
+    'x-ApI-kEy: REPORT_API_TEXT_SYNTH\n'
+    'pRoXy-AuThOrIzAtIoN: Basic REPORT_PROXY_TEXT_SYNTH\n'
+    '{"X-API-Key": "REPORT_API_JSON_SYNTH", '
+    '"Proxy-Authorization": "Basic REPORT_PROXY_JSON_SYNTH", "X-Trace": "Соседний заголовок"}\n'
+    'Конец заголовков'
+)
+REPORT_HEADER_SECRETS = ('REPORT_API_TEXT_SYNTH', 'REPORT_PROXY_TEXT_SYNTH',
+                         'REPORT_API_JSON_SYNTH', 'REPORT_PROXY_JSON_SYNTH')
+
+
 class WebRuntimeTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='pm-web-')
@@ -244,6 +256,42 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertIn('TCP/8080', partial.stdout)
         self.assertEqual(before, self.snapshot())
 
+    def test_status_preserves_protocol_and_excludes_non_open_probes(self):
+        self.seed_task()
+        records = [
+            ('tcp_port_open', {'protocol': 'tcp', 'port': 22, 'state': 'open', 'service_hint': 'ssh'}),
+            ('service_probe', {'protocol': 'udp', 'port': 53, 'state': 'open', 'service_hint': 'dns'}),
+            ('service_probe', {'protocol': 'tcp', 'port': 53, 'state': 'open', 'service_hint': 'domain'}),
+            ('service_probe', {'protocol': 'tcp', 'port': 443, 'state': 'closed', 'service_hint': 'https'}),
+            ('service_probe', {'protocol': 'udp', 'port': 161, 'state': 'open|filtered'}),
+            ('service_probe', {'protocol': 'tcp', 'port': 8443, 'state': 'unknown'}),
+            ('service_probe', {'port': 8081, 'service_hint': 'legacy-http'}),
+        ]
+        bundle = {'network_observations': [{'kind': kind, 'data': data} for kind, data in records]}
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute('CREATE TABLE evidence_snapshots(task_id INTEGER,evidence_sha256 TEXT,evidence_json TEXT,created_at TEXT)')
+            db.execute("INSERT INTO evidence_snapshots VALUES(1,?,?,'t')", ('c' * 64, json.dumps(bundle)))
+            db.execute('CREATE TABLE pm_tcp_full_scans(task_id INTEGER,target TEXT,status TEXT,open_ports_json TEXT)')
+            db.execute("INSERT INTO pm_tcp_full_scans VALUES(1,'192.0.2.10','completed','[22,8080]')")
+        before = self.snapshot()
+        result = self.cli('status', '1', '--storage', self.storage)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        open_lines = [line.strip() for line in result.stdout.splitlines() if '[OPEN]' in line]
+        self.assertCountEqual(open_lines, [
+            '[OPEN] TCP/22: ssh', '[OPEN] TCP/53: domain', '[OPEN] UDP/53: dns',
+            '[OPEN] TCP/8080: сервис не определён', '[OPEN] TCP/8081: legacy-http',
+        ])
+        result = self.cli('status', '1', '--json', '--storage', self.storage)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data['network_observations'], len(records))
+        self.assertEqual(data['findings']['tcp'], [
+            {'port': 22, 'service': 'ssh'}, {'port': 53, 'service': 'domain'},
+            {'port': 8080, 'service': None}, {'port': 8081, 'service': 'legacy-http'},
+        ])
+        self.assertEqual(data['findings']['udp'], [{'port': 53, 'service': 'dns'}])
+        self.assertEqual(before, self.snapshot())
+
     def test_journal_damage_and_recovery_are_local_to_each_run(self):
         self.seed_task(1)
         self.seed_task(2)
@@ -413,13 +461,32 @@ class WebRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(sqlite3.OperationalError, 'readonly'):
                 db.execute("UPDATE tasks SET status='closed'")
 
+    def test_http_response_masks_report_credential_headers_without_browser(self):
+        self.seed_waiting_task()
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute('UPDATE pm_agent_action_reports SET report_json=?',
+                       (json.dumps({'summary': REPORT_CREDENTIAL_HEADERS}),))
+        before = self.snapshot()
+        self.serve()
+        code, raw = self.get('/tasks/1/reports/verify-1')
+        self.assertEqual(code, 200)
+        for secret in REPORT_HEADER_SECRETS:
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, raw)
+        self.assertIn('Начало заголовков &lt;script&gt;\nx-ApI-kEy: [REDACTED]\n'
+                      'pRoXy-AuThOrIzAtIoN: [REDACTED]\n', raw)
+        self.assertIn('Соседний заголовок', raw)
+        self.assertIn('\nКонец заголовков', raw)
+        self.assertEqual(before, self.snapshot())
+
     def test_browser_masks_secrets_before_escaping_and_sending_html(self):
         from playwright.sync_api import sync_playwright
 
         self.seed_waiting_task()
         self.seed_task(2)
         report = {
-            'summary': 'Обычный текст отчёта <script>\nAuthorization: Bearer REPORT_AUTH_SYNTH\nКонец отчёта',
+            'summary': 'Обычный текст отчёта <script>\nAuthorization: Bearer REPORT_AUTH_SYNTH\n'
+                       f'{REPORT_CREDENTIAL_HEADERS}\nКонец отчёта',
             'report_warning': 'Cookie: a=WARNING_COOKIE_SYNTH; b=SECOND_COOKIE_SYNTH\nОбычное предупреждение',
             'report_quality': {'reason': 'Причина отчёта token="QUALITY TOKEN SYNTH" далее'},
         }
@@ -436,12 +503,14 @@ class WebRuntimeTests(unittest.TestCase):
         self.serve()
         secrets = ('REPORT_AUTH_SYNTH', 'WARNING_COOKIE_SYNTH', 'SECOND_COOKIE_SYNTH', 'QUALITY TOKEN SYNTH',
                    'INTENT_COOKIE_SYNTH', 'DESCRIPTION_PASS_SYNTH', 'STEP_TOKEN_SYNTH',
-                   'QUESTION_PASS_SYNTH', 'REASON_AUTH_SYNTH')
+                   'QUESTION_PASS_SYNTH', 'REASON_AUTH_SYNTH', *REPORT_HEADER_SECRETS)
         pages = {
             '/tasks/1': ('Задание\n', 'Ограничение остаётся', 'Поручение', 'далее', 'page=2', 'Пояснение остаётся'),
             '/tasks/2': ('Описание', 'далее'),
             '/tasks/1/reports/verify-1': ('Обычный текст отчёта', 'Конец отчёта', '[REDACTED]\nОбычное предупреждение',
-                                          'Причина отчёта', 'далее'),
+                                          'Причина отчёта', 'далее', 'Соседний заголовок',
+                                          'Начало заголовков <script>\nx-ApI-kEy: [REDACTED]\n'
+                                          'pRoXy-AuThOrIzAtIoN: [REDACTED]\n'),
         }
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', headless=True)
@@ -455,8 +524,10 @@ class WebRuntimeTests(unittest.TestCase):
                         html = tab.content()
                         visible = tab.locator('main').inner_text()
                         for secret in secrets:
-                            self.assertNotIn(secret, raw)
-                            self.assertNotIn(secret, html)
+                            with self.subTest(secret=secret):
+                                self.assertNotIn(secret, raw)
+                                self.assertNotIn(secret, html)
+                                self.assertNotIn(secret, visible)
                         for fragment in ordinary:
                             self.assertIn(fragment, visible)
                         self.assertIn('[REDACTED]', visible)

@@ -2820,9 +2820,10 @@ def op_status(args):
     snapshot = data['snapshot']['data']
     if snapshot:
         line(f'  Сохранённый снимок: находок {snapshot["network_observations"]}, Burp {snapshot["burp_observations"]}')
-    for observation in data['findings']['tcp']:
-        service = observation['service'] or 'сервис не определён'
-        line(f'  {tint("[OPEN]", "success")} TCP/{observation["port"]}: {safe_display(service)}')
+    for protocol in ('tcp', 'udp'):
+        for observation in data['findings'][protocol]:
+            service = observation['service'] or 'сервис не определён'
+            line(f'  {tint("[OPEN]", "success")} {protocol.upper()}/{observation["port"]}: {safe_display(service)}')
     for observation in data['findings'].get('http_headers', []):
         status_line = observation.get('status_line') or observation.get('status_code')
         value = ' · '.join(str(value) for value in (status_line, observation.get('path'), observation.get('title')) if value)

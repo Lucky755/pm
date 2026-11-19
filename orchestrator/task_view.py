@@ -210,26 +210,35 @@ def valid_port(value):
 
 
 def snapshot_findings(bundle):
-    tcp = {}
+    services = {'tcp': {}, 'udp': {}}
     http_headers = []
     for record in bundle.get('network_observations') or []:
         if not isinstance(record, dict) or not isinstance(record.get('data'), dict):
             continue
         item = record['data']
-        port = item.get('port')
-        if record.get('kind') in ('tcp_port_open', 'service_probe') and valid_port(port):
+        kind = record.get('kind')
+        if kind in ('tcp_port_open', 'service_probe'):
+            port = item.get('port')
+            # Older snapshots omit protocol on TCP records and state on positive probes.
+            protocol = item.get('protocol', 'tcp')
+            if not valid_port(port) or protocol not in ('tcp', 'udp') or item.get('state', 'open') != 'open':
+                continue
+            if kind == 'tcp_port_open' and protocol != 'tcp':
+                continue
+            ports = services[protocol]
             service = item.get('service_hint')
-            tcp.setdefault(port, None)
+            ports.setdefault(port, None)
             if isinstance(service, str) and service:
-                tcp[port] = service
-        elif record.get('kind') in ('http_response', 'http_content'):
+                ports[port] = service
+        elif kind in ('http_response', 'http_content'):
             observation = fields(item, 'status_line', 'status_code', 'path', 'title')
             if observation:
                 http_headers.append(observation)
     web = [fields(item, 'hostname', 'port', 'path', 'status_code', 'title')
            for item in bundle.get('web_observations') or [] if isinstance(item, dict)]
-    return {'tcp': [{'port': port, 'service': service} for port, service in sorted(tcp.items())],
-            'http_headers': http_headers, 'web': [item for item in web if item]}
+    findings = {protocol: [{'port': port, 'service': service} for port, service in sorted(ports.items())]
+                for protocol, ports in services.items()}
+    return {**findings, 'http_headers': http_headers, 'web': [item for item in web if item]}
 
 
 def legacy_snapshot(db, task_id):
@@ -342,7 +351,7 @@ def cli_metadata(db, task_id, data):
         'previous_task': (previous['data'] or [None])[0],
         'successor_task': (successor['data'] or [None])[0],
         'aliases': aliases['data'],
-        'findings': {**findings, 'tcp': [ports[port] for port in sorted(ports)]},
+        'findings': {**findings, 'tcp': [ports[port] for port in sorted(ports)], 'udp': findings.get('udp', [])},
     }
 
 
