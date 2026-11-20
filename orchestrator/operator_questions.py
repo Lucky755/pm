@@ -67,6 +67,12 @@ def listing(db,task_id,*,pending=False):
 def branch(decision):return decision.get('branch_id','task')
 
 
+def informational(question):
+    """Legacy untyped tool questions accept text without granting permission."""
+    return question['kind'] == 'information' or (
+        question['kind'] == 'tool' and not question.get('tool_request'))
+
+
 def dependent_branches(question):
     return (question.get('tool_request') or {}).get('dependent_branches') or [question['branch_id']]
 

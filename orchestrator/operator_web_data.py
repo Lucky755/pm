@@ -226,7 +226,10 @@ def event_view(event):
     result = label_status(event.get('status') or event.get('current_state'))
     reason = clean(event.get('reason_summary') or event.get('reason'))
     reason = REASONS.get(reason, reason)
-    return timeline_record(f"event:{event['run_id']}:{ident}", event.get('timestamp'), actor or event.get('source'),
+    question = identifiers.get('question_id') if isinstance(identifiers, dict) else None
+    key = (f'question-answer:{question}' if kind == 'operator.answer' and type(question) is int
+           else f"event:{event['run_id']}:{ident}")
+    return timeline_record(key, event.get('timestamp'), actor or event.get('source'),
                            action, ' · '.join(filter(None, (result, reason))), 'Диагностика PM', kind,
                            details, command_argv(event.get('argv') or event.get('command')))
 
@@ -370,6 +373,23 @@ def target_map(db, task_id, data):
     return {'nodes': nodes, 'edges': edges, 'inventory': inventory}
 
 
+def question_answers(db, task_id):
+    rows = []
+    damaged = False
+    decisions = {'approve': 'принято', 'decline': 'отклонено', 'information': 'информация сохранена'}
+    for row in task_memory.rows(db, 'pm_operator_question_events', task_id):
+        if row.get('event') != 'answered':
+            continue
+        try:
+            decision = json.loads(row['payload_json'])['decision']
+            rows.append(timeline_record(f"question-answer:{row['question_id']}", row['created_at'], 'Оператор',
+                                        'Ответ оператора', decisions.get(decision), 'SQLite · Вопросы',
+                                        'operator.answer', {'Вопрос': row['question_id']}))
+        except (KeyError, ValueError, TypeError):
+            damaged = True
+    return {'rows': rows, 'damaged': damaged}
+
+
 def load(database, task_id):
     with task_view.read_database(database) as db:
         if not task_memory.exists(db, 'tasks'):
@@ -379,12 +399,15 @@ def load(database, task_id):
             return None
         graph = task_view.section(lambda: target_map(db, task_id, data))
         exchanges = task_view.section(lambda: task_memory.rows(db, 'pm_http_exchanges', task_id))
+        answers = task_view.section(lambda: question_answers(db, task_id))
     events, damaged = diagnostic_events(database.parent / 'run_events', task_id)
     history = [event_view(e) for e in events]
     capability_problems = []
     capabilities = task_view.section(lambda: list(capability_events(
         database.parent / 'capability_log' / f'task_{task_id}.jsonl', task_id, capability_problems)))
     history.extend(capabilities['data'] or [])
+    saved_answers = answers['data'] or {}
+    history.extend(saved_answers.get('rows', []))
     for row in exchanges['data'] or []:
         history.append(timeline_record(f"http:{row['id']}", row.get('created_at'), row.get('session_id'),
                                        'Запись HTTP-запроса', label_status(row.get('phase')), 'SQLite · HTTP',
@@ -399,5 +422,5 @@ def load(database, task_id):
                            'scope': question_scope(q)} for q in data['questions']['data'] or []],
             'questions_state': data['questions']['state'],
             'outcome': clean((data['outcome']['data'] or {}).get('label')),
-            'history_error': damaged or bool(capability_problems) or
-            capabilities['state'] == 'error' or exchanges['state'] == 'error'}
+            'history_error': damaged or bool(capability_problems) or saved_answers.get('damaged', False) or
+            any(source['state'] == 'error' for source in (capabilities, exchanges, answers))}

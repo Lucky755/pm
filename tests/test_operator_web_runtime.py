@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import select
 import shutil
@@ -15,11 +16,12 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
+from executor import task_scope
 from executor.netguard_root import tool_digest
 from orchestrator import coordinated_attack, flag_review, http_client, method_library, objectives, operator_questions
-from orchestrator import pivoting, resources, task_memory, task_view
+from orchestrator import http_artifacts, pivoting, resources, task_memory, task_view
 from tests.run_offline import ROOT, storage_guard
 
 
@@ -93,7 +95,13 @@ class WebRuntimeTests(unittest.TestCase):
                                    cwd=self.root, env=self.env, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+        stopped = False
+
         def stop():
+            nonlocal stopped
+            if stopped:
+                return
+            stopped = True
             if process.poll() is None:
                 process.send_signal(signal.SIGINT)
             try:
@@ -109,10 +117,11 @@ class WebRuntimeTests(unittest.TestCase):
         self.url = startup.strip().split()[-1]
         self.port = urlsplit(self.url).port
         self.assertEqual(self.url, f'http://127.0.0.1:{self.port}/')
+        return stop
 
-    def get(self, path, *, method='GET', headers=None):
+    def get(self, path, *, method='GET', headers=None, body=None):
         with closing(http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)) as connection:
-            connection.request(method, path, headers=headers or {})
+            connection.request(method, path, body=body, headers=headers or {})
             response = connection.getresponse()
             return response.status, response.read().decode('utf-8')
 
@@ -682,6 +691,281 @@ class WebRuntimeTests(unittest.TestCase):
             folder = Path(destination)
             folder.mkdir(parents=True, exist_ok=True)
             tab.screenshot(path=folder / f'{name}.png', animations='disabled')
+
+    def test_management_wizard_and_task_scoped_clarification_in_chromium(self):
+        from playwright.sync_api import expect, sync_playwright
+
+        self.seed_task(1)
+        self.seed_task(2)
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute('CREATE TABLE pm_task_intents(task_id INTEGER PRIMARY KEY,intent TEXT)')
+            db.executemany('INSERT INTO pm_task_intents VALUES (?,?)', [(1, 'Задача Alpha'), (2, 'Задача Beta')])
+            db.execute('CREATE TABLE pm_task_hostnames(task_id INTEGER PRIMARY KEY,hostnames_json TEXT)')
+            db.execute('INSERT INTO pm_task_hostnames VALUES (?,?)', (1, json.dumps(['confirmed.lab.test'])))
+        before = self.snapshot()
+        self.serve()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', headless=True)
+            try:
+                tab = browser.new_page(viewport={'width': 1380, 'height': 1080})
+                tab.goto(self.url + 'management')
+                tab.get_by_role('link', name='Новый контекст').click()
+                target = tab.get_by_label('Адрес, домен или URL')
+                tab.get_by_label('Известные домены через запятую').fill('portal.lab.test')
+                tab.get_by_label('Описание основной цели').fill('Подтвердить флаг лаборатории')
+                tab.get_by_label('Ограничения', exact=True).fill('Только сохранённые материалы')
+                target.fill('999.11.22.33')
+                tab.get_by_role('button', name='Далее').click()
+                expect(tab.locator('[aria-current=step]')).to_have_text('Контекст')
+                expect(target).to_have_attribute('aria-invalid', 'true')
+                expect(tab.locator('#target-error')).to_be_visible()
+                target.fill('fd12:3456::9')
+                tab.get_by_role('button', name='Далее').click()
+                expect(tab.locator('[aria-current=step]')).to_have_text('Цели')
+                tab.get_by_role('button', name='Назад').click()
+                expect(target).to_have_value('fd12:3456::9')
+                original_url = 'https://[fd12:3456::9]:8443/room/start?tab=one#part'
+                target.fill(original_url)
+                self.save_dashboard_screenshot(tab, '01-context')
+                tab.get_by_role('button', name='Далее').click()
+                expected = tab.get_by_label('Ожидаемое число флагов')
+                expected.fill('0')
+                tab.get_by_role('button', name='Далее').click()
+                expect(tab.locator('[aria-current=step]')).to_have_text('Цели')
+                expect(expected).to_have_attribute('aria-invalid', 'true')
+                expected.fill('1')
+                tab.get_by_role('button', name='Далее').click()
+                expect(tab.locator('[aria-current=step]')).to_have_text('Проверка')
+                expect(tab.locator('main')).to_contain_text(original_url)
+                expect(tab.locator('main')).to_contain_text('Формат неизвестен')
+                tab.get_by_role('button', name='Назад').click()
+                expect(expected).to_have_value('1')
+                expect(tab.get_by_label('Регулярное выражение флага')).to_have_value('')
+                tab.get_by_role('button', name='Далее').click()
+                self.save_dashboard_screenshot(tab, '02-context-review')
+                self.assertEqual(before, self.snapshot())
+                tab.get_by_role('button', name='Сохранить контекст').click()
+                expect(tab.locator('main')).to_contain_text('Контекст сохранён как черновик')
+                expect(tab.locator('main')).to_contain_text(original_url)
+                self.assertEqual(tab.reload().status, 200)
+                tab.goto(self.url + 'management/tasks/1/context')
+                tab.get_by_label('Уточнение оператора').fill('Сверить источник сохранённого документа')
+                tab.get_by_label('Имена по сообщению оператора').fill('unbound.lab.test')
+                tab.get_by_role('button', name='Сохранить уточнение').click()
+                expect(tab.locator('#saved-intent')).to_contain_text('unbound.lab.test')
+                tab.reload()
+                expect(tab.locator('#saved-intent')).to_contain_text('Сверить источник')
+                with task_view.read_database(self.database) as db:
+                    self.assertEqual(db.execute('SELECT intent FROM pm_task_intents WHERE task_id=2').fetchone()[0], 'Задача Beta')
+                    self.assertEqual(json.loads(db.execute('SELECT hostnames_json FROM pm_task_hostnames').fetchone()[0]),
+                                     ['confirmed.lab.test'])
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0], 2)
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_task_intent_history').fetchone()[0], 1)
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_context_drafts').fetchone()[0], 1)
+            finally:
+                browser.close()
+
+    def seed_management_questions(self):
+        self.seed_dashboard()
+        with closing(sqlite3.connect(self.database)) as db, db:
+            def request(kind, text):
+                return operator_questions.request(db, 1, '192.0.2.10', {
+                    'operator_question': {'kind': kind}, 'question': text, 'reason': 'Уточнение оператора',
+                    'boundaries': {'task_id': 1, 'target': '192.0.2.10'}, 'references': ['intent'],
+                }, None)['id']
+            info = request('tool', 'Как подписан сохранённый документ?')
+            execution = request('pivoting', 'Разрешить связанное действие?')
+            first = next(row for row in operator_questions.listing(db, 1) if row['kind'] == 'flag_confirmation')
+            objectives.save_objectives(db, 2, 'Подтвердить флаг', expected_flags=1)
+            flag_review.activate(db, 2, 1)
+            proposal = flag_review.propose(db, 2, 'second-task-flag', objective_key='goal',
+                                           source='Сохранённый отчёт', method='Ручная отметка')
+            second = flag_review.enqueue(db, proposal['id'])
+        return info, execution, first, second
+
+    def test_management_question_csrf_and_task_boundary_over_http(self):
+        _, action, first, second = self.seed_management_questions()
+        self.serve()
+        before = self.snapshot()
+        active = f'/management/tasks/1/questions/{first["id"]}'
+        body = self.get(active)[1]
+        token = re.search(r'name="csrf" value="([a-f0-9]+)"', body)[1]
+        data = {'csrf': token, 'decision': 'approve', 'checked': 'yes',
+                'candidate': first['flag_candidate']['id'], 'revision': first['flag_candidate']['revision']}
+        headers = {'Content-Type': 'application/x-www-form-urlencoded', 'Origin': self.url.rstrip('/')}
+        for path, payload, supplied, expected in (
+            (active, data, {**headers, 'Origin': 'http://example.invalid'}, 403),
+            (active, {**data, 'csrf': 'wrong'}, headers, 403),
+            (f'/management/tasks/1/questions/{second["id"]}', data, headers, 403),
+            (active, {**data, 'candidate': second['flag_candidate']['id']}, headers, 409),
+            (active, {**data, 'checked': ''}, headers, 422),
+        ):
+            with self.subTest(path=path, expected=expected):
+                code, _ = self.get(path, method='POST', body=urlencode(payload), headers=supplied)
+                self.assertEqual(code, expected)
+        path = f'/management/tasks/1/questions/{action}'
+        code, body = self.get(path)
+        self.assertEqual(code, 200)
+        self.assertIn('Действия с разрешениями выполняются в CLI', body)
+        self.assertNotIn('<form', body)
+        self.assertEqual(before, self.snapshot())
+
+    def test_management_answers_flags_and_competing_tabs_in_chromium(self):
+        from playwright.sync_api import expect, sync_playwright
+
+        info, _, first, second = self.seed_management_questions()
+        self.use_fixture_as_default_storage()
+        stop = self.serve()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', headless=True)
+            try:
+                form = browser.new_page(viewport={'width': 1380, 'height': 1080})
+                dashboard = browser.new_page(viewport={'width': 390, 'height': 850})
+                dashboard.goto(self.url + 'tasks/1#map')
+                card = dashboard.locator('[data-key="pivot:1"]')
+                card.locator('button').click()
+                card.evaluate('(el) => window.beforeAnswer = el')
+                scroll = dashboard.locator('#map .diagram-scroll')
+                scroll.evaluate('(el) => { el.scrollLeft = 170; }')
+                left = scroll.evaluate('(el) => el.scrollLeft')
+                form.goto(self.url + f'management/tasks/1/questions/{info}')
+                expect(form.locator('main')).to_contain_text('Как подписан сохранённый документ?')
+                form.get_by_label('Информационный ответ').fill('Файл подписан именем Alpha')
+                self.save_dashboard_screenshot(form, '03-question')
+                form.get_by_role('button', name='Сохранить ответ').click()
+                expect(form.locator('main')).to_contain_text('Информация сохранена')
+                form.reload()
+                expect(form.locator('main')).to_contain_text('Файл подписан именем Alpha')
+                form.goto(self.url + f'management/tasks/1/questions/{first["id"]}')
+                expect(form.locator('.selected-flag')).to_have_text('fixture-candidate')
+                form.get_by_label('Проверено на платформе').check()
+                form.get_by_role('button', name='Принять флаг').click()
+                expect(form.locator('main')).to_contain_text('Принято оператором')
+                form.get_by_role('link', name='Итоговый отчёт').click()
+                expect(form.locator('#final-outcome')).to_have_text('Цель достигнута · 1 из 1')
+                expect(form.locator('main')).to_contain_text('Закрытие задачи · неизвестно')
+                self.save_dashboard_screenshot(form, '04-flag-result')
+                expect(dashboard.locator('#goal-outcome')).to_have_text('Цель достигнута · 1 из 1')
+                expect(dashboard.locator('#history-entries').get_by_text('Ответ оператора', exact=True)).to_have_count(2)
+                self.assertTrue(card.evaluate('(el) => el === window.beforeAnswer'))
+                expect(card.locator('button')).to_have_attribute('aria-pressed', 'true')
+                self.assertEqual(scroll.evaluate('(el) => el.scrollLeft'), left)
+                cli = self.cli('status', '1')
+                self.assertEqual(cli.returncode, 0, cli.stderr)
+                self.assertIn('Цель достигнута · 1 из 1', cli.stdout)
+                cli = self.cli('questions', '1', '--json')
+                self.assertEqual(cli.returncode, 0, cli.stderr)
+                saved = {row['id']: row for row in json.loads(cli.stdout)}
+                self.assertEqual(saved[info]['answer']['text'], 'Файл подписан именем Alpha')
+                self.assertEqual(saved[first['id']]['answer']['decision'], 'approve')
+                url = self.url + f'management/tasks/2/questions/{second["id"]}'
+                form.goto(url)
+                other = browser.new_page()
+                other.goto(url)
+                prepare = '''decision => {
+                    const form = document.querySelector('form');
+                    const body = new URLSearchParams(new FormData(form));
+                    body.set('decision', decision);
+                    body.set('checked', 'yes');
+                    window.submitAnswer = () => fetch(form.action, { method: 'POST', body })
+                        .then(async response => [response.status, await response.text()]);
+                }'''
+                form.evaluate(prepare, 'approve')
+                other.evaluate(prepare, 'decline')
+                for tab in (form, other):
+                    tab.evaluate('() => { window.result = new Promise(resolve => setTimeout(() => resolve(window.submitAnswer()), 400)); }')
+                results = [tab.evaluate('window.result') for tab in (form, other)]
+                self.assertEqual(sorted(code for code, _ in results), [200, 409])
+                self.assertIn('Вопрос уже обработан', next(body for code, body in results if code == 409))
+                form.reload()
+                expect(form.locator('main')).to_contain_text('Сохранённое решение')
+                with task_view.read_database(self.database) as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM pm_operator_question_events WHERE question_id=? AND event='answered'",
+                                               (second['id'],)).fetchone()[0], 1)
+                    self.assertEqual(db.execute("SELECT status FROM tasks WHERE id=1").fetchone()[0], 'pending_review')
+                    self.assertFalse((self.storage / 'method_library').exists())
+                stop()
+                self.serve()
+                form.goto(self.url + f'management/tasks/1/questions/{info}')
+                expect(form.locator('main')).to_contain_text('Файл подписан именем Alpha')
+                form.goto(self.url + 'management/tasks/1/report')
+                expect(form.locator('#final-outcome')).to_have_text('Цель достигнута · 1 из 1')
+            finally:
+                browser.close()
+
+    def seed_method_original(self):
+        self.seed_task(target='10.20.30.40')
+        with closing(sqlite3.connect(self.database)) as db, http_artifacts.saved_artifact_location(self.storage / 'artifacts'):
+            task_scope.initialize(db)
+            db.execute("INSERT INTO task_scope_settings VALUES (1,'10.20.30.40',0,0)")
+            original = http_artifacts.save(db, 1, '10.20.30.40', 'http', '10.20.30.40', 80, '/status', {
+                'body': b'Original response\nalpha=42\n', 'headers': {'content-type': 'text/plain'},
+                'metadata': {}, 'status': 200, 'complete': True,
+            }, task_memory.now())
+        log = self.storage / 'capability_log'
+        log.mkdir()
+        rid = 'a' * 24
+        (log / 'task_1.jsonl').write_text(json.dumps({'id': rid, 'task_id': 1, 'tool': 'http_capture', 'provenance': 'network',
+            'result': {'task_id': 1, 'target': '10.20.30.40', 'status': 'completed', 'exit_code': 0,
+                       'artifact_id': original}}) + '\n', encoding='utf-8')
+        return rid, f'http_artifact:{original}'
+
+    def test_management_method_preview_cancel_revision_conflict_and_withdrawal_in_chromium(self):
+        from playwright.sync_api import expect, sync_playwright
+
+        rid, ref = self.seed_method_original()
+        initial = self.database.read_bytes()
+        self.serve()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', headless=True)
+            try:
+                first = browser.new_page()
+                second = browser.new_page()
+                first.goto(self.url + 'management/methods/new')
+                for label, value in {
+                    'Ключ совета': 'audit-original', 'Название': 'Проверка сохранённого ответа',
+                    'Условия применимости': 'Доступен полный оригинал.', 'Процедура': 'Сверить контрольную сумму.',
+                    'Ограничения': 'Только сохранённые материалы.', 'Когда неприменим': 'Оригинал отсутствует.',
+                    'Профили': 'verify', 'Теги': 'capture', 'Инструменты': 'pm_http_capture',
+                    'Номер задачи с оригиналом': '1', 'Result ID': rid, 'Артефакт': ref,
+                    'Точная цитата из оригинала': 'alpha=42',
+                }.items():
+                    first.get_by_label(label, exact=True).fill(value)
+                first.get_by_role('button', name='Проверить совет').click()
+                expect(first.locator('main')).to_contain_text('Проверенное основание')
+                self.assertFalse((self.storage / 'method_library').exists())
+                first.get_by_role('button', name='Сохранить совет').click()
+                method_url = first.url
+                expect(first.locator('main')).to_contain_text('Версия 1 · действует')
+                edit_url = first.get_by_role('link', name='Исправить совет').get_attribute('href')
+                edit_url = self.url.rstrip('/') + edit_url
+                catalog = self.storage / 'method_library' / 'catalog.json'
+                before = catalog.read_bytes()
+                first.goto(edit_url)
+                first.get_by_label('Название', exact=True).fill('Отменённая правка')
+                first.get_by_role('link', name='Отмена').click()
+                self.assertEqual(catalog.read_bytes(), before)
+                for tab, title in ((first, 'Уточнённый совет'), (second, 'Правка из второй вкладки')):
+                    tab.goto(edit_url)
+                    tab.get_by_label('Название', exact=True).fill(title)
+                    tab.get_by_label('Точная цитата из оригинала').fill('alpha=42')
+                    tab.get_by_label('Причина изменения').fill('Уточнение названия после проверки')
+                    tab.get_by_role('button', name='Проверить совет').click()
+                    expect(tab.locator('main')).to_contain_text('Проверенное основание')
+                first.get_by_role('button', name='Сохранить совет').click()
+                expect(first.locator('main')).to_contain_text('Версия 2 · действует')
+                second.get_by_role('button', name='Сохранить совет').click()
+                expect(second.get_by_role('link', name='Перечитать карточку')).to_be_visible()
+                first.get_by_role('link', name='Отозвать совет').click()
+                first.get_by_label('Причина изменения').fill('Область применимости требует повторной проверки')
+                first.get_by_role('button', name='Проверить отзыв').click()
+                expect(first.locator('main')).to_contain_text('Проверенное основание')
+                first.get_by_role('button', name='Подтвердить отзыв').click()
+                expect(first.locator('main')).to_contain_text('Версия 3 · отозван')
+                self.assertEqual(first.url, method_url)
+                self.assertEqual(self.database.read_bytes(), initial)
+            finally:
+                browser.close()
 
     def test_browser_masks_secrets_before_escaping_and_sending_html(self):
         from playwright.sync_api import sync_playwright

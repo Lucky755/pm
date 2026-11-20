@@ -37,12 +37,14 @@ DB = ROOT / 'storage/tasks.db'
 DOC_NETS = [ipaddress.ip_network(x) for x in (
     '192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24')]
 PORTS_MAX = 50
-MAX_HOSTNAMES = 12
 TRANSITION_MAX_BYTES = 256 * 1024
 from intent_limits import INTENT_MAX, HINTS_MAX
 from orchestrator import diagnostics, planner_protocol
 
 from operator_errors import OperatorError
+from orchestrator import operator_context
+from orchestrator.operator_context import (compose_task_description, previous_task_intent,
+                                          restore_task_intent, validate_hostnames, validate_intent)
 
 
 class PlannerValidationError(OperatorError):
@@ -175,11 +177,7 @@ def connect():
         approved_at TEXT NOT NULL,
         closed_at TEXT
     )''')
-    db.execute('''CREATE TABLE IF NOT EXISTS pm_task_intents (
-        task_id INTEGER PRIMARY KEY,
-        intent TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    )''')
+    operator_context.initialize(db)
     db.execute('''CREATE TABLE IF NOT EXISTS pm_task_lineage (
         previous_task_id INTEGER NOT NULL UNIQUE,
         successor_task_id INTEGER NOT NULL UNIQUE,
@@ -370,22 +368,6 @@ def docker_forward_drop():
     if proc.returncode:
         raise OperatorError('Не удалось проверить политику FORWARD')
     return '-P FORWARD DROP' in proc.stdout.splitlines()
-
-
-def validate_hostnames(raw):
-    if raw is None or not raw.strip():
-        return []
-    names = [x.strip().lower().rstrip('.') for x in raw.split(',')]
-    if not 1 <= len(names) <= MAX_HOSTNAMES or len(set(names)) != len(names):
-        raise OperatorError('Укажи 1–12 уникальных доменных имён')
-    for name in names:
-        labels = name.split('.')
-        if (len(name) > 253 or name in ('localhost', 'localhost.localdomain') or
-            not all(1 <= len(label) <= 63 and
-                    re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
-                    for label in labels) or name.replace('.', '').isdigit()):
-            raise OperatorError('Недопустимое имя хоста: ' + repr(name))
-    return names
 
 
 def configure_hostnames(db, task_id, target, raw):
@@ -876,30 +858,6 @@ def save_task_intent(db, task_id, text):
                    (task_id, text, datetime.now(timezone.utc).isoformat()))
 
 
-def restore_task_intent(db, task_id, text, source):
-    text, source = str(text).strip(), str(source).strip()
-    validate_intent(text)
-    if not source or len(source) > 300:
-        raise OperatorError('Нужен источник до 300 символов')
-    if not db.execute('SELECT 1 FROM tasks WHERE id=?', (task_id,)).fetchone():
-        raise OperatorError('Задача не найдена')
-    with db:
-        db.execute('CREATE TABLE IF NOT EXISTS pm_task_intent_history ('
-                   'id INTEGER PRIMARY KEY,task_id INTEGER NOT NULL,previous_intent TEXT,'
-                   'intent TEXT NOT NULL,source TEXT NOT NULL,created_at TEXT NOT NULL)')
-        previous = previous_task_intent(db, task_id)
-        if previous == text:
-            return False
-        stamp = datetime.now(timezone.utc).isoformat()
-        db.execute('INSERT INTO pm_task_intent_history '
-                   '(task_id,previous_intent,intent,source,created_at) VALUES (?,?,?,?,?)',
-                   (task_id, previous, text, source, stamp))
-        db.execute('INSERT INTO pm_task_intents VALUES (?,?,?) '
-                   'ON CONFLICT(task_id) DO UPDATE SET intent=excluded.intent,created_at=excluded.created_at',
-                   (task_id, text, stamp))
-    return True
-
-
 def op_intent(args):
     args.task=read_operator_task(args)
     text = compose_task_description(args.task, '', read_hints(args))
@@ -913,15 +871,6 @@ def op_intent(args):
     line('Описание и ограничения сохранены с историей.' if changed else 'Описание уже сохранено.')
 
 
-def previous_task_intent(db, task_id):
-    row = db.execute('SELECT intent FROM pm_task_intents WHERE task_id=?', (task_id,)).fetchone()
-    if row:
-        return row[0]
-    # Legacy tasks created before the v5 console did not save the original
-    # operator objective in our own metadata table. Never invent it from GLM.
-    return None
-
-
 def read_operator_task(args):
     source=getattr(args,'task_file',None)
     if not source:return getattr(args,'task','')
@@ -933,13 +882,6 @@ def read_operator_task(args):
     except (OSError,ValueError) as exc:raise OperatorError(str(exc)) from exc
     validate_intent(data)
     return data
-
-
-def validate_intent(text):
-    if not text:
-        raise OperatorError('Нужно непустое описание задачи')
-    if len(text.encode('utf-8')) > INTENT_MAX:
-        raise OperatorError(f'Описание превышает явный предел хранения {INTENT_MAX} байт; большие материалы передайте отдельными файлами')
 
 
 def read_hints(args):
@@ -2857,7 +2799,8 @@ def op_web(args):
     from orchestrator.operator_web import serve
     database = args.storage / 'tasks.db' if args.storage is not None else DB
     library_root = args.storage / 'method_library' if args.storage is not None else None
-    serve(database, port=args.port, library_root=library_root)
+    serve(database, port=args.port, library_root=library_root,
+          artifact_root=args.storage / 'artifacts' if args.storage is not None else None)
 
 
 def op_methods(args):
@@ -3409,7 +3352,7 @@ def op_http_reparse(args):
 def parser_main():
     parser = argparse.ArgumentParser(description='Pentest Master — удобная операторская консоль')
     sub = parser.add_subparsers(dest='command', required=False)
-    web = sub.add_parser('web', help='Открыть локальный просмотр сохранённых задач')
+    web = sub.add_parser('web', help='Открыть локальное управление сохранёнными задачами')
     web.add_argument('--port', type=int, default=8765, metavar='0..65535')
     web.add_argument('--storage', type=Path, help='Каталог сохранённых данных или резервной копии')
     policy = sub.add_parser('http-policy',help='Предел HTTP-ответа конкретной задачи')
@@ -3586,29 +3529,6 @@ def parser_main():
     args=parser.parse_args()
     args._explicit_flags={token.split('=',1)[0] for token in sys.argv[1:] if token.startswith('--')}
     return parser,args
-
-
-def compose_task_description(objective, constraints, hints=''):
-    """Per-task operator restrictions and leads; no hardcoded global prohibition.
-
-    Hints are leads the operator already has (a login form, an odd port, a
-    default credential to try). The text says they are unverified, so the
-    planner and the action agents verify them with tools instead of treating
-    them as an approved action or a reason to leave the task scope.
-    """
-    objective = str(objective or '').strip()
-    constraints = str(constraints or '').strip()
-    hints = str(hints or '').strip()
-    if not objective:
-        raise OperatorError('Нужно описание задачи')
-    text = objective
-    if constraints:
-        text += '\nОграничения: ' + constraints
-    if hints:
-        text += ('\nПодсказки оператора (зацепки для проверки, не доказанные '
-                 'факты; действовать только в рамках текущего scope): ' + hints)
-    validate_intent(text)
-    return text
 
 
 def interactive_operation(callback, args):

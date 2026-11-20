@@ -233,7 +233,7 @@ class Library:
         if version is not None and (type(version) is not int or not 1<=version<=len(versions)):raise ValueError('method_unknown_version')
         return versions[(version or len(versions))-1]
 
-    def save(self,db,task_id,spec,evidence,log,*,expected_version=None,reason='selected_successful_method'):
+    def inspect(self,db,task_id,spec,evidence,log,*,reason='selected_successful_method'):
         spec=validate(spec)
         if not isinstance(reason,str) or not reason.strip() or len(reason)>500:raise ValueError('method_revision_reason')
         with task_memory.atomic(db,write=False):
@@ -242,6 +242,10 @@ class Library:
         supported={'http_response':{'pm_http_request','pm_http_capture'},'http_criterion':{'pm_check_series'},
                    'material_transform':{'pm_material_process'}}
         if not set(spec['tools'])&supported[evidence['kind']]:raise ValueError('method_tool_not_linked_to_success')
+        return spec,result,origin
+
+    def save(self,db,task_id,spec,evidence,log,*,expected_version=None,reason='selected_successful_method'):
+        spec,result,origin=self.inspect(db,task_id,spec,evidence,log,reason=reason)
         with self.writer() as data:
             versions=next((v for v in data['methods'].values() if v[-1]['content']['key']==spec['key']),None)
             if versions is None:versions=next((v for v in data['methods'].values() if fingerprint(v[-1]['content'])==fingerprint(spec)),None)

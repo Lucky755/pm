@@ -196,6 +196,15 @@ def load_patterns(db, task_id):
     return flag_patterns(db, task_id)
 
 
+def validate_pattern(pattern):
+    if len(pattern) > 300:
+        raise ValueError('Шаблон флага длиннее 300 символов')
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValueError('Некорректный шаблон флага: ' + str(exc)) from exc
+
+
 def save_patterns(db, task_id, patterns=(), prefixes=(), shapes=(), expects=()):
     ensure_schema(db)
     entries = [(item, 'task_regex') for item in patterns]
@@ -211,12 +220,7 @@ def save_patterns(db, task_id, patterns=(), prefixes=(), shapes=(), expects=()):
     if len(existing | {item[0] for item in entries}) > 20:
         raise ValueError('Для задачи допускается не более 20 дополнительных шаблонов')
     for pattern, source in entries:
-        if len(pattern) > 300:
-            raise ValueError('Шаблон флага длиннее 300 символов')
-        try:
-            re.compile(pattern)
-        except re.error as exc:
-            raise ValueError('Некорректный шаблон флага: ' + str(exc)) from exc
+        validate_pattern(pattern)
     with db:
         db.executemany('INSERT OR IGNORE INTO pm_flag_patterns VALUES (?,?,?,?)',
                        [(task_id, pattern, source, now()) for pattern, source in entries])

@@ -3,11 +3,13 @@ import errno
 from functools import partial
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hmac
 import json
 from pathlib import Path
 import re
+import secrets
 import sqlite3
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from operator_errors import OperatorError
 from orchestrator import diagnostics, operator_web_data, task_view
@@ -35,6 +37,9 @@ STATE_LABELS = {
     'active': 'действует',
     'withdrawn': 'отозван',
     'deactivated': 'выключена',
+    'answered': 'ответ сохранён',
+    'cancelled': 'отменён',
+    'confirmed': 'подтверждена',
 }
 
 
@@ -61,7 +66,7 @@ def page(title, body, *, task=False):
             '<div class="sky" aria-hidden="true"></div>'
             '<header class="masthead"><a class="brand" href="/"><span class="brand-mark">PM</span>'
             '<span>PENTEST MASTER</span></a><nav aria-label="Навигация PM">'
-            '<a href="/">Задачи</a><a href="/methods">Управление</a></nav></header>'
+            '<a href="/">Задачи</a><a href="/management">Управление</a></nav></header>'
             f'<main><h1>{text(title)}</h1>{body}</main></body></html>')
 
 
@@ -221,7 +226,9 @@ def task_page(data):
     if data['runtime']['state'] != 'missing':
         body += block('Режим задачи', data['runtime'], lambda value: details(
             value, {'mode': 'Режим', 'recon_status': 'Разведка', 'pause_reason': 'Причина паузы'}))
-    body += '<p><a href="#questions">Ожидающие вопросы</a></p>'
+    body += (f'<p><a href="/management/tasks/{task_id}/context">Уточнить контекст</a> · '
+             f'<a href="/management/tasks/{task_id}/questions">Вопросы</a> · '
+             f'<a href="/management/tasks/{task_id}/report">Итоговый отчёт</a></p>')
     body += questions_view(data['questions'])
     body += block('Роли и шаги', data['steps'], lambda rows: list_html(step_view(step) for step in rows))
     if data['legacy_steps']['state'] != 'missing':
@@ -251,7 +258,7 @@ def methods_page(library, ident=None, version=None):
             f' · версия {rows[-1]["version"]} · {status(rows[-1]["status"])}'
             for key, rows in sorted(methods.items(), key=lambda item: item[1][-1]['content']['title'])
         ) if methods else '<p>Сохранённых советов пока нет</p>'
-        return 200, page('Советы', body)
+        return 200, page('Советы', '<p><a href="/management/methods/new">Сохранить совет</a></p>' + body)
     history = methods.get(ident, [])
     if not history or (version is not None and not 1 <= version <= len(history)):
         return 404, page('Совет', '<p>Совет или версия не найдены.</p>')
@@ -271,21 +278,31 @@ def methods_page(library, ident=None, version=None):
                 f'<a href="/methods/{text(ident)}/{row["version"]}">Версия {row["version"]}</a>'
                 f' · {status(row["status"])} · {text(row["created_at"])} · {text(row["reason"])}'
                 for row in reversed(history)))
+    if version is None:
+        body += (f'<p><a href="/management/methods/{text(ident)}/edit">Исправить совет</a> · '
+                 f'<a href="/management/methods/{text(ident)}/withdraw">Отозвать совет</a></p>')
     return 200, page(spec['title'], body)
 
 
 class Handler(BaseHTTPRequestHandler):
     timeout = 10
+    max_form = 3 * 16 * 1024 * 1024 + 65536
 
-    def __init__(self, *args, database, library, **kwargs):
+    def __init__(self, *args, database, library, admin, csrf_secret, **kwargs):
         self.database = database
         self.library = library
+        self.admin = admin
+        self.csrf_secret = csrf_secret
         super().__init__(*args, **kwargs)
 
     def log_message(self, *_):
         pass
 
     def dispatch(self, path):
+        if path.startswith('/management'):
+            response = self.admin.dispatch(path, self.form_token)
+            if response is not None:
+                return response
         if path == '/':
             tasks = task_view.list_tasks(self.database)
             return (500 if tasks['state'] == 'error' else 200,
@@ -344,28 +361,80 @@ class Handler(BaseHTTPRequestHandler):
         code, html = self.dispatch(path)
         return code, 'text/html; charset=utf-8', html.encode('utf-8')
 
-    def do_GET(self):
+    def form_token(self, path):
+        return hmac.digest(self.csrf_secret, path.encode('utf-8'), 'sha256').hex()
+
+    def request_path(self, *, write=False):
         host = f'127.0.0.1:{self.server.server_port}'
-        error = '<p>Откройте URL из терминала.</p>'
         if self.headers.get_all('Host') != [host]:
+            raise ValueError('Host')
+        if write and self.headers.get_all('Origin') != ['http://' + host]:
+            raise PermissionError('Origin')
+        url = urlsplit(self.path)
+        if url.scheme or url.netloc or (write and (url.query or url.fragment)):
+            raise ValueError('URL')
+        return unquote(url.path)
+
+    def do_GET(self):
+        error = '<p>Откройте URL из терминала.</p>'
+        try:
+            path = self.request_path()
+        except ValueError:
             code, kind, body = 400, 'text/html; charset=utf-8', page('Неверный адрес', error).encode('utf-8')
         else:
-            try:
-                url = urlsplit(self.path)
-                if url.scheme or url.netloc:
-                    raise ValueError('Absolute URL')
-            except ValueError:
-                code, kind, body = 400, 'text/html; charset=utf-8', page('Неверный адрес', error).encode('utf-8')
-            else:
-                code, kind, body = self.content(unquote(url.path))
+            code, kind, body = self.content(path)
+        self.respond(code, kind, body)
+
+    def form_values(self):
+        lengths = self.headers.get_all('Content-Length', [])
+        if (len(lengths) != 1 or not re.fullmatch(r'[0-9]{1,9}', lengths[0])
+                or self.headers.get('Transfer-Encoding')
+                or self.headers.get_content_type() != 'application/x-www-form-urlencoded'):
+            raise ValueError('Invalid form headers')
+        count = int(lengths[0])
+        if not 0 < count <= self.max_form:
+            raise OverflowError('Form size')
+        body = self.rfile.read(count)
+        if len(body) != count:
+            raise ValueError('Incomplete form')
+        values = parse_qs(body.decode('ascii'), keep_blank_values=True, strict_parsing=True,
+                          errors='strict', max_num_fields=32)
+        if any(len(value) != 1 or '\x00' in value[0] for value in values.values()):
+            raise ValueError('Ambiguous form')
+        return {name: value[0].replace('\r\n', '\n').replace('\r', '\n') for name, value in values.items()}
+
+    def do_POST(self):
+        try:
+            path = self.request_path(write=True)
+            params = self.form_values()
+            supplied = params.pop('csrf', '')
+            if not re.fullmatch(r'[a-f0-9]{64}', supplied) or not hmac.compare_digest(supplied, self.form_token(path)):
+                raise PermissionError('CSRF')
+        except PermissionError:
+            code, html = 403, page('Запрос отклонён', '<p>Откройте форму заново с локального адреса PM.</p>')
+        except OverflowError:
+            code, html = 413, page('Запрос слишком большой', '<p>Размер формы превышает допустимый предел.</p>')
+        except (ValueError, TimeoutError):
+            code, html = 400, page('Неверная форма', '<p>Не удалось прочитать форму запроса.</p>')
+        else:
+            result = self.admin.dispatch(path, self.form_token, params)
+            code, html = result or (404, page('Не найдено', '<p>Действие недоступно в браузере.</p>'))
+        if code == 303:
+            self.respond(code, 'text/html; charset=utf-8', b'', location=html)
+        else:
+            self.respond(code, 'text/html; charset=utf-8', html.encode('utf-8'))
+
+    def respond(self, code, kind, body, *, location=None):
         self.send_response(code)
+        if location is not None:
+            self.send_header('Location', location)
         self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Referrer-Policy', 'same-origin')
         self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; "
-                         "img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+                         "img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         self.end_headers()
         if self.command != 'HEAD':
             self.wfile.write(body)
@@ -373,8 +442,12 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
 
-def serve(database, *, port, library_root=None):
-    handler = partial(Handler, database=database, library=Library(library_root))
+def serve(database, *, port, library_root=None, artifact_root=None):
+    from orchestrator.operator_web_admin import Admin
+
+    library = Library(library_root)
+    handler = partial(Handler, database=database, library=library,
+                      admin=Admin(database, library, artifact_root), csrf_secret=secrets.token_bytes(32))
     try:
         server = ThreadingHTTPServer(('127.0.0.1', port), handler)
     except OSError as exc:

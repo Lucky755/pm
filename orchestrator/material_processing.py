@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from orchestrator import diagnostics,task_memory
+from orchestrator.http_artifacts import artifact_directory
 from orchestrator.material_worker import MAX_BYTES,VERSION
 
 ROOT=Path(__file__).resolve().parents[1]/'artifacts/materials'
@@ -34,7 +35,7 @@ def initialize(db):
 
 def directory(task_id,create=False):
     if type(task_id) is not int or task_id<1:raise ValueError('Invalid task')
-    root=Path(ROOT)
+    root=artifact_directory(Path(ROOT))
     if root.is_symlink():raise ValueError('Unsafe material root')
     if create:root.mkdir(mode=0o700,parents=True,exist_ok=True)
     path=root/str(task_id)

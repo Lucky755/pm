@@ -8,12 +8,31 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 ROOT = Path(__file__).resolve().parents[1] / 'artifacts' / 'http'
 DEFAULT_BODY = 2 * 1024 * 1024
 MAX_BODY = 8 * 1024 * 1024
 MAX_TASK_BYTES = 64 * 1024 * 1024
 MAX_HEADERS = 1024 * 1024
+_artifact_root = ContextVar('pm_artifact_root', default=None)
+
+
+@contextmanager
+def saved_artifact_location(root):
+    if root is not None and root.is_symlink():
+        raise ValueError('Unsafe alternate artifact root')
+    token = _artifact_root.set(root)
+    try:
+        yield
+    finally:
+        _artifact_root.reset(token)
+
+
+def artifact_directory(default):
+    root = _artifact_root.get()
+    return default if root is None else root / default.name
 
 
 def split_response(raw):
@@ -129,15 +148,16 @@ def _directory(task_id, *, create=True):
     if type(task_id) is not int or task_id <= 0:
         raise ValueError('Invalid artifact task')
     # This writer is unprivileged. Reject links and unsafe existing artifact dirs.
-    for directory in (ROOT, ROOT / f'task-{task_id}'):
+    root = artifact_directory(ROOT)
+    for directory in (root, root / f'task-{task_id}'):
         if create:
-            directory.mkdir(mode=0o700, parents=directory == ROOT, exist_ok=True)
+            directory.mkdir(mode=0o700, parents=directory == root, exist_ok=True)
         info = directory.lstat()
         if not stat.S_ISDIR(info.st_mode) or directory.is_symlink() or info.st_uid != os.getuid():
             raise ValueError('Unsafe HTTP artifact directory')
         if create:
             directory.chmod(0o700)
-    return ROOT / f'task-{task_id}'
+    return root / f'task-{task_id}'
 
 
 def save(db, task_id, target, scheme, host, port, path, capture, stamp):

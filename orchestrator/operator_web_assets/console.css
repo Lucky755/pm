@@ -259,3 +259,38 @@ main > pre, main > ul, main > ol { padding: 1rem 1rem 1rem 2rem; background: var
     .sky, .arriving { animation: none; }
     .edges path.pulse { display: none; }
 }
+
+.management { max-width: 58rem; margin-top: 1rem; }
+.management-back { margin-bottom: 1rem; }
+.management-panel { padding: clamp(1rem, 4vw, 2rem); overflow-wrap: anywhere; }
+.management-panel h2 { margin-top: 1.5rem; }
+.management-panel p + p, .management-panel h2 + p { margin-top: .5rem; }
+.management-panel dl { display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(0, 2fr); gap: .45rem 1rem; }
+.task-links { display: flex; flex-wrap: wrap; gap: .4rem 1rem; margin: .5rem 0 1rem; }
+.wizard-stages { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .5rem; list-style: none; padding: 0; margin: 0; }
+.wizard-stages li { padding: .6rem .45rem; border-bottom: 2px solid var(--border); color: var(--muted); }
+.wizard-stages li[aria-current] { border-color: var(--copper); color: var(--copper-bright); }
+.form-field { display: grid; gap: .3rem; margin: .95rem 0; min-width: 0; }
+.form-field label { font-weight: 600; }
+.form-field small { color: var(--muted); }
+.form-field input, .form-field select, .form-field textarea {
+    width: 100%; min-width: 0; border: 1px solid var(--border); border-radius: .45rem;
+    padding: .55rem .65rem; color: var(--text); background: #201b21; font: inherit;
+}
+.form-field textarea { resize: vertical; }
+.form-field [aria-invalid] { border-color: #efa28c; }
+.field-error, [role="alert"].form-notice { color: #ffc2b3; }
+.form-notice { margin: .85rem 0; padding: .75rem; border-left: 3px solid var(--copper); background: #322424; }
+.form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem 1rem; margin: 1.2rem 0 .5rem; }
+.form-actions button, .form-actions a.button-link {
+    border: 1px solid #9d664d; border-radius: .45rem; background: #4a3029;
+    color: var(--copper-bright); padding: .45rem .8rem; cursor: pointer; text-decoration: none;
+}
+.form-actions button.secondary { background: #251d22; }
+.form-actions button:hover, .form-actions a.button-link:hover { background: #674133; }
+.selected-flag, .report-outcome { padding: .65rem .8rem; border: 1px solid var(--border); border-radius: .45rem; background: #292026; }
+.checkbox { display: flex; align-items: center; gap: .3rem; margin-top: .75rem; }
+@media (max-width: 600px) {
+    .management-panel dl { display: block; }
+    .management-panel dt { margin-top: .45rem; }
+}
