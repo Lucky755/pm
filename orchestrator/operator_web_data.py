@@ -254,18 +254,38 @@ def event_view(event):
                            details, command_argv(event.get('argv') or event.get('command')))
 
 
-def capability_events(path, task_id, problems, exchange_roles):
+def receipt_exchange_ids(result, exchanges):
+    """Resolve only receipt IDs corroborated by this task's saved exchanges."""
+    final_id = result.get('exchange_id')
+    if type(final_id) is not int or final_id not in exchanges:
+        return
+    yield final_id  # Direct attribution also applies to receipts without a chain.
+    chain = result.get('chain')
+    if not isinstance(chain, list) or not chain or chain[-1] != final_id:
+        return
+    # The HTTP writer stores the first hop as parent_id on every later hop.
+    root_id = exchanges[final_id].get('parent_id')
+    root = exchanges.get(root_id)
+    if not root or root.get('parent_id') is not None or root_id >= final_id:
+        return
+    hops = [eid for eid in chain[:-1] if type(eid) is int and root_id <= eid < final_id
+            and eid in exchanges and (eid == root_id or exchanges[eid].get('parent_id') == root_id)]
+    if hops == sorted(set(hops)):
+        yield from hops
+
+
+def capability_events(path, task_id, problems, exchanges, exchange_roles):
     for row in json_lines(path, problems):
         if row.get('task_id') != task_id or not re.fullmatch(r'[a-f0-9]{24}', str(row.get('id'))):
             continue
         result = row.get('result')
         result = result if isinstance(result, dict) else {}
         role = row.get('actor_role')
-        exchange_id = result.get('exchange_id')
         if (row.get('tool') == 'http_capture' and isinstance(role, str) and role.strip()
-                and type(exchange_id) is int and result.get('task_id', task_id) == task_id
+                and result.get('task_id', task_id) == task_id
                 and not result.get('cached') and result.get('execution_started') is not False):
-            exchange_roles.setdefault(exchange_id, set()).add(role)
+            for exchange_id in receipt_exchange_ids(result, exchanges):
+                exchange_roles.setdefault(exchange_id, set()).add(role)
         status = label_status(result.get('status'))
         code = result.get('exit_code')
         if type(code) is int:
@@ -431,13 +451,15 @@ def load(database, task_id):
     events, damaged = diagnostic_events(database.parent / 'run_events', task_id)
     history = [event_view(e) for e in events]
     capability_problems = []
+    exchange_rows = {row['id']: row for row in exchanges['data'] or []}
     exchange_roles = {}
     capabilities = task_view.section(lambda: list(capability_events(
-        database.parent / 'capability_log' / f'task_{task_id}.jsonl', task_id, capability_problems, exchange_roles)))
+        database.parent / 'capability_log' / f'task_{task_id}.jsonl', task_id, capability_problems,
+        exchange_rows, exchange_roles)))
     history.extend(capabilities['data'] or [])
     saved_answers = answers['data'] or {}
     history.extend(saved_answers.get('rows', []))
-    for row in exchanges['data'] or []:
+    for row in exchange_rows.values():
         roles = exchange_roles.get(row['id'], set())
         actor = next(iter(roles)) if len(roles) == 1 else None
         history.append(timeline_record(f"http:{row['id']}", row.get('created_at'), actor,

@@ -714,6 +714,89 @@ class WebRuntimeTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_http_redirect_roles_from_a_real_mcp_receipt(self):
+        from tests.test_http_client_runtime import HTTPRuntimeTests
+
+        traffic = HTTPRuntimeTests()
+        self.addCleanup(traffic.doCleanups)
+        traffic.setUp()
+        self.storage = traffic.case.root
+        self.database = traffic.case.database
+        log = self.storage / 'capability_log'
+        with patch.object(traffic.server, 'CAPABILITY_LOG', log), patch.dict(os.environ, {'PM_BUDGET_ROLE': 'verify'}):
+            reply = traffic.call('/redirect', session='verify-web-session')
+        self.assertEqual(reply['status'], 'completed', reply)
+        root, final = reply['chain']
+        self.assertEqual(reply['exchange_id'], final)
+        receipt = json.loads((log / 'task_11.jsonl').read_text())
+        self.assertEqual(receipt['actor_role'], 'verify')
+        self.assertEqual(receipt['result']['chain'], [root, final])
+        self.assertEqual(receipt['result']['exchange_id'], final)
+        with task_view.read_database(self.database) as db:
+            saved = db.execute('SELECT e.id,e.parent_id,a.status_code FROM pm_http_exchanges e '
+                               'JOIN pm_http_artifacts a ON a.id=e.artifact_id AND a.task_id=e.task_id '
+                               'WHERE e.task_id=11 ORDER BY e.id').fetchall()
+            self.assertEqual([tuple(row) for row in saved], [(root, None, 302), (final, root, 200)])
+
+        before = self.snapshot()
+        requests = [row['path'] for row in traffic.requests]
+        self.assertEqual(requests, ['/redirect', '/current?q=redirect'])
+        self.serve()
+        self.assertEqual(self.get('/tasks/11')[0], 200)
+        for _ in range(2):
+            code, raw = self.get('/tasks/11/view.json')
+            self.assertEqual(code, 200)
+            history = {row['id']: row for row in json.loads(raw)['history']}
+            for exchange_id in (root, final):
+                with self.subTest(exchange=exchange_id):
+                    row = history[f'http:{exchange_id}']
+                    self.assertEqual(row['actor'], 'VERIFY')
+                    self.assertEqual(row['details']['Сессия'], 'verify-web-session')
+        self.assertEqual([row['path'] for row in traffic.requests], requests)
+        self.assertEqual(before, self.snapshot())
+
+    def test_http_history_validates_redirect_membership_and_conflicting_roles(self):
+        self.seed_task(1)
+        self.seed_task(2)
+        with closing(sqlite3.connect(self.database)) as db, db:
+            http_client.initialize(db)
+            db.executemany("INSERT INTO pm_http_exchanges VALUES "
+                           "(?,?,'shared-session',?,'GET','http://fixture.test/','192.0.2.10',"
+                           "'digest','operation','finished',NULL,'{}','2026-11-20T02:30:16Z')",
+                           [(1, 1, None), (2, 2, 1), (3, 1, 1), (4, 1, None), (5, 1, 1),
+                            (6, 1, 4), (7, 1, 98), (8, 1, 98)])
+        log = self.storage / 'capability_log'
+        log.mkdir()
+        self.serve()
+        valid = {'exchange_id': 5, 'chain': [1, 3, 5]}
+        cases = (
+            ('одиночный ID', [('verify', {'exchange_id': 5})], {5: 'VERIFY'}),
+            ('вся цепочка', [('verify', valid)], {1: 'VERIFY', 3: 'VERIFY', 5: 'VERIFY'}),
+            ('кэшированная запись', [('verify', {**valid, 'cached': True})], {}),
+            ('конфликт ролей', [('verify', valid), ('vuln', {'exchange_id': 3})], {1: 'VERIFY', 5: 'VERIFY'}),
+            ('чужая задача и посторонняя ветка', [('verify', {**valid, 'chain': [1, 2, 4, 5]})], {1: 'VERIFY', 5: 'VERIFY'}),
+            ('неполная квитанция', [('verify', {**valid, 'chain': [3, 5]})], {3: 'VERIFY', 5: 'VERIFY'}),
+            ('противоречивый порядок', [('verify', {**valid, 'chain': [3, 1, 5]})], {5: 'VERIFY'}),
+            ('противоречивый конец', [('verify', {**valid, 'chain': [1, 3, 6]})], {5: 'VERIFY'}),
+            ('корневая запись отсутствует', [('verify', {'exchange_id': 8, 'chain': [7, 8]})], {8: 'VERIFY'}),
+        )
+        for label, receipts, expected in cases:
+            with self.subTest(case=label):
+                records = [{'id': f'{index:024x}', 'task_id': 1, 'tool': 'http_capture',
+                            'actor_role': role, 'timestamp': '2026-11-20T02:30:16Z', 'result': payload}
+                           for index, (role, payload) in enumerate(receipts, 1)]
+                (log / 'task_1.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in records))
+                before = self.snapshot()
+                code, raw = self.get('/tasks/1/view.json')
+                self.assertEqual(code, 200)
+                exchanges = {int(row['id'].split(':')[1]): row for row in json.loads(raw)['history']
+                             if row['kind'] == 'http.exchange'}
+                self.assertEqual(set(exchanges), {1, 3, 4, 5, 6, 7, 8})
+                self.assertEqual({eid: row['actor'] for eid, row in exchanges.items() if row['actor'] != 'Не записан'},
+                                 expected)
+                self.assertTrue(all(row['details']['Сессия'] == 'shared-session' for row in exchanges.values()))
+                self.assertEqual(before, self.snapshot())
+
     def test_dashboard_updates_in_place_in_chromium(self):
         from playwright.sync_api import expect, sync_playwright
 
