@@ -17,8 +17,9 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+from executor.netguard_root import tool_digest
 from orchestrator import coordinated_attack, flag_review, http_client, method_library, objectives, operator_questions
-from orchestrator import task_memory, task_view
+from orchestrator import pivoting, resources, task_memory, task_view
 from tests.run_offline import ROOT, storage_guard
 
 
@@ -457,8 +458,9 @@ class WebRuntimeTests(unittest.TestCase):
                 self.assertIn('Вызов PM · завершён', task.locator('main').inner_text())
                 self.assertIn('Координатор · ожидает оператора', task.locator('main').inner_text())
                 self.assertIn('Закрытие задачи · неизвестно', task.locator('main').inner_text())
-                self.assertIn('Без брутфорса <script>', task.locator('pre').inner_text())
-                self.assertEqual(task.locator('script').count(), 0)
+                self.assertIn('Без брутфорса <script>', task.locator('.task-records pre').inner_text())
+                self.assertEqual(task.locator('script:not([src])').count(), 0)
+                self.assertEqual(task.locator('script[src="/assets/console.js"]').count(), 1)
                 self.assertEqual(other.locator('#questions li').count(), 1)
                 for tab in (task, other):
                     self.assertEqual(tab.reload().status, 200)
@@ -495,6 +497,191 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertIn(escape(header_pairs_summary(redacted=True)), raw)
         self.assertEqual(self.get('/tasks/1/reports/verify-1'), (200, raw))
         self.assertEqual(before, self.snapshot())
+
+    def write_dashboard_step(self, db, number, role, profile, status, question):
+        decision = json.dumps({'action': 'run_role', 'role': role, 'profile': profile, 'question': question})
+        db.execute("INSERT INTO pm_coordinator_steps (id,run_id,task_id,step_no,status,decision_json,"
+                   "state_sha256,budgets_json,created_at,updated_at) VALUES (?,1,1,?,?,?,'','{}','t','t')",
+                   (number, number, status, decision))
+
+    def write_dashboard_event(self, number, kind, **fields):
+        run_id = 'b' * 32
+        row = {'run_id': run_id, 'event_id': f'{number:032x}', 'task_id': 1, 'timestamp': 1795141800 + number,
+               'kind': kind, **fields}
+        with (self.storage / 'run_events' / f'{run_id}.jsonl').open('a', encoding='utf-8') as journal:
+            journal.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+    def write_dashboard_route(self, db, number, address, state):
+        ref = resources.node(db, 1, 'address', address)
+        spec = {'source_session': '0123abcd', 'resource_ref': ref, 'destination': address,
+                'port': 8080, 'local_port': 18887 + number, 'probe': 'http_headers', 'purpose': 'Лаборатория'}
+        manifest = {'task_id': 1, 'spec': spec, 'source_ssh': {}, 'listener': '127.0.0.1:18888',
+                    'rights': 'task user', 'actions': ['forward']}
+        receipt = {'request_id': tool_digest(manifest), 'manifest': manifest, 'status': state}
+        db.execute('INSERT INTO pm_pivot_routes VALUES (?,1,?,?,?,?,?,?)',
+                   (number, f'route-fixture-{number}', '0123abcd', ref, 1, state, json.dumps(receipt)))
+        return receipt['request_id']
+
+    def seed_dashboard(self):
+        self.seed_waiting_task()
+        self.seed_task(2, target='198.51.100.10')
+        with closing(sqlite3.connect(self.database)) as db, db:
+            pivoting.initialize(db)
+            resources.initialize(db)
+            db.execute("INSERT INTO pm_task_sessions VALUES "
+                       "(1,'0123abcd','192.0.2.10','student','Сохранённая SSH-сессия',1,'open','','run','{}','2026-11-20')")
+            receipt = self.write_dashboard_route(db, 1, '192.0.2.30', 'active')
+            self.write_dashboard_route(db, 2, '192.0.2.31', 'pending')
+            db.execute('CREATE TABLE evidence_snapshots(task_id INTEGER,evidence_sha256 TEXT,evidence_json TEXT,created_at TEXT)')
+            bundle = {'network_observations': [
+                {'kind': 'service_probe', 'data': {'port': 22, 'protocol': 'tcp', 'state': 'open', 'service_hint': 'ssh'}},
+                {'kind': 'service_probe', 'data': {'port': 443, 'protocol': 'tcp', 'state': 'open', 'service_hint': 'https'}},
+                {'kind': 'service_probe', 'data': {'port': 53, 'protocol': 'udp', 'state': 'open', 'service_hint': 'dns'}},
+            ], 'web_observations': [{'path': '/portal', 'status_code': 200, 'title': 'Портал лаборатории'}]}
+            db.execute("INSERT INTO evidence_snapshots VALUES (1,?,?,'t')", ('d' * 64, json.dumps(bundle)))
+            db.execute("UPDATE pm_coordinator_steps SET decision_json=? WHERE id=1", (
+                json.dumps({'role': 'recon', 'profile': 'recon', 'question': 'Прочитать сохранённую карту сервисов'}),
+            ))
+            self.write_dashboard_step(db, 2, 'vuln', 'web', 'running', 'Сопоставить сохранённые HTTP-ответы')
+            self.write_dashboard_step(db, 3, 'verify', 'http-audit', 'running', 'Проверить источник наблюдения')
+            self.write_dashboard_step(db, 4, 'access', 'ssh', 'completed', 'Проверка сессии')
+            http_client.initialize(db)
+            db.execute("INSERT INTO pm_http_exchanges VALUES "
+                       "(1,1,'web-session',NULL,'GET','https://192.0.2.10/portal?token=WEB_QUERY_SYNTH',"
+                       "'192.0.2.10','digest','operation','finished',NULL,'{}','2026-11-20T02:30:12Z')")
+        for number, role in enumerate(('recon', 'vuln', 'verify'), 1):
+            self.write_dashboard_event(number, 'coordinator.decision', role=role, step_id=number, coordinator_run_id=1)
+        for number in range(6, 16):
+            self.write_dashboard_event(number, 'tool.end', role='recon', name='pm_http_capture', status='completed')
+        self.write_dashboard_event(17, 'operator.question', reason='flag_confirmation', identifiers={'question_id': 1})
+        caps = self.storage / 'capability_log'
+        caps.mkdir()
+        (caps / 'task_1.jsonl').write_text(json.dumps({
+            'id': 'c' * 24, 'task_id': 1, 'tool': 'research', 'timestamp': '2026-11-20T02:30:15Z',
+            'actor_role': 'vuln', 'argv': ['curl', '-H', 'X-API-Key: DASH_HEADER_SYNTH',
+                                          'https://example.invalid/reference?token=DASH_QUERY_SYNTH'],
+            'result': {'status': 'completed', 'exit_code': 0, 'stdout': 'DASH_OUTPUT_SYNTH'},
+        }) + '\n', encoding='utf-8')
+        return receipt
+
+    def test_dashboard_updates_in_place_in_chromium(self):
+        from playwright.sync_api import expect, sync_playwright
+
+        receipt = self.seed_dashboard()
+        original = self.snapshot()
+        self.serve()
+        code, raw = self.get('/tasks/1/view.json')
+        self.assertEqual(code, 200)
+        data = json.loads(raw)
+        self.assertEqual(len(data['agents']['edges']), 3)
+        self.assertNotIn('step:4', {edge['to'] for edge in data['agents']['edges']})
+        self.assertIn('example.invalid/reference', raw)
+        self.assertIn('Вопрос оператору', raw)
+        self.assertIn('https://192.0.2.10/portal', raw)
+        secrets = ('DASH_HEADER_SYNTH', 'DASH_QUERY_SYNTH', 'WEB_QUERY_SYNTH', 'DASH_OUTPUT_SYNTH')
+        for secret in secrets:
+            self.assertNotIn(secret, raw)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', headless=True)
+            try:
+                tab = browser.new_page(viewport={'width': 1440, 'height': 1000})
+                tab.goto(self.url + 'tasks/1')
+                expect(tab.locator('[data-key="step:3"]')).to_be_visible()
+                expect(tab.locator('[data-key="step:4"]')).to_contain_text('Кто назначил — не записано')
+                expect(tab.locator('#agents .wire')).to_have_count(3)
+                self.assertEqual(tab.locator('.sky').evaluate('(node) => getComputedStyle(node).animationName'), 'orbit')
+                self.assertGreater(tab.locator('.workgrid').bounding_box()['width'], 1240)
+                expect(tab.locator('#questions li')).to_have_count(1)
+                self.assertEqual(original, self.snapshot())
+                step = tab.locator('[data-key="step:3"]')
+                step.evaluate('(node) => window.originalStep = node')
+                previous_position = step.bounding_box()
+                with closing(sqlite3.connect(self.database)) as db, db:
+                    self.write_dashboard_step(db, 5, 'recon', 'service-review', 'running', 'Сохранённый TCP-инвентарь')
+                assignment = {'role': 'recon', 'step_id': 5, 'coordinator_run_id': 1}
+                self.write_dashboard_event(20, 'coordinator.decision', **assignment)
+                self.write_dashboard_event(20, 'coordinator.decision', **assignment)
+                self.write_dashboard_event(21, 'tool.end', task_id=2, task_ids=[1, 2], reason='Чужая запись')
+                expect(tab.locator('[data-key="step:5"]')).to_be_visible()
+                self.assertTrue(step.evaluate('(node) => node === window.originalStep'))
+                self.assertEqual(step.bounding_box(), previous_position)
+                expect(tab.locator('#agents .wire')).to_have_count(4)
+                step.locator('button').click()
+                self.save_dashboard_screenshot(tab, '01-agents')
+
+                tab.get_by_role('link', name='Карта цели').click()
+                expect(tab.locator('.inventory')).to_contain_text('UDP/53')
+                expect(tab.locator('.inventory')).to_contain_text('/portal')
+                expect(tab.locator('#map .pending .wire')).to_have_count(1)
+                expect(tab.locator('#map .confirmed .wire')).to_have_count(2)
+                old_route = tab.locator('[data-key="pivot:1"]')
+                old_route.locator('button').click()
+                expect(tab.locator('#selection')).to_contain_text(receipt)
+                self.save_dashboard_screenshot(tab, '02-map')
+
+                tab.set_viewport_size({'width': 390, 'height': 850})
+                tab.emulate_media(reduced_motion='reduce')
+                self.assertEqual(tab.locator('.sky').evaluate('(node) => getComputedStyle(node).animationName'), 'none')
+                self.assertTrue(tab.locator('#map .pulse').first.is_hidden())
+                self.assertTrue(tab.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                map_scroll = tab.locator('#map .diagram-scroll')
+                map_scroll.evaluate('(node) => { node.scrollLeft = 210 }')
+                old_route.evaluate('(node) => window.originalRoute = node')
+                old_left = map_scroll.evaluate('(node) => node.scrollLeft')
+                self.assertGreater(old_left, 0)
+                with closing(sqlite3.connect(self.database)) as db, db:
+                    db.execute("UPDATE pm_pivot_routes SET state='unknown' WHERE id=1")
+                    self.write_dashboard_route(db, 3, '192.0.2.32', 'pending')
+                expect(tab.locator('[data-key="pivot:3"]')).to_be_visible()
+                expect(tab.locator('#selection')).to_contain_text('исход неизвестен')
+                self.assertTrue(old_route.evaluate('(node) => node === window.originalRoute'))
+                expect(old_route.locator('button')).to_have_attribute('aria-pressed', 'true')
+                self.assertEqual(map_scroll.evaluate('(node) => node.scrollLeft'), old_left)
+                old_route.locator('button').click()
+                expect(tab.locator('#selection')).to_contain_text(receipt)
+
+                tab.get_by_role('link', name='История', exact=True).click()
+                history = tab.locator('#history-entries')
+                first = history.locator('li').first
+                first.locator('summary').click()
+                expect(first.locator('details')).to_have_attribute('open', '')
+                history_scroll = tab.locator('#history-log')
+                history_scroll.evaluate('(node) => { node.scrollTop = 0 }')
+                connection = tab.locator('#connection')
+                tab.route('**/view.json', lambda route: route.abort())
+                expect(connection).to_contain_text('Источник временно недоступен')
+                self.write_dashboard_event(22, 'session.state', role='access', current_state='open')
+                tab.unroute('**/view.json')
+                expect(connection).to_have_text('Чтение сохранённых данных')
+                expect(history.get_by_text('Состояние сессии', exact=True)).to_have_count(1)
+                expect(history.get_by_text('Назначение координатора', exact=True)).to_have_count(4)
+                expect(history.get_by_text('Чужая запись', exact=True)).to_have_count(0)
+                expect(first.locator('details')).to_have_attribute('open', '')
+                self.assertEqual(history_scroll.evaluate('(node) => node.scrollTop'), 0)
+                external = history.locator('li').filter(has_text='Обращение за внешними данными')
+                external.locator('summary').click()
+                expect(external.locator('pre')).to_contain_text('https://example.invalid/reference')
+                for secret in secrets:
+                    self.assertNotIn(secret, tab.content())
+                tab.set_viewport_size({'width': 1440, 'height': 1000})
+                tab.emulate_media(reduced_motion='no-preference')
+                external.scroll_into_view_if_needed()
+                external.evaluate('(node) => node.scrollIntoView({block: "center"})')
+                tab.evaluate('window.scrollTo(0, 0)')
+                self.save_dashboard_screenshot(tab, '03-history')
+                final = self.snapshot()
+                tab.goto(self.url + 'tasks/2#history')
+                expect(tab.locator('#history-entries')).to_contain_text('Чужая запись')
+                expect(tab.locator('#history-entries')).not_to_contain_text('Назначение координатора')
+                self.assertEqual(final, self.snapshot())
+            finally:
+                browser.close()
+
+    def save_dashboard_screenshot(self, tab, name):
+        if destination := os.environ.get('PM_WEB_SCREENSHOTS'):
+            folder = Path(destination)
+            folder.mkdir(parents=True, exist_ok=True)
+            tab.screenshot(path=folder / f'{name}.png', animations='disabled')
 
     def test_browser_masks_secrets_before_escaping_and_sending_html(self):
         from playwright.sync_api import sync_playwright

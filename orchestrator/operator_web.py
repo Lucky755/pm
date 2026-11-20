@@ -4,12 +4,13 @@ from functools import partial
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 import re
 import sqlite3
 from urllib.parse import unquote, urlsplit
 
 from operator_errors import OperatorError
-from orchestrator import diagnostics, task_view
+from orchestrator import diagnostics, operator_web_data, task_view
 from orchestrator.method_library import Library
 
 
@@ -18,6 +19,9 @@ STATE_MESSAGES = {
     'empty': 'Сохранённых записей нет.',
     'error': 'Ошибка чтения сохранённых данных.',
 }
+ASSETS = Path(__file__).with_name('operator_web_assets')
+STATIC_TYPES = {'console.css': 'text/css; charset=utf-8',
+                'console.js': 'text/javascript; charset=utf-8', 'saturn.webp': 'image/webp'}
 STATE_LABELS = {
     'completed': 'завершён',
     'failed': 'ошибка',
@@ -48,11 +52,16 @@ def status(value):
     return text(STATE_LABELS.get(value, value) if isinstance(value, str) else value)
 
 
-def page(title, body):
-    return ('<!doctype html><html lang="ru"><meta charset="utf-8">'
+def page(title, body, *, task=False):
+    script = '<script src="/assets/console.js" defer></script>' if task else ''
+    return ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>{text(title)} | Pentest Master</title><body>'
-            '<nav><a href="/">Задачи</a> · Управление → <a href="/methods">Советы</a></nav>'
+            '<link rel="stylesheet" href="/assets/console.css">'
+            f'<title>{text(title)} | Pentest Master</title>{script}</head><body>'
+            '<div class="sky" aria-hidden="true"></div>'
+            '<header class="masthead"><a class="brand" href="/"><span class="brand-mark">PM</span>'
+            '<span>PENTEST MASTER</span></a><nav aria-label="Навигация PM">'
+            '<a href="/">Задачи</a><a href="/methods">Управление</a></nav></header>'
             f'<main><h1>{text(title)}</h1>{body}</main></body></html>')
 
 
@@ -113,13 +122,74 @@ def step_view(step):
                                   'decision_error': 'Ошибка чтения'})
 
 
+def questions_view(source):
+    message = STATE_MESSAGES.get(source['state'], '')
+    if source['state'] == 'empty':
+        message = 'Ожидающих вопросов нет.'
+    items = ''.join(
+        f'<li data-question="{text(q["id"])}"><span data-question-title>'
+        f'#{text(q["id"])} · {text(q["kind"])}</span>'
+        f'<p data-question-text>{text(q["question"])}</p>'
+        f'<p data-question-reason>{text(q.get("reason"))}</p>'
+        f'<p data-question-scope>{text(operator_web_data.question_scope(q))}</p></li>'
+        for q in source['data'] or [])
+    return ('<section id="questions" class="questions"><h2>Ожидающие вопросы</h2>'
+            f'<p id="questions-info"{"" if message else " hidden"}>{text(message)}</p>'
+            f'<ul id="question-rows">{items}</ul></section>')
+
+
+def workspace(task_id):
+    return f'''<div id="workspace" data-task="{task_id}">
+      <nav class="tabs" aria-label="Представления задачи">
+        <a href="#agents" aria-current="page">Агенты</a>
+        <a href="#map">Карта цели</a><a href="#history">История</a>
+      </nav>
+      <div class="workgrid">
+        <div class="views">
+          <section id="agents" class="panel view">
+            <header><h2>Импульсы</h2><p id="agent-info">Чтение сохранённых назначений…</p></header>
+            <div class="diagram-scroll" tabindex="0" aria-label="Схема назначений">
+              <div class="canvas agent-canvas"><div data-column="coordinator"></div>
+                <div data-column="specialists"></div></div>
+            </div>
+          </section>
+          <section id="map" class="panel view" hidden>
+            <header><h2>Маршрут</h2><div class="legend">
+              <span><i></i>Связь в карте</span><span><i class="pending"></i>Ожидает подтверждения</span>
+            </div></header>
+            <p id="map-info" hidden></p>
+            <div class="diagram-scroll" tabindex="0" aria-label="Карта маршрута">
+              <div class="canvas route-canvas"><div data-column="target"></div>
+                <div data-column="sessions"></div><div data-column="destinations"></div></div>
+            </div>
+          </section>
+          <section id="history" class="panel view" hidden>
+            <header><h2>История</h2><a id="history-latest" href="#history">К последней записи</a></header>
+            <div id="history-log" class="history-scroll" tabindex="0" aria-label="Журнал событий">
+              <ol id="history-entries"></ol>
+            </div>
+            <p id="history-info">История включает только сохранённые записи PM.</p>
+          </section>
+        </div>
+        <aside class="inspector panel">
+          <h2>Сведения</h2>
+          <p id="selection-hint">Выберите карточку или запись истории.</p>
+          <div id="selection"></div>
+          <section class="last-event"><h3>Событие</h3><a id="last-event" href="#history">Нет сохранённых событий</a></section>
+          <p id="connection" aria-live="polite">Чтение сохранённых данных…</p>
+        </aside>
+      </div>
+    </div>'''
+
+
 def task_page(data):
     task_id = data['id']
     outcome = data['outcome']['data']
-    body = (f'<p>Адрес · {text(data.get("target"))}</p>'
+    body = (f'<div class="overview"><p class="target-address">{text(data.get("target"))}</p>'
+            f'<p id="goal-outcome">{text(outcome["label"] if outcome else STATE_MESSAGES[data["outcome"]["state"]])}</p></div>'
+            + workspace(task_id) + '<div class="task-records">'
             f'<p>Статус в SQLite · {status(data.get("status"))}</p>'
-            f'<p>Закрытие задачи · {status(data["closure"])}</p>'
-            f'<p id="goal-outcome">{text(outcome["label"] if outcome else STATE_MESSAGES[data["outcome"]["state"]])}</p>')
+            f'<p>Закрытие задачи · {status(data["closure"])}</p>')
     if outcome and outcome.get('remaining_goals'):
         body += '<p>Есть цели, ожидающие подтверждения.</p>'
     if outcome and outcome.get('legacy_evidence_count') is not None:
@@ -152,10 +222,7 @@ def task_page(data):
         body += block('Режим задачи', data['runtime'], lambda value: details(
             value, {'mode': 'Режим', 'recon_status': 'Разведка', 'pause_reason': 'Причина паузы'}))
     body += '<p><a href="#questions">Ожидающие вопросы</a></p>'
-    body += '<div id="questions">' + block('Ожидающие вопросы', data['questions'], lambda rows: list_html(
-        f'#{text(q["id"])} · {text(q["kind"])} · {multiline(q["question"])}'
-        + details(q, {'reason': 'Причина', 'branch_id': 'Ветка', 'boundaries': 'Границы'}) for q in rows),
-        empty='Ожидающих вопросов нет.') + '</div>'
+    body += questions_view(data['questions'])
     body += block('Роли и шаги', data['steps'], lambda rows: list_html(step_view(step) for step in rows))
     if data['legacy_steps']['state'] != 'missing':
         body += block('Шаги прежнего планировщика', data['legacy_steps'], lambda rows: list_html(
@@ -170,7 +237,7 @@ def task_page(data):
         body += block(title, source, lambda rows: list_html(
             f'<a href="/tasks/{task_id}/reports/{text(row["reference"])}">{text(report_label(row))}</a>'
             f' · {text(row.get("created_at"))}' for row in rows))
-    return page(f'Задача #{task_id}', body)
+    return page(f'Задача #{task_id}', body + '</div>', task=True)
 
 
 def methods_page(library, ident=None, version=None):
@@ -261,27 +328,44 @@ class Handler(BaseHTTPRequestHandler):
                 return 500, page('Задача', '<p>Ошибка чтения базы задач.</p>')
         return 404, page('Не найдено', '<p>Страница или сохранённая запись не найдена.</p>')
 
+    def content(self, path):
+        if path.startswith('/assets/') and (name := path.removeprefix('/assets/')) in STATIC_TYPES:
+            return 200, STATIC_TYPES[name], (ASSETS / name).read_bytes()
+        match = re.fullmatch(r'/tasks/([1-9][0-9]{0,17})/view\.json', path)
+        if match:
+            try:
+                data = operator_web_data.load(self.database, int(match[1]))
+                code = 200 if data is not None else 404
+            except FileNotFoundError:
+                code, data = 404, None
+            except (OSError, sqlite3.Error):
+                code, data = 500, None
+            return code, 'application/json; charset=utf-8', json.dumps(data, ensure_ascii=False).encode('utf-8')
+        code, html = self.dispatch(path)
+        return code, 'text/html; charset=utf-8', html.encode('utf-8')
+
     def do_GET(self):
         host = f'127.0.0.1:{self.server.server_port}'
+        error = '<p>Откройте URL из терминала.</p>'
         if self.headers.get_all('Host') != [host]:
-            code, html = 400, page('Неверный адрес', '<p>Откройте URL из терминала.</p>')
+            code, kind, body = 400, 'text/html; charset=utf-8', page('Неверный адрес', error).encode('utf-8')
         else:
             try:
                 url = urlsplit(self.path)
                 if url.scheme or url.netloc:
                     raise ValueError('Absolute URL')
             except ValueError:
-                code, html = 400, page('Неверный адрес', '<p>Откройте URL из терминала.</p>')
+                code, kind, body = 400, 'text/html; charset=utf-8', page('Неверный адрес', error).encode('utf-8')
             else:
-                code, html = self.dispatch(unquote(url.path))
-        body = html.encode('utf-8')
+                code, kind, body = self.content(unquote(url.path))
         self.send_response(code)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
-        self.send_header('Content-Security-Policy', "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+        self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; "
+                         "img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
         self.end_headers()
         if self.command != 'HEAD':
             self.wfile.write(body)
