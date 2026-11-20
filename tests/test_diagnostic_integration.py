@@ -1,6 +1,6 @@
 """Offline integration regressions: real planner PTY, fake executor boundaries."""
 import base64
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -92,6 +92,74 @@ with patch.object(sys, 'argv', ['planner', '--target', '10.0.0.1', '--task', 'In
         self.assertEqual(plan['tasks'][0]['agent'], 'recon')
         self.assertIn("identifiers={'id': 11}", self.console.getvalue())
         self.assertNotIn('PM_PLANNER_RESULT_V1:', self.console.getvalue())
+
+    def test_planner_instruction_rejection_identifies_saved_reply_over_pty(self):
+        from orchestrator import coordinated_attack
+
+        script = """from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+from orchestrator import model_adapter, planner
+import sys
+
+root = Path(sys.argv[1])
+planner.DATABASE = root / 'tasks.db'
+planner.RAW_DIR = root / 'planner_raw'
+planner.diagnostics.EVENT_DIR = root / 'events'
+planner.getpass.getpass = lambda prompt: 'offline-key'
+adapter = MagicMock()
+adapter.__enter__.return_value = adapter
+adapter.start_session.return_value.run.return_value = SimpleNamespace(
+    final_response=sys.argv[2], finish_reason='completed')
+model_adapter.HarnessAdapter = lambda **kwargs: adapter
+sys.argv = ['planner', '--target', '10.0.0.1', '--task', 'Inspect']
+planner.main()
+"""
+        for name, fields, actual in (
+            ('missing', {}, 'ключ отсутствует'),
+            ('null', {'instruction': None}, 'null'),
+            ('array', {'instruction': ['PRIVATE_FIXTURE_PAYLOAD']}, 'массив (array)'),
+            ('valid', {'instruction': 'Inspect locally'}, None),
+        ):
+            with self.subTest(name=name):
+                root = self.root / name
+                payload = json.dumps({'target': TARGET, 'summary': 'PRIVATE_FIXTURE_PAYLOAD',
+                                      'tasks': [{'agent': 'recon', 'instruction': 'Local'} for _ in range(9)]
+                                      + [{'agent': 'verify', **fields}]})
+                child = [sys.executable, '-c', script, str(root), payload]
+                before = len(self.console.getvalue())
+                read = pm.read_planner_stream
+                with patch.object(pm, 'read_planner_stream', side_effect=lambda *a, **kw: read(child)) as calls:
+                    if actual:
+                        args = ['pm', 'new', '--target', TARGET, '--task', 'Inspect', '--coordinated']
+                        with (patch.object(sys, 'argv', args),
+                              patch.object(pm, 'session_api_key', return_value='offline-key'),
+                              patch.object(coordinated_attack, 'task_lock', side_effect=AssertionError('Task launch')),
+                              self.assertRaises(SystemExit) as failure):
+                            pm.main()
+                        self.assertEqual(failure.exception.code, 1)
+                    else:
+                        task_id, plan = pm.run_planner_with_validation_retry(TARGET, 'Inspect', 'offline-key')
+                        self.assertEqual(task_id, 1)
+                        self.assertEqual(plan['tasks'][9]['instruction'], fields['instruction'])
+                self.assertEqual(calls.call_count, 1)
+                saved = list((root / 'planner_raw').glob('plan-*.json'))
+                self.assertEqual(len(saved), 1)
+                self.assertEqual(json.loads(saved[0].read_text())['content'], payload)
+                output = self.console.getvalue()[before:]
+                self.assertNotIn('Traceback', output)
+                self.assertNotIn('PRIVATE_FIXTURE_PAYLOAD', output)
+                if actual:
+                    self.assertFalse((root / 'tasks.db').exists())
+                    message = next(line for line in output.splitlines() if '[ОШИБКА]' in line)
+                    for part in ('Пункт 10', 'tasks[9].instruction', 'строка (string)', actual,
+                                 str(saved[0]), 'Задача не создана'):
+                        self.assertIn(part, message)
+                else:
+                    with closing(sqlite3.connect(root / 'tasks.db')) as db:
+                        stored = db.execute('SELECT plan_json,status FROM tasks').fetchone()
+                    self.assertEqual(json.loads(stored[0]), plan)
+                    self.assertEqual(stored[1], 'pending_review')
 
     def test_mcp_failure_reasons_are_safe_and_visible(self):
         @d.tool

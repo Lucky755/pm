@@ -440,7 +440,7 @@ def read_planner_stream(process, api_key=None):
             if not data:
                 break
             text = data.decode('utf-8', errors='replace')
-            chunks.append(text)
+            chunks.append(data)
             pending += text
             while '\n' in pending:
                 part, pending = pending.split('\n', 1)
@@ -450,7 +450,7 @@ def read_planner_stream(process, api_key=None):
                 if part.lstrip().startswith(('[EVENT]', '[DIAG-ERROR]')):
                     line('  ' + safe_display(part))
                     continue
-                if part.startswith('PM_PLAN_VALIDATION_ERROR:'):
+                if part.startswith((planner_protocol.REJECTION_PREFIX, planner_protocol.VALIDATION_ERROR_PREFIX)):
                     continue
                 if part.lstrip().startswith('{'):
                     suppress = True
@@ -466,16 +466,21 @@ def read_planner_stream(process, api_key=None):
         if child.poll() is None:
             child.kill()
             child.wait()
-    raw = ''.join(chunks)
+    raw = b''.join(chunks).decode('utf-8', errors='replace').replace('\r', '')
     if return_code:
-        if re.search(r'(?m)^PM_PLAN_VALIDATION_ERROR:', raw.replace('\r', '')):
-            raise PlannerValidationError('Planner завершился с ошибкой; задачу не запускаем')
+        for part in raw.splitlines():
+            if part.startswith(planner_protocol.REJECTION_PREFIX):
+                reason = safe_display(part.removeprefix(planner_protocol.REJECTION_PREFIX).strip())
+                raise OperatorError(reason or 'План отклонён. Задача не создана.')
+            if part.startswith(planner_protocol.VALIDATION_ERROR_PREFIX):
+                reason = safe_display(part.removeprefix(planner_protocol.VALIDATION_ERROR_PREFIX).strip())
+                raise PlannerValidationError(f'План отклонён. {reason} Задача не создана.')
         raise OperatorError('Planner завершился с ошибкой; задачу не запускаем')
-    ids = re.findall(r'(?m)^Task ID:\s*(\d+)\s*$', raw.replace('\r', ''))
+    ids = re.findall(r'(?m)^Task ID:\s*(\d+)\s*$', raw)
     if len(ids) != 1:
         raise OperatorError('Planner не сообщил однозначный Task ID')
     try:
-        plan = planner_protocol.decode_result(raw.replace('\r', ''), int(ids[0]))
+        plan = planner_protocol.decode_result(raw, int(ids[0]))
     except ValueError as exc:
         raise OperatorError('Невозможно проверить план GLM; автоматический запуск запрещён') from exc
     return int(ids[0]), plan

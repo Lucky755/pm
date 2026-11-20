@@ -65,6 +65,10 @@ Return JSON only, without Markdown.
 RAW_DIR = ROOT / "storage" / "planner_raw"
 
 
+class RejectedPlan(ValueError):
+    """A locally rejected plan, with the location of its saved source."""
+
+
 def parse_json_response(content):
     """Parse the plan even when the model wraps it in prose.
 
@@ -123,6 +127,11 @@ def save_raw_plan(target, content, finish_reason):
 
 def request_plan(api_key, target, description, attempts=2, context=None):
     """Initial planning and at most one tool-disabled format recovery."""
+    plan, _ = _request_plan(api_key, target, description, attempts=attempts, context=context)
+    return plan
+
+
+def _request_plan(api_key, target, description, attempts=2, context=None):
     from orchestrator import model_adapter
     prompt=SYSTEM_PROMPT+'\n<pm_dynamic_context>\n'+json.dumps({'authorized_target':target,'operator_request':description,
         'prior_evidence_context':context or {}},ensure_ascii=False)
@@ -130,10 +139,10 @@ def request_plan(api_key, target, description, attempts=2, context=None):
         for attempt in range(min(2,max(1,attempts))):
             response=harness.start_session('planner-'+uuid.uuid4().hex).run(
                 prompt,recovery_attempt=attempt,diagnostic_reason='planner_format' if attempt else 'initial_plan')
-            save_raw_plan(target,response.final_response,response.finish_reason)
+            raw_path = save_raw_plan(target,response.final_response,response.finish_reason)
             try:
                 if response.finish_reason!='completed':raise ValueError('planner_model_not_completed')
-                return parse_json_response(response.final_response)
+                return parse_json_response(response.final_response), raw_path
             except ValueError as exc:
                 record=model_adapter.reject_response(response,'planner_json_invalid',attempt)
                 print('[FORMAT] Planner response rejected; raw='+record['raw_response_ref'],flush=True)
@@ -219,10 +228,19 @@ def validate_plan(plan, target, stale=()):
     allowed_agents = {"recon", "vuln", "access", "verify"}
 
     for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise ValueError(f"Пункт {index + 1}, поле tasks[{index}]: ожидался объект (object)")
         if task.get("agent") not in allowed_agents:
             raise ValueError(f"Invalid agent in task {index}")
         if not isinstance(task.get("instruction"), str):
-            raise ValueError(f"Invalid instruction in task {index}")
+            actual = 'ключ отсутствует'
+            if 'instruction' in task:
+                value = task['instruction']
+                actual = {type(None): 'null', list: 'массив (array)', dict: 'объект (object)',
+                          bool: 'логическое значение (boolean)', int: 'число (number)',
+                          float: 'число (number)'}.get(type(value), type(value).__name__)
+            raise ValueError(f"Пункт {index + 1}, поле tasks[{index}].instruction: "
+                             f"ожидалась строка (string), фактически: {actual}")
 
         dependencies = task.get("depends_on", [])
         if not isinstance(dependencies, list):
@@ -329,17 +347,26 @@ def plan_with_context(api_key, target, description, context=None, planner_call=N
         # shallow copy would rewrite the caller's own context as a side effect.
         context = scrub_addresses(deepcopy(context), inherited, target)
         description = scrub_addresses(description, inherited, target)
-    caller = planner_call or request_plan
-    plan = caller(api_key, target, description, context=context)
-    validate_plan(plan, target, inherited)
-    filter_closed_steps(plan, context)
+    def checked_plan(request_context):
+        if planner_call is None:
+            plan, raw_path = _request_plan(api_key, target, description, context=request_context)
+        else:
+            plan = planner_call(api_key, target, description, context=request_context)
+            raw_path = None
+        try:
+            validate_plan(plan, target, inherited)
+        except ValueError as exc:
+            source = f" Сохранённый ответ: {raw_path}." if raw_path is not None else ""
+            raise RejectedPlan(f"{exc}.{source} Задача не создана.") from exc
+        filter_closed_steps(plan, context)
+        return plan
+
+    plan = checked_plan(context)
     active = sum(task.get('status') != 'skipped' for task in plan['tasks'])
     if active < 3 and context.get('open'):
         second = dict(context)
         second['instruction'] = 'Предложи работу по ОТКРЫТО; закрытые активы не повторяй.'
-        retry = caller(api_key, target, description, context=second)
-        validate_plan(retry, target, inherited)
-        filter_closed_steps(retry, context)
+        retry = checked_plan(second)
         if sum(task.get('status') != 'skipped' for task in retry['tasks']) > active:
             plan = retry
     return plan
@@ -403,13 +430,17 @@ def main():
             raise SystemExit('Planner context must be an object')
 
     print("[1] Requesting plan from GLM...")
-    plan = plan_with_context(api_key, target, args.task, context)
+    try:
+        plan = plan_with_context(api_key, target, args.task, context)
+    except RejectedPlan as exc:
+        print(f"{planner_protocol.REJECTION_PREFIX} {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(2) from None
 
     print("[2] Validating plan...")
     try:
         validate_plan(plan, target)
     except ValueError as exc:
-        print(f"PM_PLAN_VALIDATION_ERROR: {exc}", file=sys.stderr, flush=True)
+        print(f"{planner_protocol.VALIDATION_ERROR_PREFIX} {exc}", file=sys.stderr, flush=True)
         raise SystemExit(2) from exc
 
     task_id = save_plan(target, args.task, plan)

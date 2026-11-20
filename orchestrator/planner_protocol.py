@@ -3,6 +3,8 @@ import base64
 import json
 
 RESULT_PREFIX = 'PM_PLANNER_RESULT_V1:'
+REJECTION_PREFIX = 'PM_PLAN_REJECTED:'
+VALIDATION_ERROR_PREFIX = 'PM_PLAN_VALIDATION_ERROR:'
 
 
 def encode_result(task_id, plan):
