@@ -315,7 +315,7 @@ def parse_decision(value, state, roles):
     if decision['action'] not in ('run_role','wait_operator','stop','await_specialists'):
         raise ValueError('decision_action')
     if decision['action']=='await_specialists' and not state.get('active_specialists'):raise ValueError('no_active_specialists')
-    for field, limit in (('question',1200),('reason',500),('expected_result',600)):
+    for field, limit in (('question',1200),('reason',4000),('expected_result',2000)):
         if not isinstance(decision[field], str) or not decision[field].strip() or len(decision[field]) > limit:
             raise DecisionRejected('decision_' + field, field=field, character_limit=limit)
         if diagnostics.clean(decision[field], limit=None) != decision[field]:
@@ -472,13 +472,13 @@ def decision_prompt(state, roles, previous, error=None, rejected=None, recovery_
             + encoded(data))
 
 
-def choose_with_model(prompt, api_key, max_tokens=3000):
+def choose_with_model(prompt, api_key, max_tokens=16384):
     from orchestrator.model_adapter import HarnessAdapter
     recovery_attempt=json.loads(prompt.rsplit('\n',1)[-1]).get('format_recovery',{}).get('attempt',0)
     with evidence.read_only_analysis_patch() as policy, HarnessAdapter(mode='analysis',
             profile='sdk-minimal', patches=(policy,), dsh_home=str(actions.DSH_HOME),
             cwd=str(actions.WORKSPACE), provider='experiential', model='glm-5.3-uncensored',
-            api_key=api_key, env=harness_env(), max_tokens=min(3000,max_tokens), request_timeout_seconds=120) as harness:
+            api_key=api_key, env=harness_env(), max_tokens=min(16384,max_tokens), request_timeout_seconds=1200) as harness:
         session = harness.start_session('coordinator-' + uuid.uuid4().hex)
         result = model_adapter.model_call(session, prompt, diagnostic_reason='coordinator_decision',
                                          recovery_attempt=recovery_attempt)

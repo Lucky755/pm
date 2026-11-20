@@ -135,7 +135,7 @@ def _request_plan(api_key, target, description, attempts=2, context=None):
     from orchestrator import model_adapter
     prompt=SYSTEM_PROMPT+'\n<pm_dynamic_context>\n'+json.dumps({'authorized_target':target,'operator_request':description,
         'prior_evidence_context':context or {}},ensure_ascii=False)
-    with model_adapter.HarnessAdapter(mode='analysis',api_key=api_key,max_tokens=8000) as harness:
+    with model_adapter.HarnessAdapter(mode='analysis',api_key=api_key,max_tokens=111111) as harness:
         for attempt in range(min(2,max(1,attempts))):
             response=harness.start_session('planner-'+uuid.uuid4().hex).run(
                 prompt,recovery_attempt=attempt,diagnostic_reason='planner_format' if attempt else 'initial_plan')

@@ -400,7 +400,7 @@ def run_agents(db, task_id, digest, bundle):
         provider='experiential',
         model='glm-5.3-uncensored',
         api_key=api_key,
-        max_tokens=2400,
+        max_tokens=111111,
         request_timeout_seconds=120,
     ) as harness:
         for stage in STAGES:

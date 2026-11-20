@@ -518,7 +518,7 @@ MANDATORY:
             provider=PROVIDER,
             model=MODEL,
             api_key=key,
-            max_tokens=2200,
+            max_tokens=111111,
             request_timeout_seconds=120,
         ) as harness:
 

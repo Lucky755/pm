@@ -67,11 +67,11 @@ CHARTERS = {role: instructions.role_text(role) for role in ROLES}
 # The report is written at the end of a long turn with the whole transcript in
 # context; 8000 tokens was hit mid-sentence and killed the turn. The profile
 # allows much more; truncated results are formatted in a tool-disabled session.
-DEFAULT_MAX_TOKENS = 24000
+DEFAULT_MAX_TOKENS = 111111
 # A single fresh attempt is allowed only if the first session made no tool call.
 NO_ACTION_RETRY_TOKENS = 32000
 # Hard ceiling for an explicitly configured stage limit.
-MAX_TOKENS_CEILING = 64000
+MAX_TOKENS_CEILING = 111111
 
 # Context-pressure threshold for the no-action retry. Executed turns are never
 # replayed to recover their report. Full outputs remain in the capability log.
@@ -2151,7 +2151,7 @@ def reformat_saved_report(db, context, role, iteration, key, max_tokens, prior_i
     with evidence.read_only_analysis_patch() as policy, HarnessAdapter(mode='analysis',
             profile='sdk-minimal',patches=(policy,),dsh_home=str(DSH_HOME),cwd=str(WORKSPACE),
             provider='experiential',model='glm-5.3-uncensored',api_key=key,env=harness_env(),
-            max_tokens=min(4096,max_tokens),request_timeout_seconds=120) as harness:
+            max_tokens=min(111111,max_tokens),request_timeout_seconds=120) as harness:
         response=model_adapter.model_call(harness.start_session('report-format-'+uuid.uuid4().hex),prompt,
                                         diagnostic_reason='saved_report_format')
         context['_format_usage']=response.metadata['statistics']

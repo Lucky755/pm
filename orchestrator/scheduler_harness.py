@@ -349,7 +349,7 @@ def run_task(db, task_id, api_key):
         with action_policy_patch() as policy, HarnessAdapter(mode='execute', patches=(policy,),
             profile="sdk-minimal", dsh_home=DSH_HOME, cwd=WORKSPACE,
             provider=PROVIDER, model=MODEL, api_key=api_key,
-            max_tokens=1800, request_timeout_seconds=120,
+            max_tokens=111111, request_timeout_seconds=120,
         ) as harness:
             for index, step in enumerate(plan["tasks"]):
                 runs = get_runs(db, task_id)

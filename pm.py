@@ -1298,7 +1298,7 @@ def validate_launch_options(args, mode, *, new=False):
     if getattr(args,'no_agents',False) or getattr(args,'no_decide',False) or getattr(args,'verbose',False):
         raise OperatorError('--no-agents, --no-decide и --verbose относятся к прежнему режиму')
     for name,default,lower,upper in (('coordinator_steps',15,1,32),('decision_retries',1,0,2),
-                                     ('poc_budget',15,1,15),('step_limit',25,1,25),('max_tokens',24000,1,64000),('max_specialists',2,1,10)):
+                                     ('poc_budget',15,1,15),('step_limit',25,1,25),('max_tokens',111111,1,111111),('max_specialists',2,1,10)):
         value=getattr(args,name,None)
         if value is not None and not lower <= value <= upper:
             raise OperatorError(f'{name}: {lower}..{upper}')
@@ -1491,7 +1491,7 @@ def run_task_coordinator(db, task_id, args):
             with progress:
                 result=coordinated_attack.run(task_id,roles=tuple(r.strip().lower() for r in option('roles','recon,vuln,access,verify').split(',')),
                     max_steps=option('coordinator_steps',15),decision_retries=option('decision_retries',1),max_specialists=option('max_specialists',2),
-                    poc_budget=option('poc_budget',15),step_limit=option('step_limit',25),max_tokens=option('max_tokens',24000),
+                    poc_budget=option('poc_budget',15),step_limit=option('step_limit',25),max_tokens=option('max_tokens',111111),
                     expect_flags=expect,key_provider=key,continue_run=getattr(args,'continue_coordinated',False),
                     abandon_running_step=getattr(args,'abandon_running_step',None))
         finally:live.close()

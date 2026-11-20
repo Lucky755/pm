@@ -703,7 +703,7 @@ def run_agents(db, task_id):
         provider=PROVIDER,
         model=MODEL,
         api_key=key,
-        max_tokens=1800,
+        max_tokens=111111,
         request_timeout_seconds=120,
     ) as harness:
 

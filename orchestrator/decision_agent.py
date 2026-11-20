@@ -202,7 +202,7 @@ def choose_with_model(bundle, candidates):
         profile='sdk-minimal', patches=(policy_patch,),
         dsh_home=str(evidence.DSH_HOME), cwd=str(evidence.WORKSPACE),
         provider='experiential', model='glm-5.3-uncensored',
-        api_key=key, max_tokens=700, request_timeout_seconds=120,
+        api_key=key, max_tokens=111111, request_timeout_seconds=120,
     ) as harness:
         previous_error = ''
         for attempt in range(2):

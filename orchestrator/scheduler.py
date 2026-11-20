@@ -135,7 +135,7 @@ def ask_agent(api_key, agent, instruction, evidence, target, *, memory_view=None
     ]
 
     from orchestrator.model_adapter import HarnessAdapter
-    with HarnessAdapter(mode='analysis',api_key=api_key,max_tokens=1500) as harness:
+    with HarnessAdapter(mode='analysis',api_key=api_key,max_tokens=111111) as harness:
         result=harness.run(json.dumps(messages,ensure_ascii=False))
     if result.finish_reason!='completed' or not result.final_response.strip():
         raise RuntimeError('Scheduler analysis failed; request_id='+result.metadata['request_id'])
