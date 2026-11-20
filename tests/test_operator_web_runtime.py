@@ -1,5 +1,6 @@
 """Generated project launcher, local HTTP and Chromium over guarded test data."""
 from contextlib import closing
+from html import escape
 import http.client
 import io
 import json
@@ -16,7 +17,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-from orchestrator import coordinated_attack, flag_review, method_library, objectives, operator_questions
+from orchestrator import coordinated_attack, flag_review, http_client, method_library, objectives, operator_questions
 from orchestrator import task_memory, task_view
 from tests.run_offline import ROOT, storage_guard
 
@@ -31,6 +32,19 @@ REPORT_CREDENTIAL_HEADERS = (
 )
 REPORT_HEADER_SECRETS = ('REPORT_API_TEXT_SYNTH', 'REPORT_PROXY_TEXT_SYNTH',
                          'REPORT_API_JSON_SYNTH', 'REPORT_PROXY_JSON_SYNTH')
+REPORT_SENSITIVE_PAIRS = (
+    ('x-aPi-kEy', 'PAIR_API_SYNTH'),
+    ('pRoXy-aUtHoRiZaTiOn', 'Basic PAIR_PROXY_SYNTH'),
+    ('X-API-Key', 'PAIR_API_REPEAT_SYNTH'),
+)
+REPORT_PAIR_SECRETS = tuple(value for _, value in REPORT_SENSITIVE_PAIRS)
+
+
+def header_pairs_summary(*, redacted=False, indent=None):
+    pairs = [(name, '[REDACTED]' if redacted else value) for name, value in REPORT_SENSITIVE_PAIRS]
+    headers = http_client.pairs([*pairs, ('X-Trace', 'Обычное значение & <b>метка</b>')])
+    fragment = json.dumps({'headers': headers}, ensure_ascii=False, indent=indent)
+    return f'Перед списком <script>\n{fragment}\nПосле списка'
 
 
 class WebRuntimeTests(unittest.TestCase):
@@ -463,20 +477,23 @@ class WebRuntimeTests(unittest.TestCase):
 
     def test_http_response_masks_report_credential_headers_without_browser(self):
         self.seed_waiting_task()
+        summary = f'{REPORT_CREDENTIAL_HEADERS}\n{header_pairs_summary()}'
         with closing(sqlite3.connect(self.database)) as db, db:
             db.execute('UPDATE pm_agent_action_reports SET report_json=?',
-                       (json.dumps({'summary': REPORT_CREDENTIAL_HEADERS}),))
+                       (json.dumps({'summary': summary}),))
         before = self.snapshot()
         self.serve()
         code, raw = self.get('/tasks/1/reports/verify-1')
         self.assertEqual(code, 200)
-        for secret in REPORT_HEADER_SECRETS:
+        for secret in (*REPORT_HEADER_SECRETS, *REPORT_PAIR_SECRETS):
             with self.subTest(secret=secret):
                 self.assertNotIn(secret, raw)
         self.assertIn('Начало заголовков &lt;script&gt;\nx-ApI-kEy: [REDACTED]\n'
                       'pRoXy-AuThOrIzAtIoN: [REDACTED]\n', raw)
         self.assertIn('Соседний заголовок', raw)
         self.assertIn('\nКонец заголовков', raw)
+        self.assertIn(escape(header_pairs_summary(redacted=True)), raw)
+        self.assertEqual(self.get('/tasks/1/reports/verify-1'), (200, raw))
         self.assertEqual(before, self.snapshot())
 
     def test_browser_masks_secrets_before_escaping_and_sending_html(self):
@@ -486,7 +503,7 @@ class WebRuntimeTests(unittest.TestCase):
         self.seed_task(2)
         report = {
             'summary': 'Обычный текст отчёта <script>\nAuthorization: Bearer REPORT_AUTH_SYNTH\n'
-                       f'{REPORT_CREDENTIAL_HEADERS}\nКонец отчёта',
+                       f'{REPORT_CREDENTIAL_HEADERS}\n{header_pairs_summary(indent=2)}\nКонец отчёта',
             'report_warning': 'Cookie: a=WARNING_COOKIE_SYNTH; b=SECOND_COOKIE_SYNTH\nОбычное предупреждение',
             'report_quality': {'reason': 'Причина отчёта token="QUALITY TOKEN SYNTH" далее'},
         }
@@ -503,14 +520,15 @@ class WebRuntimeTests(unittest.TestCase):
         self.serve()
         secrets = ('REPORT_AUTH_SYNTH', 'WARNING_COOKIE_SYNTH', 'SECOND_COOKIE_SYNTH', 'QUALITY TOKEN SYNTH',
                    'INTENT_COOKIE_SYNTH', 'DESCRIPTION_PASS_SYNTH', 'STEP_TOKEN_SYNTH',
-                   'QUESTION_PASS_SYNTH', 'REASON_AUTH_SYNTH', *REPORT_HEADER_SECRETS)
+                   'QUESTION_PASS_SYNTH', 'REASON_AUTH_SYNTH', *REPORT_HEADER_SECRETS, *REPORT_PAIR_SECRETS)
         pages = {
             '/tasks/1': ('Задание\n', 'Ограничение остаётся', 'Поручение', 'далее', 'page=2', 'Пояснение остаётся'),
             '/tasks/2': ('Описание', 'далее'),
             '/tasks/1/reports/verify-1': ('Обычный текст отчёта', 'Конец отчёта', '[REDACTED]\nОбычное предупреждение',
                                           'Причина отчёта', 'далее', 'Соседний заголовок',
                                           'Начало заголовков <script>\nx-ApI-kEy: [REDACTED]\n'
-                                          'pRoXy-AuThOrIzAtIoN: [REDACTED]\n'),
+                                          'pRoXy-AuThOrIzAtIoN: [REDACTED]\n',
+                                          header_pairs_summary(redacted=True, indent=2)),
         }
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', headless=True)
@@ -525,14 +543,15 @@ class WebRuntimeTests(unittest.TestCase):
                         visible = tab.locator('main').inner_text()
                         for secret in secrets:
                             with self.subTest(secret=secret):
-                                self.assertNotIn(secret, raw)
                                 self.assertNotIn(secret, html)
                                 self.assertNotIn(secret, visible)
+                                self.assertNotIn(secret, raw)
                         for fragment in ordinary:
                             self.assertIn(fragment, visible)
                         self.assertIn('[REDACTED]', visible)
                 self.assertIn('&lt;script&gt;', raw)
                 self.assertEqual(tab.locator('script').count(), 0)
+                self.assertEqual(tab.locator('pre b').count(), 0)
             finally:
                 browser.close()
         self.assertEqual(before, self.snapshot())

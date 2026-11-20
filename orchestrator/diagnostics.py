@@ -46,7 +46,8 @@ def register_secret(value):
         _secrets.add(value)
 
 
-_QUOTED_VALUE = r'"(?:\\.|[^"\\\r\n])*"' r"|'(?:\\.|[^'\\\r\n])*'"
+_DOUBLE_QUOTED_VALUE = r'"(?:\\.|[^"\\\r\n])*"'
+_QUOTED_VALUE = _DOUBLE_QUOTED_VALUE + r"|'(?:\\.|[^'\\\r\n])*'"
 _SECRET_FIELD = r'api[_-]?key|password|passwd|(?:client[_-]?)?secret|(?:(?:access|refresh|id)[_-]?)?token|session[_-]?id'
 _HEADER_FIELD = r'(?:proxy-)?authorization|x-api-key|set-cookie|cookie'
 
@@ -59,6 +60,10 @@ def _sensitive_assignment(keys, unquoted):
 
 
 _SENSITIVE_HEADER = _sensitive_assignment(_HEADER_FIELD, r'[^\r\n]+')
+_SENSITIVE_HEADER_PAIR = re.compile(
+    rf'(\[\s*"(?:{_HEADER_FIELD})"\s*,\s*){_DOUBLE_QUOTED_VALUE}(?=\s*\])',
+    re.IGNORECASE,
+)
 _SENSITIVE_FIELD = _sensitive_assignment(_SECRET_FIELD, r'''[^\s,;&"'<>]+''')
 _SENSITIVE_OPTION = re.compile(
     rf'(?i)(--(?:{_SECRET_FIELD}|cookie)(?:=|[ \t]+))(?:{_QUOTED_VALUE}|[^\s]+)'
@@ -73,6 +78,7 @@ def clean(value, limit=500, *, preserve_lines=False):
     text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     text = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]', ' ', text)
+    text = _SENSITIVE_HEADER_PAIR.sub(r'\1"[REDACTED]"', text)
     text = _SENSITIVE_HEADER.sub(r'\1[REDACTED]', text)
     text = _SENSITIVE_FIELD.sub(r'\1[REDACTED]', text)
     text = re.sub(r'(https?://)[^/@\s]+:[^/@\s]+@', r'\1[REDACTED]@', text)
