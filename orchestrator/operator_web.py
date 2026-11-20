@@ -187,6 +187,31 @@ def workspace(task_id):
     </div>'''
 
 
+def task_context_view(description, source):
+    body = ''
+    if description:
+        body += ('<section><h2>Сохранённое описание планировщика</h2>'
+                 f'<pre>{text(description)}</pre></section>')
+    data = source['data'] or {}
+    original = data.get('original')
+    if source['state'] == 'error':
+        original_view = '<p>Историю задания не удалось прочитать.</p>'
+    else:
+        original_view = f'<pre>{text(original)}</pre>' if original else '<p>Исходное задание неизвестно.</p>'
+    body += '<section id="operator-intent"><h2>Исходное задание и ограничения оператора</h2>' + original_view + '</section>'
+    for key, title, identity in (('clarifications', 'Уточнения оператора', 'saved-intent'),
+                                 ('revisions', 'Другие редакции задания', 'intent-revisions')):
+        entries = data.get(key) or []
+        if entries:
+            body += f'<section id="{identity}"><h2>{title}</h2>' + list_html(
+                f'<p>{text(row["source"])} · {text(row["created_at"])}</p><pre>{text(row["text"])}</pre>'
+                for row in entries) + '</section>'
+    if data.get('unlinked'):
+        body += ('<section><h2>Сохранённый текст без привязки к истории</h2>'
+                 f'<pre>{text(data["unlinked"])}</pre></section>')
+    return body
+
+
 def task_page(data):
     task_id = data['id']
     outcome = data['outcome']['data']
@@ -199,9 +224,7 @@ def task_page(data):
         body += '<p>Есть цели, ожидающие подтверждения.</p>'
     if outcome and outcome.get('legacy_evidence_count') is not None:
         body += f'<p>Флагов со свидетельствами в прежнем реестре · {text(outcome["legacy_evidence_count"])}</p>'
-    if data['intent']['state'] in ('empty', 'missing') and data.get('description'):
-        body += '<h2>Сохранённое описание планировщика</h2><pre>' + text(data['description']) + '</pre>'
-    body += block('Исходное задание и ограничения оператора', data['intent'], lambda value: f'<pre>{text(value)}</pre>')
+    body += task_context_view(data.get('description'), data['intent_provenance'])
     body += block('Цели', data['goals'], lambda goals: list_html(
         f'{text(goal.get("title"))} · {status(goal.get("status"))}' for goal in goals))
     body += block('Область задачи', data['scope'], lambda value: details(value, {

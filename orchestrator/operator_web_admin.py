@@ -9,7 +9,7 @@ import sqlite3
 from operator_errors import OperatorError
 from orchestrator import diagnostics, flag_review, flag_verify, http_artifacts, method_library
 from orchestrator import objectives, operator_context, operator_questions, resources, task_memory, task_view
-from orchestrator.operator_web import details, list_html, page, status, text
+from orchestrator.operator_web import details, list_html, page, status, task_context_view, text
 
 TASK_ROUTES = re.compile(r'/management/tasks/([1-9][0-9]{0,17})/(context|questions|flags|report)(?:/([1-9][0-9]{0,17}))?')
 METHOD_ROUTES = re.compile(r'/management/methods/(?:(new)|(method:[a-f0-9]{24})/(edit|withdraw))')
@@ -115,8 +115,8 @@ def public_form_values(values):
 def read_task(db, task_id):
     if not task_memory.exists(db, 'tasks'):
         return None
-    row = db.execute('SELECT id,target,status FROM tasks WHERE id=?', (task_id,)).fetchone()
-    return dict(row) if row is not None else None
+    row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+    return task_view.fields(dict(row), 'id', 'target', 'status', 'description') if row is not None else None
 
 
 def require_task(db, task_id):
@@ -369,12 +369,13 @@ class Admin:
         saved = resources.saved(db, task_id)
         row = task_view.one_row(db, 'pm_task_hostnames', task_id)
         hosts = json.loads(row['hostnames_json']) if row.get('hostnames_json') else []
+        provenance = task_view.section(lambda: operator_context.intent_provenance(db, task_id))
         body = (f'<p>Задача #{task_id} · {text(task["target"])}</p>'
                 '<p>Сохранение добавит уточнение в историю задания. Настройки области и привязки имён остаются прежними.</p>'
                 '<h2>Применённые привязки из PM</h2>'
                 + details({'hosts': hosts or 'Нет записи', 'entry': saved['entry'].get('input') if saved else 'Нет записи'},
                           {'hosts': 'Имена NetGuard', 'entry': 'Сохранённый входной ресурс'})
-                + '<h2>Сохранённое задание и уточнения</h2>' + f'<pre id="saved-intent">{text(intent)}</pre>')
+                + task_context_view(task.get('description'), provenance))
         form = (field('note', 'Уточнение оператора', values, multiline=True)
                 + field('domains', 'Имена по сообщению оператора', values,
                         hint='Ввод добавляется в уточнение и не создаёт привязку.')
@@ -395,8 +396,8 @@ class Admin:
                 raise FormError('Введите уточнение или известное имя.')
             if domains:
                 note += ('\n' if note else '') + 'Имена по сообщению оператора: ' + ', '.join(domains)
-            updated = (intent + '\n\n' if intent else '') + 'Уточнение оператора:\n' + note
-            operator_context.restore_task_intent(db, task['id'], updated, 'PM Web · уточнение')
+            updated = operator_context.clarification_prefix(intent) + note
+            operator_context.restore_task_intent(db, task['id'], updated, operator_context.WEB_CLARIFICATION_SOURCE)
         except (ValueError, OperatorError) as exc:
             return 422, self.context_page(db, task, token, values, str(exc))
         return 303, f'/management/tasks/{task["id"]}/context'

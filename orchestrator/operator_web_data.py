@@ -89,6 +89,26 @@ def safe_url(value):
         return '[REDACTED]'
 
 
+def http_address(item):
+    scheme = clean(item.get('scheme')).lower()
+    scheme = scheme if scheme in ('http', 'https') else ''
+    # Hostnames are normally bare names. Drop any stored userinfo before
+    # formatting a host, including legacy rows with credentials in that field.
+    hostname = item.get('hostname')
+    host = hostname.rsplit('@', 1)[-1] if isinstance(hostname, str) else ''
+    port = item.get('port')
+    port = str(port) if task_view.valid_port(port) else ''
+    path = item.get('path')
+    path = path if isinstance(path, str) else ''
+    if not host:
+        return ' · '.join(filter(None, (scheme, f'порт {port}' if port else '', safe_url(path))))
+    if ':' in host and not host.startswith('['):
+        host = f'[{host}]'
+    authority = f'{host}:{port}' if port else host
+    address = safe_url(urlunsplit((scheme, authority, path, '', '')))
+    return address.removeprefix('//') if not scheme else address
+
+
 # Retain only known displayable arguments. Opaque shell, bodies, credentials and
 # unclassified positional values remain in the original log, outside this API.
 PUBLIC_OPTIONS = {'--task-id', '--target', '--profile', '--port', '--ports', '--scheme', '--path',
@@ -234,12 +254,18 @@ def event_view(event):
                            details, command_argv(event.get('argv') or event.get('command')))
 
 
-def capability_events(path, task_id, problems):
+def capability_events(path, task_id, problems, exchange_roles):
     for row in json_lines(path, problems):
         if row.get('task_id') != task_id or not re.fullmatch(r'[a-f0-9]{24}', str(row.get('id'))):
             continue
         result = row.get('result')
         result = result if isinstance(result, dict) else {}
+        role = row.get('actor_role')
+        exchange_id = result.get('exchange_id')
+        if (row.get('tool') == 'http_capture' and isinstance(role, str) and role.strip()
+                and type(exchange_id) is int and result.get('task_id', task_id) == task_id
+                and not result.get('cached') and result.get('execution_started') is not False):
+            exchange_roles.setdefault(exchange_id, set()).add(role)
         status = label_status(result.get('status'))
         code = result.get('exit_code')
         if type(code) is int:
@@ -319,18 +345,20 @@ def target_map(db, task_id, data):
         if address:
             inventory.append({'id': 'origin:' + clean(address), 'label': 'Приложение', 'value': safe_url(address)})
     for item in snapshot.get('web', []):
-        if item.get('path'):
-            identity = task_memory.digest([item.get(key) for key in ('hostname', 'port', 'path')])
+        address = http_address(item)
+        if address:
+            identity = task_memory.digest([item.get(key) for key in ('scheme', 'hostname', 'port', 'path')])
             inventory.append({'id': f'snapshot:app:{identity}', 'label': f"HTTP {clean(item.get('status_code'))}".strip(),
-                              'value': ' · '.join(filter(None, (safe_url(item['path']), clean(item.get('title')))))})
+                              'value': ' · '.join(filter(None, (address, clean(item.get('title')))))})
     for row in task_memory.rows(db, 'pm_http_artifacts', task_id, target=target):
-        if row.get('target') != target or not row.get('path'):
+        if row.get('target') != target:
             continue
-        path = safe_url(row['path'])
-        host = clean(row.get('hostname'))
+        address = http_address(row)
+        if not address:
+            continue
         identity = task_memory.digest([row.get(key) for key in ('scheme', 'hostname', 'port', 'path')])
         inventory.append({'id': f'http:app:{identity}', 'label': f"HTTP {clean(row.get('status_code'))}".strip(),
-                          'value': host + path})
+                          'value': address})
     nodes = [{'id': target_key, 'column': 'target', 'title': clean(target), 'note': 'Цель задачи',
               'status': label_status((data['availability']['data'] or {}).get('state')),
               'details': {'Источник': 'Задача, сохранённые наблюдения и область исследования'}}]
@@ -403,15 +431,19 @@ def load(database, task_id):
     events, damaged = diagnostic_events(database.parent / 'run_events', task_id)
     history = [event_view(e) for e in events]
     capability_problems = []
+    exchange_roles = {}
     capabilities = task_view.section(lambda: list(capability_events(
-        database.parent / 'capability_log' / f'task_{task_id}.jsonl', task_id, capability_problems)))
+        database.parent / 'capability_log' / f'task_{task_id}.jsonl', task_id, capability_problems, exchange_roles)))
     history.extend(capabilities['data'] or [])
     saved_answers = answers['data'] or {}
     history.extend(saved_answers.get('rows', []))
     for row in exchanges['data'] or []:
-        history.append(timeline_record(f"http:{row['id']}", row.get('created_at'), row.get('session_id'),
+        roles = exchange_roles.get(row['id'], set())
+        actor = next(iter(roles)) if len(roles) == 1 else None
+        history.append(timeline_record(f"http:{row['id']}", row.get('created_at'), actor,
                                        'Запись HTTP-запроса', label_status(row.get('phase')), 'SQLite · HTTP',
-                                       'http.exchange', {'Обмен': row['id'], 'Артефакт': row.get('artifact_id')},
+                                       'http.exchange', {'Обмен': row['id'], 'Сессия': row.get('session_id'),
+                                                         'Артефакт': row.get('artifact_id')},
                                        f"{clean(row.get('method'))} {safe_url(row.get('url') or '')}".strip()))
     unique = {event['id']: event for event in history if event is not None}
     return {'task': task_id, 'agents': agents(data, events),

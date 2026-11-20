@@ -234,8 +234,10 @@ function createHistoryItem() {
 
 function selectHistoryItem(item) {
     const row = item.row;
+    const details = { "Исполнитель": row.actor };
+    if (row.details["Сессия"]) details["Сессия"] = row.details["Сессия"];
     selections.set("history", { id: row.id, title: row.action,
-        details: { "Исполнитель": row.actor, "Результат": row.result, "Источник": row.source } });
+        details: { ...details, "Результат": row.result, "Источник": row.source } });
     updateSelection();
 }
 
@@ -255,7 +257,8 @@ function patchHistory(rows) {
         const parts = item.parts;
         parts.time.dateTime = row.date;
         write(parts.time, dateFormat.format(new Date(row.date)));
-        write(parts.actor, row.actor);
+        write(parts.actor, row.kind === "http.exchange" && row.actor === "Не записан" ?
+            "Исполнитель не записан" : row.actor);
         write(parts.origin, row.source);
         write(parts.action, row.action);
         write(parts.outcome, row.result);

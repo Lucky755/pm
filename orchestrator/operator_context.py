@@ -7,6 +7,7 @@ from operator_errors import OperatorError
 from orchestrator import task_memory
 
 MAX_HOSTNAMES = 12
+WEB_CLARIFICATION_SOURCE = 'PM Web · уточнение'
 
 
 def validate_hostnames(raw):
@@ -62,6 +63,31 @@ def previous_task_intent(db, task_id):
         return None
     row = db.execute('SELECT intent FROM pm_task_intents WHERE task_id=?', (task_id,)).fetchone()
     return row[0] if row else None
+
+
+def clarification_prefix(previous):
+    return (previous + '\n\n' if previous else '') + 'Уточнение оператора:\n'
+
+
+def intent_provenance(db, task_id):
+    """Project original text and revisions without rewriting the effective intent."""
+    current = previous_task_intent(db, task_id)
+    history = []
+    if task_memory.exists(db, 'pm_task_intent_history'):
+        history = db.execute('SELECT previous_intent,intent,source,created_at FROM pm_task_intent_history '
+                             'WHERE task_id=? ORDER BY id', (task_id,)).fetchall()
+    original = history[0][0] if history else current
+    clarifications = []
+    revisions = []
+    for previous, saved, source, stamp in history:
+        entry = {'text': saved, 'source': source, 'created_at': stamp}
+        prefix = clarification_prefix(previous)
+        if source == WEB_CLARIFICATION_SOURCE and saved.startswith(prefix) and len(saved) > len(prefix):
+            clarifications.append({**entry, 'text': saved[len(prefix):]})
+        else:
+            revisions.append(entry)
+    return {'original': original, 'clarifications': clarifications, 'revisions': revisions,
+            'unlinked': current if history and current != history[-1][1] else None}
 
 
 def restore_task_intent(db, task_id, text, source):

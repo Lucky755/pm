@@ -234,7 +234,7 @@ def snapshot_findings(bundle):
             observation = fields(item, 'status_line', 'status_code', 'path', 'title')
             if observation:
                 http_headers.append(observation)
-    web = [fields(item, 'hostname', 'port', 'path', 'status_code', 'title')
+    web = [fields(item, 'scheme', 'hostname', 'port', 'path', 'status_code', 'title')
            for item in bundle.get('web_observations') or [] if isinstance(item, dict)]
     findings = {protocol: [{'port': port, 'service': service} for port, service in sorted(ports.items())]
                 for protocol, ports in services.items()}
@@ -361,6 +361,9 @@ def load_task(path, task_id, *, for_cli=False):
             data = task(db, task_id) if task_memory.exists(db, 'tasks') else None
             if data and for_cli:
                 data.update(cli_metadata(db, task_id, data))
+            elif data:
+                from orchestrator import operator_context
+                data['intent_provenance'] = section(lambda: operator_context.intent_provenance(db, task_id))
     except FileNotFoundError:
         return None
     if data is not None:

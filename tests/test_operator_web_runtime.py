@@ -21,7 +21,7 @@ from urllib.parse import urlencode, urlsplit
 from executor import task_scope
 from executor.netguard_root import tool_digest
 from orchestrator import coordinated_attack, flag_review, http_client, method_library, objectives, operator_questions
-from orchestrator import http_artifacts, pivoting, resources, task_memory, task_view
+from orchestrator import http_artifacts, operator_context, pivoting, resources, task_memory, task_view
 from tests.run_offline import ROOT, storage_guard
 
 
@@ -179,6 +179,59 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(self.get('/')[0], 500)
         self.assertEqual(self.get('/tasks/1')[0], 500)
         self.assertEqual(self.database.read_bytes(), corrupted)
+
+    def test_context_pages_preserve_planner_original_and_saved_clarifications(self):
+        for task_id in (1, 2, 3):
+            self.seed_task(task_id)
+        operator_path = '/management/tasks/1/context'
+        stop = self.serve()
+
+        def check_views(task_id, original, additions):
+            before = self.snapshot()
+            for path in (f'/tasks/{task_id}', f'/management/tasks/{task_id}/context'):
+                with self.subTest(path=path, additions=additions):
+                    code, body = self.get(path)
+                    self.assertEqual(code, 200)
+                    self.assertIn('Сохранённое описание планировщика', body)
+                    self.assertIn('Сохранённое описание</pre>', body)
+                    self.assertIn(f'<pre>{original}</pre>' if original else 'Исходное задание неизвестно.', body)
+                    for addition in additions:
+                        self.assertIn(f'<pre>{addition}</pre>', body)
+            self.assertEqual(before, self.snapshot())
+
+        check_views(1, None, [])
+        for note in ('Добавить дату отчёта', 'Сверить исходный журнал'):
+            code, body = self.get(operator_path)
+            self.assertEqual(code, 200)
+            params = {name: re.search(rf'name="{name}" value="([a-f0-9]+)"', body)[1]
+                      for name in ('csrf', 'revision')}
+            params.update(action='save', note=note)
+            self.assertEqual(self.get(operator_path, method='POST', body=urlencode(params), headers={
+                'Origin': self.url.rstrip('/'), 'Content-Type': 'application/x-www-form-urlencoded',
+            })[0], 303)
+            if note.startswith('Добавить'):
+                check_views(1, None, [note])
+        with closing(sqlite3.connect(self.database)) as db:
+            # The base revision wrote a combined intent with this provenance.
+            operator_context.restore_task_intent(db, 3, 'Уточнение оператора:\nСохранено прежним Web', 'PM Web · уточнение')
+            with db:
+                db.execute("INSERT INTO pm_task_intents VALUES (2,'Исходный текст оператора','t')")
+            self.assertEqual([row[0] for row in db.execute(
+                'SELECT previous_intent FROM pm_task_intent_history WHERE task_id=1 ORDER BY id')],
+                [None, 'Уточнение оператора:\nДобавить дату отчёта'])
+            operator_context.restore_task_intent(db, 2,
+                'Исходный текст оператора\n\nУточнение оператора:\nОтделить наблюдения', 'PM Web · уточнение')
+            operator_context.restore_task_intent(db, 3,
+                'Уточнение оператора:\nТекст из другого источника', 'Восстановление через CLI')
+        stop()
+        self.serve()
+        check_views(1, None, ['Добавить дату отчёта', 'Сверить исходный журнал'])
+        check_views(2, 'Исходный текст оператора', ['Отделить наблюдения'])
+        check_views(3, None, ['Сохранено прежним Web'])
+        for path in ('/tasks/3', '/management/tasks/3/context'):
+            body = self.get(path)[1]
+            self.assertIn('Другие редакции задания', body)
+            self.assertIn('<pre>Уточнение оператора:\nТекст из другого источника</pre>', body)
 
     def test_wal_db_is_not_opened_when_sqlite_could_create_sidecars(self):
         self.seed_task()
@@ -467,7 +520,7 @@ class WebRuntimeTests(unittest.TestCase):
                 self.assertIn('Вызов PM · завершён', task.locator('main').inner_text())
                 self.assertIn('Координатор · ожидает оператора', task.locator('main').inner_text())
                 self.assertIn('Закрытие задачи · неизвестно', task.locator('main').inner_text())
-                self.assertIn('Без брутфорса <script>', task.locator('.task-records pre').inner_text())
+                self.assertIn('Без брутфорса <script>', task.locator('#operator-intent pre').inner_text())
                 self.assertEqual(task.locator('script:not([src])').count(), 0)
                 self.assertEqual(task.locator('script[src="/assets/console.js"]').count(), 1)
                 self.assertEqual(other.locator('#questions li').count(), 1)
@@ -572,6 +625,94 @@ class WebRuntimeTests(unittest.TestCase):
             'result': {'status': 'completed', 'exit_code': 0, 'stdout': 'DASH_OUTPUT_SYNTH'},
         }) + '\n', encoding='utf-8')
         return receipt
+
+    def test_http_map_addresses_and_exchange_actors_in_chromium(self):
+        from playwright.sync_api import expect, sync_playwright
+
+        self.seed_dashboard()
+        with closing(sqlite3.connect(self.database)) as db, db:
+            captures = [
+                ('http', 'docs.test', 8080, '/status?token=HTTP_MAP_QUERY_SYNTH'),
+                ('https', 'docs.test', 8443, '/status'),
+                ('https', 'fd12:3456::9', 9443, '/status'),
+                ('https', 'user:HTTP_MAP_AUTH_SYNTH@masked.test', 8443, '/status'),
+            ]
+            db.executemany('INSERT INTO pm_http_artifacts(task_id,target,scheme,hostname,port,path,status_code,'
+                           'sha256,bytes_saved,complete,metadata_json,created_at) '
+                           "VALUES(1,'192.0.2.10',?,?,?,?,200,'digest',0,1,'{}','t')", captures)
+            bundle = {'web_observations': [
+                {'hostname': 'legacy.test', 'path': '/old', 'status_code': 200},
+                {'scheme': 'https', 'hostname': 'snapshot.test', 'port': 7443, 'path': '/app', 'status_code': 200},
+            ]}
+            db.execute('UPDATE evidence_snapshots SET evidence_json=?', (json.dumps(bundle),))
+            db.execute("INSERT INTO pm_http_exchanges VALUES "
+                       "(2,1,'audit token=HISTORY_SESSION_SYNTH',NULL,'GET','https://docs.test:8443/status',"
+                       "'192.0.2.10','digest','second-operation','finished',2,'{}','2026-11-20T02:30:16Z')")
+        with (self.storage / 'capability_log' / 'task_1.jsonl').open('a', encoding='utf-8') as stream:
+            for ident, exchange, cached in (('d' * 24, 2, False), ('e' * 24, 1, True)):
+                stream.write(json.dumps({'id': ident, 'task_id': 1, 'tool': 'http_capture', 'actor_role': 'verify',
+                                         'timestamp': '2026-11-20T02:30:16Z',
+                                         'result': {'exchange_id': exchange, 'cached': cached, 'status': 'completed'}}
+                                        ) + '\n')
+        before = self.snapshot()
+        self.serve()
+        code, raw = self.get('/tasks/1/view.json')
+        self.assertEqual(code, 200)
+        data = json.loads(raw)
+        values = {item['value'] for item in data['map']['inventory']}
+        addresses = ('http://docs.test:8080/status?[REDACTED]', 'https://docs.test:8443/status',
+                     'https://[fd12:3456::9]:9443/status', 'legacy.test/old', 'https://snapshot.test:7443/app')
+        with self.subTest(projection='map'):
+            self.assertTrue(set(addresses) <= values, values)
+        history = {item['id']: item for item in data['history']}
+        with self.subTest(projection='history'):
+            self.assertEqual(history['http:1']['actor'], 'Не записан')
+            self.assertEqual(history['http:1']['details']['Сессия'], 'web-session')
+            self.assertEqual(history['http:2']['actor'], 'VERIFY')
+            self.assertEqual(history['http:2']['details']['Сессия'], 'audit token=[REDACTED]')
+            self.assertEqual(history['capability:' + 'c' * 24]['actor'], 'VULN')
+        secrets = ('HTTP_MAP_QUERY_SYNTH', 'HTTP_MAP_AUTH_SYNTH', 'HISTORY_SESSION_SYNTH')
+        with self.subTest(projection='masking'):
+            for secret in secrets:
+                self.assertNotIn(secret, raw)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', headless=True)
+            try:
+                tab = browser.new_page(viewport={'width': 390, 'height': 850})
+                tab.goto(self.url + 'tasks/1#map')
+                inventory = tab.locator('.inventory')
+                expect(inventory).to_be_visible()
+                for address in addresses:
+                    expect(inventory).to_contain_text(address, use_inner_text=True)
+                card = tab.locator('[data-key="pivot:1"] button')
+                card.click()
+                card.evaluate('(node) => window.oldCard = node')
+                scroll = tab.locator('#map .diagram-scroll')
+                scroll.evaluate('(node) => { node.scrollLeft = 180; }')
+                left = scroll.evaluate('(node) => node.scrollLeft')
+                self.assertGreater(left, 0)
+                self.assertEqual(before, self.snapshot())
+                with closing(sqlite3.connect(self.database)) as db, db:
+                    db.execute("UPDATE pm_http_artifacts SET status_code=204 WHERE hostname='docs.test' AND port=8443")
+                after_update = self.snapshot()
+                expect(inventory.get_by_text('HTTP 204', exact=True)).to_have_count(1)
+                expect(card).to_have_attribute('aria-pressed', 'true')
+                self.assertTrue(card.evaluate('(node) => node === window.oldCard'))
+                self.assertEqual(scroll.evaluate('(node) => node.scrollLeft'), left)
+                tab.get_by_role('link', name='История', exact=True).click()
+                unowned = tab.locator('#history-entries li').filter(has_text='Исполнитель не записан').filter(
+                    has_text='Запись HTTP-запроса')
+                unowned.locator('summary').click()
+                expect(unowned).to_contain_text('web-session')
+                expect(tab.locator('#selection')).to_contain_text('Сессия')
+                expect(tab.locator('#selection')).to_contain_text('web-session')
+                expect(tab.locator('#history-entries li').filter(
+                    has_text='Обращение за внешними данными')).to_contain_text('VULN')
+                for secret in secrets:
+                    self.assertNotIn(secret, tab.content())
+                self.assertEqual(after_update, self.snapshot())
+            finally:
+                browser.close()
 
     def test_dashboard_updates_in_place_in_chromium(self):
         from playwright.sync_api import expect, sync_playwright
